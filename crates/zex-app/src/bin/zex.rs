@@ -54,6 +54,16 @@ enum MsgKind {
         name: Option<String>,
     },
     System,
+    /// 子智能体的一步动作。缩进显示在主对话里，
+    /// 让用户不切视图也知道后台那些 agent 在干什么。
+    SubAgentStep {
+        /// 哪个 agent。
+        agent: String,
+        /// 工具名。
+        name: String,
+        /// 参数摘要。
+        args: String,
+    },
 }
 
 #[derive(Clone)]
@@ -412,7 +422,25 @@ impl ChatView {
             }
             CoreEvent::ToolCallBegin { session, name, arguments, risk, .. } => {
                 if !self.is_active(&session) {
-                    // 后台会话的工具调用不上台面，但它确实在跑
+                    // 是我的子智能体吗？是的话把动作回流到主对话，
+                    // 用户不用点进去也知道后台在干什么。
+                    let owner = self
+                        .team
+                        .iter()
+                        .find(|a| a.session == session.as_str())
+                        .map(|a| a.id.clone());
+                    if let Some(agent) = owner {
+                        self.messages.push(MsgItem {
+                            kind: MsgKind::SubAgentStep {
+                                agent,
+                                name: name.clone(),
+                                args: compact_args(&arguments),
+                            },
+                            text: String::new(),
+                        });
+                        self.sync_scroller(cx);
+                    }
+                    // 其它会话的工具调用不上台面，但它确实在跑
                     self.status = format!("其它会话执行 {name}");
                 } else {
                 self.flush_streaming(cx);
@@ -725,6 +753,43 @@ impl ChatView {
                             .font_family(MONO)
                             .text_color(rgb(TEXT_MUTED))
                             .child(shown),
+                    )
+                    .into_any_element()
+            }
+
+            MsgKind::SubAgentStep { agent, name, args } => {
+                // 缩进 + 竖线：视觉上明确属于「后台那几个」，不抢主线注意力
+                div()
+                    .ml_10()
+                    .pl_3()
+                    .border_l_2()
+                    .border_color(rgb(BORDER))
+                    .py_1()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(rgb(TEXT_MUTED))
+                            .child(format!("⟡ {agent}")),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_family(MONO)
+                            .text_color(rgb(TEXT_DIM))
+                            .child(name.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .text_xs()
+                            .text_color(rgb(TEXT_DIM))
+                            .overflow_hidden()
+                            .child(args.clone()),
                     )
                     .into_any_element()
             }
