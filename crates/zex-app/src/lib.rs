@@ -7,3 +7,16 @@
 // 测试代码允许 unwrap/expect：断言失败就该 panic，生产代码里才禁止。
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 #![warn(missing_docs)]
+
+pub mod config;
+
+pub use config::{ResolvedConfig, config_dir, load};
+
+/// 把已解析的配置装配成内核。
+pub fn build_agent(
+    cfg: &ResolvedConfig,
+    cwd: std::path::PathBuf,
+) -> zex_core::Result<zex_agent::Agent> {
+    let agent_cfg = zex_agent::AgentConfig::new(cfg.provider.clone(), cfg.model.clone(), cwd);
+    zex_agent::Agent::new(agent_cfg, zex_tools::default_tools())
+}

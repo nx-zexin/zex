@@ -10,6 +10,13 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
 [dependencies]
 zex-core.workspace = true
-
+zex-llm.workspace = true
+zex-tools.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+tracing.workspace = true

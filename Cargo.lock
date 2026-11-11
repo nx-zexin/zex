@@ -8701,7 +8701,12 @@ dependencies = [
 name = "zex-agent"
 version = "0.1.0"
 dependencies = [
+ "reqwest",
+ "tokio",
+ "tracing",
  "zex-core",
+ "zex-llm",
+ "zex-tools",
 ]
 
 [[package]]
@@ -8709,10 +8714,15 @@ name = "zex-app"
 version = "0.1.0"
 dependencies = [
  "gpui-kit",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "zex-agent",
  "zex-core",
+ "zex-llm",
+ "zex-tools",
 ]
 
 [[package]]
@@ -8794,6 +8804,14 @@ dependencies = [
 name = "zex-tools"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "reqwest",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
  "zex-core",
 ]
 

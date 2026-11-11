@@ -191,15 +191,15 @@
 |---|---|---|---|
 | T0 | 三平台 gpui 冒烟 | ✅ Linux 已验证 | gpui-kit 0.9.1 编译 2m34s；Manjaro/Wayland(niri)+XWayland 下窗口创建成功、事件循环稳定、GPU 走 Vulkan(Intel Arc)。**Windows/macOS 待 CI 验证** |
 | T1 | Workspace + CI | ✅ 完成 | 12 crate；三平台 matrix（fail-fast: false）+ 3 项分层约束检查 |
-| T2 | `zex-core` | ✅ 完成 | 18 个测试全绿；schema 由 schemars 自动生成且包含文档注释 |
-| T3 | `zex-llm` | ⬜ 待开始 | **下一个任务，核心难点** |
-| T4 | 双世界桥接 | ✅ 完成 | tokio runtime 线程 + mpsc + WeakEntity 存活检测，实测稳定运行 |
-| T5 | `zex-store` | ⬜ 待开始 | |
-| T6 | `zex-agent` | ⬜ 待开始 | |
-| T7 | `zex-tools` | ⬜ 待开始 | |
-| T8 | GUI | ⬜ 待开始 | |
-| T9 | CLI | 🔄 骨架已通 | 参数解析 + 帮助信息可用，内核待 T6/T7 接入 |
-| T10 | 工具注册宏 | ⬜ 待开始 | |
+| T2 | `zex-core` | ✅ 完成 | 18 测试；schema 由 schemars 自动生成且含文档注释 |
+| T3 | `zex-llm` | ✅ 完成 | 61 测试；双协议 + SSE 解码器 + 退避重试 |
+| T4 | 双世界桥接 | ✅ 完成 | tokio 线程 + mpsc + WeakEntity 存活检测，实测稳定 |
+| T5 | `zex-store` | ⬜ 待开始 | M0 先用内存历史；持久化推到 M1 |
+| T6 | `zex-agent` | ✅ 完成 | 薄 loop + 27 测试；**端到端已跑通** |
+| T7 | `zex-tools` | ✅ 完成（4 个） | fs_read / fs_write / shell / web_fetch，28 测试。`ask` 待有 UI 后补 |
+| T8 | GUI | 🔄 骨架可跑 | 双世界桥接验证通过，对话界面待实现 |
+| T9 | CLI | ✅ 完成 | 流式过程走 stderr、结果走 stdout；真实 API 端到端通过 |
+| T10 | 工具注册宏 | ⬜ 待开始 | 目前手工 `Arc::new(...)`，4 个工具还不用宏 |
 
 图例：⬜ 待开始 / 🔄 进行中 / ✅ 完成 / ⚠️ 受阻 / ❌ 取消
 
@@ -227,3 +227,28 @@
 2. **0.9 的 API 与旧文档不同**：
    - `gpui_kit::open_window(...)` 是顶层函数，**内部已包 `Root`**，不再需要手动 `cx.new(|cx| Root::new(...))`。
    - `Entity::update` 返回 `R`（不是 `Result`）；要检测窗口关闭必须用 `Entity::downgrade()` 拿到 `WeakEntity`，它的 `update` 才返回 `Result`。
+
+---
+
+## M0 端到端验收记录（2026-11-11）
+
+用 DeepSeek（OpenAI 兼容端点）真实跑通两条任务链：
+
+```
+$ zex-cli "读一下 README.md，然后一句话告诉我这个项目是做什么的"
+[只读] fs_read {"path":"README.md"}
+  └─ ok: 1  # Zex…
+Zex 是一个用 Rust + gpui-kit 写的常驻桌面数字助理…
+[Completed] tokens: in 4408 / out 86
+
+$ zex-cli "统计这个 Rust 项目有多少个源文件和总行数，用 shell 命令做"
+[有影响] shell {"command":"find . -name "*.rs" -not -path "./target/*" | wc -l; …"}
+  └─ ok: 31…
+31 个 .rs 源文件（已排除 target/），合计 5552 行。
+[Completed] tokens: in 3468 / out 107
+```
+
+验证覆盖：流式 token、工具调用、多轮 loop、风险等级标注、
+stderr/stdout 分离（`> out.txt` 拿到干净结果）、token 统计。
+
+**M0 的核心命题成立：一条窄路走通了。**
