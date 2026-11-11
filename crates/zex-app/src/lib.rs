@@ -368,8 +368,16 @@ async fn run_task(
     locks: SessionLocks,
     broker: Arc<ApprovalBroker>,
 ) {
+    // 先落一条 queued 记录，再去等锁。
+    //
+    // 顺序很关键：排队中的任务在界面上是可见的（工作台的「排队中」），
+    // 如果等拿到锁才建记录，用户连自己派过活都看不到。
+    let task_id = zex_core::TaskId::generate().to_string();
+    let _ = store.create_task(&task_id, session.as_str(), &text, "");
+
     // 同一会话串行：两条任务同时往一条 history 追加会乱序，
-    // 而且它们看到的上下文也不一致。
+    // 而且它们看到的上下文也不一致。tokio 的 Mutex 是公平的，
+    // 先来的先拿 —— 所以顺带就有了队列语义。
     let lock = {
         let mut held = locks.lock().expect("会话锁表中毒");
         held.entry(session.clone())
@@ -378,8 +386,7 @@ async fn run_task(
     };
     let _guard = lock.lock().await;
 
-    let task_id = zex_core::TaskId::generate().to_string();
-    let _ = store.create_task(&task_id, session.as_str(), &text, "");
+    // 拿到锁才算真的开始跑
     let _ = store.start_task(&task_id);
 
     let mut agent = match Agent::resume(cfg, tools, store.clone(), session.clone()) {

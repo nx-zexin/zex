@@ -109,6 +109,8 @@ struct ChatView {
     broker: Arc<ApprovalBroker>,
     sessions: Vec<SessionItem>,
     active_session: String,
+    /// 用户点了关闭、但还有任务在跑时，先停下来问一句。
+    confirm_close: bool,
     /// 子智能体团队。非空时在对话里显示一块团队面板。
     team: Vec<zex_core::event::SubAgentView>,
     /// 别的会话发来的授权请求。切到那个会话时再摆出来，
@@ -201,6 +203,7 @@ impl ChatView {
             broker,
             sessions,
             active_session,
+            confirm_close: false,
             team: Vec::new(),
             pending_approvals: Vec::new(),
             store,
@@ -390,6 +393,7 @@ impl ChatView {
         match ev {
             CoreEvent::TeamUpdated { agents } => {
                 self.team = agents;
+                self.tasks = load_tasks(&self.store);
                 cx.notify();
             }
             CoreEvent::TurnStarted { session, turn: _ } => {
@@ -469,6 +473,9 @@ impl ChatView {
                 self.running_tool = None;
                 self.usage.add(usage);
                 self.status = "Ready".into();
+                // 一轮跑完，工作台的待办列表得跟着变 —— 否则用户
+                // 不切换视图就永远看到旧的"执行中"。
+                self.tasks = load_tasks(&self.store);
                 if !matches!(reason, zex_core::EndReason::Completed) {
                     self.messages.push(MsgItem {
                         kind: MsgKind::System,
@@ -872,6 +879,73 @@ impl ChatView {
     }
 
     /// 单条任务卡片：点一下跳到它所在的会话。
+    /// 关窗确认层。
+    ///
+    /// 用户按了关闭但后台还有任务 —— 直接退会把活儿掐了，
+    /// 所以停下来问一句，把"会中断什么"说清楚。
+    fn render_close_confirm(&self, cx: &mut Context<Self>) -> AnyElement {
+        let running = self.team.iter().filter(|a| a.status == "执行中").count();
+
+        div()
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(rgb(0x1A1A1A).opacity(0.35))
+            .child(
+                div()
+                    .w(px(400.0))
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .bg(rgb(BG_MAIN))
+                    .p_5()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .child(
+                        div()
+                            .text_base()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(TEXT))
+                            .child("还有任务在跑"),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(TEXT_MUTED))
+                            .child(if running > 0 {
+                                format!("{running} 个子智能体正在执行。现在关闭会中断它们，已完成的进度会保留。")
+                            } else {
+                                "有任务正在执行。现在关闭会中断它，已完成的进度会保留。".to_string()
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .gap_2()
+                            .child(
+                                Button::new("cancel-close")
+                                    .ghost()
+                                    .label("继续运行")
+                                    .on_click(cx.listener(|this, _: &ClickEvent, _w, cx| {
+                                        this.confirm_close = false;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Button::new("confirm-close")
+                                    .label("仍然关闭")
+                                    .on_click(cx.listener(|_this, _: &ClickEvent, _w, cx| {
+                                        cx.quit();
+                                    })),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
     /// 团队面板：主对话里直接看到子智能体在干什么。
     ///
     /// 放在对话下方而不是侧栏，是因为它属于「这一轮正在发生的事」；
@@ -1563,8 +1637,9 @@ impl Render for ChatView {
         }
         bottom = bottom.child(self.render_composer(cx));
 
-        div()
+        let mut root = div()
             .size_full()
+            .relative()
             .flex()
             .bg(rgb(BG_MAIN))
             .text_color(rgb(TEXT))
@@ -1599,8 +1674,15 @@ impl Render for ChatView {
                     main = main.child(bottom);
                 }
                 main
-            })
+            });
+
+        // 关窗确认：压在整界面之上，挡住所有交互
+        if self.confirm_close {
+            root = root.child(self.render_close_confirm(cx));
+        }
+        root
     }
+
 }
 
 /// 把 JSON 参数压成一行短摘要。
@@ -1822,22 +1904,6 @@ fn main() {
                 // 这里再显式要一次；被忽略也无害（浮动窗口自行决定）。
                 window.resize(size(px(1280.0), px(820.0)));
 
-                // 关窗拦截：还有任务在跑就最小化，别把活儿掐了。
-                // 注意 Linux 只有 minimize，没有窗口级 hide —— niri 这类
-                // 平铺合成器可能忽略最小化请求，那时至少窗口不会关掉。
-                {
-                    let store = store.clone();
-                    window.on_window_should_close(cx, move |window, _cx| {
-                        let busy = store.has_running_work().unwrap_or(false);
-                        if busy {
-                            window.minimize_window();
-                            false
-                        } else {
-                            true
-                        }
-                    });
-                }
-
                 let tx = cmd_tx.clone();
                 let broker = broker.clone();
                 let sessions = sessions.clone();
@@ -1846,10 +1912,44 @@ fn main() {
                 let model = model.clone();
                 let history = history.clone();
                 let tasks = tasks.clone();
-                let store = store.clone();
-                cx.new(|cx| {
-                    ChatView::new(tx, broker, sessions, active, cwd, model, history, tasks, store, window, cx)
-                })
+                let store_for_view = store.clone();
+                let view = cx.new(|cx| {
+                    ChatView::new(
+                        tx,
+                        broker,
+                        sessions,
+                        active,
+                        cwd,
+                        model,
+                        history,
+                        tasks,
+                        store_for_view,
+                        window,
+                        cx,
+                    )
+                });
+
+                // 关窗拦截：还有任务在跑就停下来问一句，而不是直接掐掉。
+                // 不做托盘 —— Linux 的托盘在 Wayland 下不可靠，而且用户
+                // 需要的是"明确知道我在后台跑着"，不是一个看不见的图标。
+                {
+                    let weak = view.downgrade();
+                    let store = store.clone();
+                    window.on_window_should_close(cx, move |_window, cx| {
+                        let busy = store.has_running_work().unwrap_or(false);
+                        if !busy {
+                            return true;
+                        }
+                        let _ = weak.update(cx, |this, cx| {
+                            this.confirm_close = true;
+                            cx.notify();
+                        });
+                        // 先不关：等用户在确认层里做决定
+                        false
+                    });
+                }
+
+                view
             },
         ) {
             Ok(v) => v,
