@@ -127,7 +127,15 @@ impl Agent {
         let mut agent = Self::new(cfg, tools, store)?;
         agent.session = session.clone();
         let stored = agent.store.load_messages(&session)?;
-        agent.history = stored.into_iter().map(|s| s.message).collect();
+        agent.history = stored
+            .into_iter()
+            .map(|s| {
+                let mut m = s.message;
+                // 旧数据里可能留着防护上线前的明文凭据
+                zex_policy::secret::redact_message(&mut m);
+                m
+            })
+            .collect();
         // 历史消息里存了各自的 token 数，恢复后带上，界面才不会一片 0
         let total = agent.store.session_tokens(&agent.session).unwrap_or(0);
         agent.usage = Usage {
@@ -593,6 +601,11 @@ impl Agent {
             ),
             Err(e) => (format!("工具 `{}` 执行失败：{e}", call.name), true),
         };
+
+        // 凭据脱敏放在最外一层：不管密钥是从 env、文件还是网络响应里来的，
+        // 只要形态可疑就不进上下文。路径黑名单挡得住 `cat .env`，
+        // 挡不住 `env | grep KEY` 或 `curl` 回来的配置。
+        let content = zex_policy::secret::redact(&content);
 
         let result_brief = if is_error { "失败" } else { "成功" };
         self.audit(

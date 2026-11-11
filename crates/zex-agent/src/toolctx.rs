@@ -147,8 +147,25 @@ pub fn is_secret(path: &Path) -> bool {
         if NAMES.iter().any(|n| lower == *n) {
             return true;
         }
+        // .env 的各种变体：.env.local / .env.production / .env.test ...
+        // 它们和 .env 一样装着密钥，只认精确名字等于没防
+        if lower == ".env" || lower.starts_with(".env.") {
+            return true;
+        }
+        // 各类私钥：id_rsa 之外还有 id_ed25519 / id_dsa / id_ecdsa_sk ...
+        if lower.starts_with("id_") {
+            return true;
+        }
+        if lower == ".git-credentials" {
+            return true;
+        }
         // 私钥文件常见后缀
-        if lower.ends_with(".pem") || lower.ends_with(".key") || lower.ends_with(".p12") {
+        if lower.ends_with(".pem")
+            || lower.ends_with(".key")
+            || lower.ends_with(".p12")
+            || lower.ends_with(".pfx")
+            || lower.ends_with(".keystore")
+        {
             return true;
         }
     }
@@ -157,6 +174,19 @@ pub fn is_secret(path: &Path) -> bool {
         let s = s.replace('\\', "/");
         if s.contains("/.zex/.env") || s.contains("/.zex/config.json") {
             return true;
+        }
+        // 各家 CLI 存放长期凭据的位置
+        for marker in [
+            "/.aws/",
+            "/.gnupg/",
+            "/.kube/config",
+            "/.docker/config.json",
+            "/.config/gh/hosts.yml",
+            "/.ssh/",
+        ] {
+            if s.contains(marker) {
+                return true;
+            }
         }
     }
     false

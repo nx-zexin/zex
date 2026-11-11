@@ -23,6 +23,7 @@
 
 pub mod glob;
 pub mod rules;
+pub mod secret;
 
 use serde_json::Value;
 use zex_core::{Risk, ToolSpec};
