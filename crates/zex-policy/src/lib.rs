@@ -214,6 +214,42 @@ mod tests {
     }
 
     #[test]
+    fn write_outside_home_escalates_to_ask() {
+        // /tmp 是公认的工作位置会被放行，但 /srv 这类"home 外、又不在
+        // 系统目录"的路径必须问一句
+        let p = policy();
+        let v = p.evaluate(
+            &spec("fs_write", Risk::Reversible),
+            &serde_json::json!({"path": "/srv/zex-probe.txt"}),
+            Mode::Normal,
+        );
+        assert!(matches!(v, Verdict::Ask { .. }), "应为 Ask，实际 {v:?}");
+    }
+
+    #[test]
+    fn temp_dir_write_is_allowed() {
+        // 反面：临时目录不该弹审批，否则正常干活会被打断
+        let p = policy();
+        let v = p.evaluate(
+            &spec("fs_write", Risk::Reversible),
+            &serde_json::json!({"path": "/tmp/zex-probe.txt"}),
+            Mode::Normal,
+        );
+        assert!(v.is_allow());
+    }
+
+    #[test]
+    fn write_system_dir_is_denied() {
+        let p = policy();
+        let v = p.evaluate(
+            &spec("fs_write", Risk::Reversible),
+            &serde_json::json!({"path": "/usr/local/bin/zex"}),
+            Mode::Normal,
+        );
+        assert!(matches!(v, Verdict::Deny { .. }), "应为 Deny，实际 {v:?}");
+    }
+
+    #[test]
     fn read_only_is_allowed() {
         let p = policy();
         let v = p.evaluate(

@@ -560,7 +560,9 @@ impl Agent {
                         if let Some(scope) = remember {
                             if double_confirm {
                                 tracing::warn!(tool = %call.name, "高危操作不接受授权记忆，已忽略");
-                            } else if let Err(e) = self.persist_grant(&call.name, &scope) {
+                            } else if let Err(e) =
+                                self.persist_grant(&call.name, &scope, &call.arguments)
+                            {
                                 self.emit(
                                     CoreEvent::Warning {
                                         message: format!("授权记忆保存失败: {e}"),
@@ -597,18 +599,37 @@ impl Agent {
     }
 
     /// 把"记住这个授权"落库。
-    fn persist_grant(&self, tool: &str, scope: &zex_core::event::RememberScope) -> Result<()> {
+    fn persist_grant(
+        &self,
+        tool: &str,
+        scope: &zex_core::event::RememberScope,
+        args: &serde_json::Value,
+    ) -> Result<()> {
         use zex_core::event::RememberScope;
         let risk = self.risk_of(tool);
         match scope {
             RememberScope::Exact => {
-                // 精确记忆需要具体参数，M1 简化为"该工具全部参数"，
-                // 真正的 exact 匹配在 M2（需要把参数摘要存进 pattern）
-                self.store.add_grant(tool, "", risk, None)?;
+                // 只记住这一次的参数
+                if let Some(p) = zex_policy::glob::literal_pattern(args) {
+                    self.store.add_grant(tool, &p, risk, None)?;
+                }
             }
-            RememberScope::Pattern { pattern, days } => {
-                self.store
-                    .add_grant(tool, pattern.as_deref().unwrap_or(""), risk, *days)?;
+            RememberScope::Pattern {
+                pattern: Some(p),
+                days,
+            } => {
+                // 调用方显式给了模式（如 `git *`），照用
+                self.store.add_grant(tool, p, risk, *days)?;
+            }
+            RememberScope::Pattern {
+                pattern: None,
+                days,
+            } => {
+                // "该工具全部参数" 的口子太宽：用户在某个文件上点一次记住，
+                // 就放行了这个工具对任何路径的调用。退化成这次的具体参数。
+                if let Some(p) = zex_policy::glob::literal_pattern(args) {
+                    self.store.add_grant(tool, &p, risk, *days)?;
+                }
             }
         }
         Ok(())
