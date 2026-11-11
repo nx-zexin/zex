@@ -32,6 +32,36 @@ pub fn build_agent(cfg: &ResolvedConfig, cwd: PathBuf) -> zex_core::Result<zex_a
     zex_agent::Agent::new(agent_cfg, zex_tools::default_tools(), store)
 }
 
+/// 打开最近一个会话（若无则新建）。
+///
+/// 这是"关掉再打开能接着聊"的实现：GUI 启动时恢复上次的对话，
+/// 而不是每次都开一个空白会话。
+pub fn build_agent_resuming(cfg: &ResolvedConfig, cwd: PathBuf) -> zex_core::Result<zex_agent::Agent> {
+    let store = open_store()?;
+    let agent_cfg = zex_agent::AgentConfig::new(cfg.provider.clone(), cfg.model.clone(), cwd);
+
+    // 跳过空会话：每次启动都会留下一个没说话的会话壳，
+    // 直接恢复它会让用户以为历史丢了。
+    let latest = store
+        .list_sessions(8)?
+        .into_iter()
+        .find(|s| !store.load_messages(&s.id).map(|m| m.is_empty()).unwrap_or(true));
+
+    match latest {
+        Some(session) => {
+            // 恢复失败时退回新建，不让一次数据问题把应用卡死
+            match zex_agent::Agent::resume(agent_cfg.clone(), zex_tools::default_tools(), store.clone(), session.id) {
+                Ok(a) => Ok(a),
+                Err(e) => {
+                    tracing::warn!(error = %e, "恢复会话失败，改为新建");
+                    zex_agent::Agent::new(agent_cfg, zex_tools::default_tools(), store)
+                }
+            }
+        }
+        None => zex_agent::Agent::new(agent_cfg, zex_tools::default_tools(), store),
+    }
+}
+
 /// 装配一个用内存数据库的内核（测试与 --ephemeral 模式）。
 pub fn build_ephemeral_agent(
     cfg: &ResolvedConfig,

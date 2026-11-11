@@ -1,89 +1,123 @@
 //! Zex GUI 二进制。
 //!
+//! 视觉按参考设计稿实现：浅色主题、橙色品牌色、左侧会话栏、
+//! 文档流消息、独立工具调用卡片、内嵌审批条。
+//!
 //! 双世界桥接的 UI 侧（ADR-002）：gpui 主线程只做渲染与输入，
 //! 内核在独立 tokio 线程里跑，两者用 channel 通信。
-//!
-//! M1 范围：流式对话 + 审批弹层 + 工具调用展示。
-//! Markdown 渲染与消息虚拟滚动留到 M2。
 
 use std::sync::Arc;
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::Sizable as _;
-use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::*;
 use tokio::sync::mpsc;
 use zex_agent::ApprovalBroker;
-use zex_app::{build_agent, CoreHandles};
-use zex_core::{ApprovalId, ApprovalRequest, CoreEvent, RememberScope, UiCommand};
+use zex_core::{ApprovalId, ApprovalRequest, CoreEvent, RememberScope, UiCommand, Usage};
+
+// ─── 配色（浅色主题）───
+// 取自设计稿：近白背景、极浅灰面板、橙色作为唯一强调色。
+const BG_SIDEBAR: u32 = 0xF8F8F6;
+const BG_MAIN: u32 = 0xFFFFFF;
+const BG_HOVER: u32 = 0xEFEFEC;
+const BG_TOOL: u32 = 0xF5F5F3;
+const BG_RESULT: u32 = 0xFAFAF8;
+const BG_INPUT: u32 = 0xFFFFFF;
+const BORDER: u32 = 0xE5E5E2;
+const BORDER_SOFT: u32 = 0xEDEDEA;
+const TEXT: u32 = 0x1A1A1A;
+const TEXT_MUTED: u32 = 0x8C8C88;
+const TEXT_DIM: u32 = 0xA8A8A4;
+const BRAND: u32 = 0xF59E0B;
+const BRAND_SOFT: u32 = 0xFEF3E2;
+const BRAND_BORDER: u32 = 0xF5C97A;
+const OK: u32 = 0x22C55E;
+const OK_SOFT: u32 = 0xDCFCE7;
+const DANGER: u32 = 0xE5534B;
+const DANGER_SOFT: u32 = 0xFDECEA;
+const MONO: &str = "JetBrains Mono";
 
 /// 一条展示用的消息。
 #[derive(Clone)]
+enum MsgKind {
+    User,
+    Assistant,
+    ToolCall { name: String, args: String, risk: String },
+    ToolResult { ok: bool, output: String },
+    System,
+}
+
+#[derive(Clone)]
 struct MsgItem {
-    /// 角色标签。
-    role: &'static str,
-    /// 正文。
+    kind: MsgKind,
     text: String,
-    /// 是否是错误。
-    error: bool,
+}
+
+/// 会话列表项。
+#[derive(Clone)]
+struct SessionItem {
+    id: String,
+    title: String,
+    when: String,
 }
 
 /// 主视图。
 struct ChatView {
     input: Entity<InputState>,
     messages: Vec<MsgItem>,
-    /// 正在流式输出的内容。
     streaming: Option<String>,
-    /// 正在执行的工具。
     running_tool: Option<String>,
-    /// 底部状态栏文本。
     status: String,
-    /// 待审批请求。
     approval: Option<ApprovalRequest>,
-    /// UI → 内核。
     cmd_tx: mpsc::Sender<UiCommand>,
-    /// 回复审批用。
     broker: Arc<ApprovalBroker>,
+    sessions: Vec<SessionItem>,
+    active_session: String,
+    cwd: String,
+    model: String,
+    usage: Usage,
 }
 
 impl ChatView {
     fn new(
         cmd_tx: mpsc::Sender<UiCommand>,
         broker: Arc<ApprovalBroker>,
+        sessions: Vec<SessionItem>,
+        active_session: String,
+        cwd: String,
+        model: String,
+        history: Vec<MsgItem>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let input = cx.new(|cx| InputState::new(window, cx).placeholder("给 Zex 下达任务…"));
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder("请输入您的指令，或选择一个快捷操作…"));
 
         ChatView {
             input,
-            messages: Vec::new(),
+            messages: history,
             streaming: None,
             running_tool: None,
-            status: "就绪".into(),
+            status: "Ready".into(),
             approval: None,
             cmd_tx,
             broker,
+            sessions,
+            active_session,
+            cwd,
+            model,
+            usage: Usage::default(),
         }
     }
 
-    /// 提交输入框里的内容。
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.input.read(cx).value().trim().to_string();
-        if text.is_empty() {
-            return;
-        }
-        if self.streaming.is_some() {
-            self.status = "上一轮还在进行中".into();
-            cx.notify();
+        if text.is_empty() || self.streaming.is_some() {
             return;
         }
 
-        self.input.update(cx, |state, cx| {
-            state.set_value("", window, cx);
-        });
-        self.messages.push(MsgItem { role: "你", text: text.clone(), error: false });
+        self.input.update(cx, |state, cx| state.set_value("", window, cx));
+        self.messages.push(MsgItem { kind: MsgKind::User, text: text.clone() });
         self.streaming = Some(String::new());
         self.status = "思考中…".into();
 
@@ -96,51 +130,38 @@ impl ChatView {
         cx.notify();
     }
 
-    /// 回复审批。
     fn respond(&mut self, approve: bool, remember: bool, cx: &mut Context<Self>) {
-        let Some(req) = self.approval.take() else {
-            return;
-        };
+        let Some(req) = self.approval.take() else { return };
         let broker = self.broker.clone();
-        let cmd_tx = self.cmd_tx.clone();
         let id: ApprovalId = req.id.clone();
         let grantable = req.grantable;
 
-        self.status = if approve { "已批准，执行中…".into() } else { "已拒绝".into() };
+        self.status = if approve { "执行中…".into() } else { "已拒绝".into() };
 
         cx.spawn(async move |_this, _cx| {
-            let (cmd, decision_scope) = if approve {
+            if approve {
                 let scope = if remember && grantable {
                     Some(RememberScope::Pattern { pattern: None, days: None })
                 } else {
                     None
                 };
-                (UiCommand::Approve { id: id.clone(), remember: scope.clone() }, scope)
+                let _ = broker
+                    .resolve(&id, zex_agent::ApprovalDecision::Approve { remember: scope })
+                    .await;
             } else {
-                (UiCommand::Reject { id: id.clone(), reason: "用户在界面上拒绝".into() }, None)
-            };
-            // 直接交给 broker 更快，也保证 UI 与内核看到同一个决定
-            if let UiCommand::Approve { id, remember } = &cmd {
                 let _ = broker
                     .resolve(
-                        id,
-                        zex_agent::ApprovalDecision::Approve { remember: remember.clone() },
+                        &id,
+                        zex_agent::ApprovalDecision::Reject { reason: "用户在界面上拒绝".into() },
                     )
                     .await;
-            } else if let UiCommand::Reject { id, reason } = &cmd {
-                let _ = broker
-                    .resolve(id, zex_agent::ApprovalDecision::Reject { reason: reason.clone() })
-                    .await;
             }
-            let _ = decision_scope;
-            let _ = cmd_tx;
         })
         .detach();
 
         cx.notify();
     }
 
-    /// 处理一个内核事件。
     fn handle_event(&mut self, ev: CoreEvent, cx: &mut Context<Self>) {
         match ev {
             CoreEvent::TurnStarted { .. } => {
@@ -151,187 +172,621 @@ impl ChatView {
                 self.streaming.get_or_insert_with(String::new).push_str(&text);
             }
             CoreEvent::ToolCallBegin { name, arguments, risk, .. } => {
-                // 把已流出的文本先落到消息列表，工具调用作为独立条目
                 self.flush_streaming();
                 self.running_tool = Some(name.clone());
-                let brief = compact_args(&arguments);
+                self.status = format!("执行 {name}");
                 self.messages.push(MsgItem {
-                    role: "工具",
-                    text: format!("[{}] {name} {brief}", risk.label()),
-                    error: false,
+                    kind: MsgKind::ToolCall {
+                        name: name.clone(),
+                        args: compact_args(&arguments),
+                        risk: risk.label().to_string(),
+                    },
+                    text: String::new(),
                 });
             }
             CoreEvent::ToolCallEnd { ok, brief, .. } => {
                 self.running_tool = None;
+                self.status = "Ready".into();
                 self.messages.push(MsgItem {
-                    role: if ok { "  结果" } else { "  失败" },
-                    text: brief,
-                    error: !ok,
+                    kind: MsgKind::ToolResult { ok, output: brief },
+                    text: String::new(),
                 });
             }
             CoreEvent::ApprovalRequired { req } => {
                 self.flush_streaming();
-                self.status = "等待你的确认".into();
+                self.status = "等待确认".into();
                 self.approval = Some(req);
             }
             CoreEvent::ContextCompacted { before_tokens, after_tokens, strategy, .. } => {
                 self.messages.push(MsgItem {
-                    role: "系统",
-                    text: format!(
-                        "上下文已压缩（{strategy}）：{before_tokens} → {after_tokens} tokens"
-                    ),
-                    error: false,
+                    kind: MsgKind::System,
+                    text: format!("上下文已压缩（{strategy}）：{before_tokens} → {after_tokens} tokens"),
                 });
             }
             CoreEvent::TurnEnded { reason, usage, .. } => {
                 self.flush_streaming();
-                self.status = format!(
-                    "{:?} · in {} / out {} tokens",
-                    reason, usage.input_tokens, usage.output_tokens
-                );
+                self.usage.add(usage);
+                self.status = "Ready".into();
+                if !matches!(reason, zex_core::EndReason::Completed) {
+                    self.messages.push(MsgItem {
+                        kind: MsgKind::System,
+                        text: format!("本轮结束：{reason:?}"),
+                    });
+                }
             }
             CoreEvent::Warning { message } => {
-                self.messages.push(MsgItem { role: "警告", text: message, error: true });
+                self.messages.push(MsgItem { kind: MsgKind::System, text: message });
             }
             CoreEvent::Fatal { message } => {
                 self.flush_streaming();
                 self.status = "出错".into();
-                self.messages.push(MsgItem { role: "错误", text: message, error: true });
+                self.messages.push(MsgItem { kind: MsgKind::System, text: format!("错误：{message}") });
             }
             CoreEvent::Thinking { .. } => {}
         }
         cx.notify();
     }
 
-    /// 把流式缓冲落成一条消息。
     fn flush_streaming(&mut self) {
         if let Some(text) = self.streaming.take() {
             if !text.trim().is_empty() {
-                self.messages.push(MsgItem { role: "Zex", text, error: false });
+                self.messages.push(MsgItem { kind: MsgKind::Assistant, text });
             }
         }
     }
 }
 
-impl Render for ChatView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut list = div().flex().flex_col().gap_2().p_4();
+// ─── 渲染辅助 ───
 
-        for m in &self.messages {
-            let color = if m.error { rgb(0xd04040) } else { rgb(0x888888) };
-            list = list.child(
+fn role_label(text: &str) -> impl IntoElement {
+    div()
+        .text_xs()
+        .font_weight(FontWeight::BOLD)
+        .text_color(rgb(BRAND))
+        .child(text.to_string())
+}
+
+fn pill(label: String, bg: u32, fg: u32) -> impl IntoElement {
+    div()
+        .px_2()
+        .py(px(2.0))
+        .rounded_full()
+        .bg(rgb(bg))
+        .text_xs()
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(rgb(fg))
+        .child(label)
+}
+
+impl ChatView {
+    fn render_message(&self, m: &MsgItem) -> AnyElement {
+        match &m.kind {
+            MsgKind::User => div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(role_label("USER"))
+                .child(div().text_lg().text_color(rgb(TEXT)).child(m.text.clone()))
+                .into_any_element(),
+
+            MsgKind::Assistant => div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(role_label("ZEX"))
+                .child(div().text_lg().text_color(rgb(TEXT)).child(m.text.clone()))
+                .into_any_element(),
+
+            MsgKind::ToolCall { name, args, risk } => {
+                // 风险等级决定胶囊配色
+                let (bg, fg) = match risk.as_str() {
+                    "高危" => (DANGER_SOFT, DANGER),
+                    "有影响" => (BRAND_SOFT, BRAND),
+                    _ => (BG_HOVER, TEXT_MUTED),
+                };
                 div()
                     .flex()
                     .flex_col()
-                    .gap_1()
-                    .child(div().text_xs().text_color(color).child(m.role))
-                    .child(div().text_sm().child(m.text.clone())),
-            );
-        }
-
-        // 正在流式输出的内容
-        if let Some(s) = &self.streaming {
-            if !s.is_empty() {
-                list = list.child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_1()
-                        .child(div().text_xs().text_color(rgb(0x888888)).child("Zex"))
-                        .child(div().text_sm().child(s.clone())),
-                );
-            }
-        }
-
-        // 审批区
-        let approval_bar = match &self.approval {
-            Some(req) => {
-                let grantable = req.grantable;
-                let mut bar = div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
+                    .gap_3()
                     .p_4()
-                    .bg(rgb(0x3a2f1a))
+                    .rounded_lg()
+                    .bg(rgb(BG_TOOL))
+                    .border_1()
+                    .border_color(rgb(BORDER_SOFT))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_3()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .font_weight(FontWeight::BOLD)
+                                            .text_color(rgb(BRAND))
+                                            .child("TOOL CALL"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .font_family(MONO)
+                                            .text_color(rgb(TEXT_MUTED))
+                                            .child(name.clone()),
+                                    ),
+                            )
+                            .child(pill(format!("{risk}"), bg, fg)),
+                    )
                     .child(
                         div()
                             .text_sm()
-                            .child(format!("需要确认 [{}] {}", req.risk.label(), req.tool)),
+                            .font_family(MONO)
+                            .text_color(rgb(TEXT))
+                            .child(args.clone()),
                     )
-                    .child(div().text_xs().child(req.summary.clone()))
-                    .child(div().text_xs().child(compact_args(&req.arguments)));
-
-                let mut buttons = div().flex().gap_2();
-                buttons = buttons.child(
-                    Button::new("ok").primary().small().label("批准").on_click(cx.listener(
-                        |this, _: &ClickEvent, _window, cx| this.respond(true, false, cx),
-                    )),
-                );
-                buttons = buttons.child(
-                    Button::new("no").small().label("拒绝").on_click(cx.listener(
-                        |this, _: &ClickEvent, _window, cx| this.respond(false, false, cx),
-                    )),
-                );
-                if grantable {
-                    buttons = buttons.child(
-                        Button::new("always").small().label("批准并记住此类").on_click(
-                            cx.listener(|this, _: &ClickEvent, _window, cx| {
-                                this.respond(true, true, cx)
-                            }),
-                        ),
-                    );
-                }
-                bar = bar.child(buttons);
-                Some(bar)
+                    .into_any_element()
             }
-            None => None,
-        };
 
-        let mut root = div()
-            .size_full()
+            MsgKind::ToolResult { ok, output } => {
+                let (dot_bg, mark) = if *ok { (OK_SOFT, "✓") } else { (DANGER_SOFT, "✕") };
+                let mark_color = if *ok { OK } else { DANGER };
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .p_4()
+                    .rounded_lg()
+                    .bg(rgb(BG_RESULT))
+                    .border_1()
+                    .border_color(rgb(BORDER_SOFT))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(rgb(TEXT_MUTED))
+                                    .child("TOOL RESULT"),
+                            )
+                            .child(
+                                div()
+                                    .size(px(16.0))
+                                    .rounded_full()
+                                    .bg(rgb(dot_bg))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(mark_color))
+                                            .child(mark),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_family(MONO)
+                            .text_color(rgb(TEXT_MUTED))
+                            .child(output.clone()),
+                    )
+                    .into_any_element()
+            }
+
+            MsgKind::System => div()
+                .w_full()
+                .flex()
+                .justify_center()
+                .child(
+                    div()
+                        .px_3()
+                        .py_1()
+                        .rounded_full()
+                        .bg(rgb(BG_TOOL))
+                        .text_xs()
+                        .text_color(rgb(TEXT_DIM))
+                        .child(m.text.clone()),
+                )
+                .into_any_element(),
+        }
+    }
+
+    fn render_sidebar(&self, _cx: &mut Context<Self>) -> AnyElement {
+        let mut list = div().flex().flex_col().gap_1().px_3();
+
+        for s in &self.sessions {
+            let active = s.id == self.active_session;
+            let mut row = div()
+                .w_full()
+                .h(px(38.0))
+                .px_3()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .rounded(px(6.0))
+                .text_sm();
+
+            row = if active {
+                row.bg(rgb(BG_HOVER)).text_color(rgb(TEXT))
+            } else {
+                row.text_color(rgb(TEXT_MUTED))
+            };
+
+            row = row
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .truncate()
+                        .child(s.title.clone()),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(TEXT_DIM))
+                        .child(s.when.clone()),
+                );
+
+            list = list.child(row);
+        }
+
+        div()
+            .w(px(240.0))
+            .h_full()
             .flex()
             .flex_col()
-            .bg(rgb(0x1a1a1a))
-            .text_color(rgb(0xe0e0e0))
+            .bg(rgb(BG_SIDEBAR))
+            .border_r_1()
+            .border_color(rgb(BORDER))
+            // 品牌区
+            .child(
+                div().flex().items_center().gap_2().px_4().pt_4().pb_3().child(
+                    div()
+                        .size(px(26.0))
+                        .rounded(px(7.0))
+                        .bg(rgb(BRAND))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(rgb(0xFFFFFF))
+                                .child("Z"),
+                        ),
+                ).child(
+                    div()
+                        .text_lg()
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(rgb(TEXT))
+                        .child("Zex"),
+                ),
+            )
+            // 新建会话
+            .child(
+                div().px_3().pb_3().child(
+                    div()
+                        .w_full()
+                        .h(px(38.0))
+                        .rounded(px(8.0))
+                        .border_1()
+                        .border_color(rgb(BORDER))
+                        .bg(rgb(BG_MAIN))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .gap_2()
+                        .text_sm()
+                        .text_color(rgb(TEXT))
+                        .child(div().text_base().child("＋"))
+                        .child("新建会话"),
+                ),
+            )
+            .child(div().flex_1().min_h(px(0.0)).child(list))
+            // 底部图标
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .px_4()
+                    .py_3()
+                    .border_t_1()
+                    .border_color(rgb(BORDER_SOFT))
+                    .child(
+                        div().text_lg().text_color(rgb(TEXT_MUTED)).child("⚙"),
+                    )
+                    .child(
+                        div().text_lg().text_color(rgb(TEXT_MUTED)).child("？"),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn render_composer(&self, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        div()
+                            .flex_1()
+                            .rounded(px(24.0))
+                            .border_1()
+                            .border_color(rgb(BORDER))
+                            .bg(rgb(BG_INPUT))
+                            .px_4()
+                            .py_2()
+                            .child(Input::new(&self.input)),
+                    )
+                    .child(
+                        Button::new("send")
+                            .primary()
+                            .label("↑")
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                this.submit(window, cx)
+                            })),
+                    ),
+            )
             .child(
                 div()
                     .flex()
                     .items_center()
                     .justify_between()
-                    .px_4()
-                    .py_2()
-                    .bg(rgb(0x242424))
-                    .child(div().text_sm().child("Zex"))
-                    .child(div().text_xs().text_color(rgb(0x888888)).child(self.status.clone())),
+                    .px_1()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(TEXT_DIM))
+                            .child(format!("{} ⌄", self.model)),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(TEXT_DIM))
+                            .child(format!(
+                                "{} / {} tokens",
+                                self.usage.input_tokens, self.usage.output_tokens
+                            )),
+                    ),
             )
-            .child(div().flex_1().overflow_y_scrollbar().child(list));
+            .into_any_element()
+    }
 
-        if let Some(bar) = approval_bar {
-            root = root.child(bar);
+    fn render_approval(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(req) = &self.approval else {
+            return div().into_any_element();
+        };
+
+        let mut actions = div().flex().items_center().gap_2();
+        actions = actions.child(
+            Button::new("approve").primary().label("批准").on_click(cx.listener(
+                |this, _: &ClickEvent, _w, cx| this.respond(true, false, cx),
+            )),
+        );
+        actions = actions.child(
+            Button::new("reject").label("拒绝").on_click(cx.listener(
+                |this, _: &ClickEvent, _w, cx| this.respond(false, false, cx),
+            )),
+        );
+        if req.grantable {
+            actions = actions.child(
+                Button::new("always").label("批准并记住此类").on_click(cx.listener(
+                    |this, _: &ClickEvent, _w, cx| this.respond(true, true, cx),
+                )),
+            );
         }
 
-        root.child(
-            div()
-                .flex()
-                .gap_2()
-                .p_4()
-                .bg(rgb(0x242424))
-                .child(div().flex_1().child(Input::new(&self.input)))
-                .child(
-                    Button::new("send")
-                        .primary()
-                        .label("发送")
-                        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.submit(window, cx))),
-                ),
-        )
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .p_4()
+            .rounded_lg()
+            .bg(rgb(BRAND_SOFT))
+            .border_1()
+            .border_color(rgb(BRAND_BORDER))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_lg()
+                                    .text_color(rgb(BRAND))
+                                    .child("⚠"),
+                            )
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(rgb(TEXT))
+                                    .child("需要确认"),
+                            )
+                            .child(pill(
+                                format!("{} {}", req.risk.label(), "").trim().to_string(),
+                                BRAND_SOFT,
+                                BRAND,
+                            )),
+                    )
+                    .child(actions),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(TEXT_MUTED))
+                    .child(req.summary.clone()),
+            )
+            .child(
+                div()
+                    .p_3()
+                    .rounded(px(8.0))
+                    .bg(rgb(0xEFEFEC))
+                    .text_sm()
+                    .font_family(MONO)
+                    .text_color(rgb(TEXT))
+                    .child(compact_args(&req.arguments)),
+            )
+            .into_any_element()
+    }
+}
+
+impl Render for ChatView {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // ─── 顶部状态栏 ───
+        let status_dot_color = if self.status == "Ready" { OK } else { BRAND };
+        let status_bg = if self.status == "Ready" { OK_SOFT } else { BRAND_SOFT };
+        let status_fg = if self.status == "Ready" { OK } else { BRAND };
+
+        let header = div()
+            .h(px(52.0))
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .justify_between()
+            .px_6()
+            .border_b_1()
+            .border_color(rgb(BORDER_SOFT))
+            .bg(rgb(BG_MAIN))
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(TEXT_MUTED))
+                    .child(self.cwd.clone()),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .px_3()
+                            .py_1()
+                            .rounded_full()
+                            .bg(rgb(status_bg))
+                            .child(div().size(px(6.0)).rounded_full().bg(rgb(status_dot_color)))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(rgb(status_fg))
+                                    .child(self.status.clone()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(TEXT))
+                            .child(format!(
+                                "{:.1}k / {}",
+                                self.usage.input_tokens as f64 / 1000.0,
+                                self.usage.output_tokens
+                            )),
+                    ),
+            );
+
+        // ─── 消息流 ───
+        let mut feed = div().flex().flex_col().gap_6().px_8().py_8();
+        for m in &self.messages {
+            feed = feed.child(self.render_message(m));
+        }
+        if let Some(s) = &self.streaming {
+            if !s.is_empty() {
+                feed = feed.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(role_label("ZEX"))
+                        .child(
+                            div()
+                                .flex()
+                                .items_end()
+                                .gap_1()
+                                .child(div().text_lg().text_color(rgb(TEXT)).child(s.clone()))
+                                // 流式光标
+                                .child(
+                                    div()
+                                        .w(px(3.0))
+                                        .h(px(18.0))
+                                        .bg(rgb(BRAND))
+                                        .mb(px(3.0)),
+                                ),
+                        ),
+                );
+            }
+        }
+
+        let feed_scroll = div()
+            .flex_1()
+            .min_h(px(0.0))
+            .bg(rgb(BG_MAIN))
+            .overflow_y_scrollbar()
+            .child(feed);
+
+        // ─── 底部区域 ───
+        let mut bottom = div().flex().flex_col().gap_3().px_8().pb_5();
+
+        if self.approval.is_some() {
+            bottom = bottom.child(self.render_approval(cx));
+        }
+        bottom = bottom.child(self.render_composer(cx));
+
+        div()
+            .size_full()
+            .flex()
+            .bg(rgb(BG_MAIN))
+            .text_color(rgb(TEXT))
+            .child(self.render_sidebar(cx))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .h_full()
+                    .flex()
+                    .flex_col()
+                    .child(header)
+                    .child(feed_scroll)
+                    .child(bottom),
+            )
+    }
+}
+
+/// 把 JSON 参数压成一行短摘要。
+fn compact_args(v: &serde_json::Value) -> String {
+    let s = v.to_string().replace('\n', " ");
+    if s.chars().count() > 200 {
+        format!("{}…", s.chars().take(200).collect::<String>())
+    } else {
+        s
     }
 }
 
 /// 按平台选择 UI 字体。
-///
-/// 默认的虚拟字体 `.SystemUIFont` 在 Linux 上解析不到（会回退到 Segoe UI，
-/// 那也是 Windows 字体），结果中文渲染成方框。这里显式指定一个装了的字体，
-/// 并允许用 `ZEX_UI_FONT` 覆盖。
 fn apply_platform_font(cx: &mut App) {
     let candidate = std::env::var("ZEX_UI_FONT").ok().unwrap_or_else(|| {
         if cfg!(target_os = "linux") {
@@ -342,18 +797,80 @@ fn apply_platform_font(cx: &mut App) {
             "Microsoft YaHei".to_string()
         }
     });
-    let theme = cx.global_mut::<gpui_kit::component::Theme>();
-    theme.font_family = candidate.into();
+    cx.global_mut::<gpui_kit::component::Theme>().font_family = candidate.into();
 }
 
-/// 把 JSON 参数压成一行短摘要。
-fn compact_args(v: &serde_json::Value) -> String {
-    let s = v.to_string().replace('\n', " ");
-    if s.chars().count() > 160 {
-        format!("{}…", s.chars().take(160).collect::<String>())
-    } else {
-        s
+/// 把持久化的 Message 映射成展示项。
+///
+/// 带工具调用的 assistant 消息不单独展示 —— 它的内容由随后的
+/// ToolResult 承载，重复展示会让历史看起来很吵。
+fn history_to_items(msgs: &[zex_core::Message]) -> Vec<MsgItem> {
+    use zex_core::Message;
+    let mut out = Vec::new();
+    for m in msgs {
+        match m {
+            Message::User { .. } => {
+                out.push(MsgItem { kind: MsgKind::User, text: m.text() });
+            }
+            Message::Assistant { tool_calls, .. } => {
+                if tool_calls.is_empty() {
+                    let t = m.text();
+                    if !t.trim().is_empty() {
+                        out.push(MsgItem { kind: MsgKind::Assistant, text: t });
+                    }
+                }
+            }
+            Message::Tool { content, is_error, .. } => {
+                out.push(MsgItem {
+                    kind: MsgKind::ToolResult { ok: !*is_error, output: content.clone() },
+                    text: String::new(),
+                });
+            }
+            Message::System { .. } => {}
+        }
     }
+    out
+}
+
+/// 从数据库读出最近的会话，供侧栏展示。
+fn load_sessions(store: &zex_store::Store, active: &str) -> Vec<SessionItem> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
+    store
+        .list_sessions(20)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| {
+            let delta = now - s.updated_at;
+            let when = if delta < 3600 {
+                format!("{} 分钟前", (delta / 60).max(1))
+            } else if delta < 86_400 {
+                format!("{} 小时前", delta / 3600)
+            } else if delta < 172_800 {
+                "昨天".to_string()
+            } else {
+                // 简化：只显示天数差，避免引入时间格式化依赖
+                format!("{} 天前", delta / 86_400)
+            };
+            let title = if s.title.trim().is_empty() {
+                // session id 形如 ses_<uuidv7>，前缀是时间戳所以彼此相同；
+                // 取尾部 6 位才能区分
+                let raw = s.id.as_str();
+                let tail = if raw.len() > 6 { &raw[raw.len() - 6..] } else { raw };
+                format!("会话 {tail}")
+            } else {
+                s.title
+            };
+            SessionItem { id: s.id.as_str().to_string(), title, when }
+        })
+        .map(|mut s| {
+            s.id = if s.id == active { active.to_string() } else { s.id };
+            s
+        })
+        .collect()
 }
 
 fn main() {
@@ -372,7 +889,7 @@ fn main() {
         }
     };
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let agent = match build_agent(&cfg, cwd) {
+    let agent = match zex_app::build_agent_resuming(&cfg, cwd.clone()) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("无法初始化内核: {e}");
@@ -381,19 +898,51 @@ fn main() {
     };
 
     let broker = agent.approvals();
-    let CoreHandles { cmd_tx, mut event_rx } = zex_app::spawn_core(agent);
+    let active_session = agent.session_id().as_str().to_string();
+    let sessions = load_sessions(agent.store(), &active_session);
+    let model = cfg.model.clone();
+    let cwd_str = cwd.display().to_string();
+    let history = history_to_items(agent.history());
+    let handles = zex_app::spawn_core(agent);
+    let cmd_tx = handles.cmd_tx.clone();
+    let mut event_rx = handles.event_rx;
 
     gpui_kit::application().run(move |cx| {
         gpui_kit::init(cx);
+        // 设计稿是浅色主题
+        gpui_kit::component::Theme::change(
+            gpui_kit::component::ThemeMode::Light,
+            None,
+            cx,
+        );
         apply_platform_font(cx);
 
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                point(px(80.0), px(60.0)),
+                size(px(1280.0), px(820.0)),
+            ))),
+            titlebar: Some(TitlebarOptions {
+                title: Some("Zex".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
         let (handle, view) = match gpui_kit::open_window(
-            WindowOptions::default(),
+            options,
             cx,
             |window, cx| {
+                // niri/sway 这类平铺器会忽略 WindowOptions 里的初始尺寸，
+                // 这里再显式要一次；被忽略也无害（浮动窗口自行决定）。
+                window.resize(size(px(1280.0), px(820.0)));
                 let tx = cmd_tx.clone();
                 let broker = broker.clone();
-                cx.new(|cx| ChatView::new(tx, broker, window, cx))
+                let sessions = sessions.clone();
+                let active = active_session.clone();
+                let cwd = cwd_str.clone();
+                let model = model.clone();
+                let history = history.clone();
+                cx.new(|cx| ChatView::new(tx, broker, sessions, active, cwd, model, history, window, cx))
             },
         ) {
             Ok(v) => v,
@@ -405,17 +954,13 @@ fn main() {
         let _ = handle;
 
         let weak = view.downgrade();
-        let cmd_tx = cmd_tx.clone();
         cx.spawn(async move |cx| {
             while let Some(ev) = event_rx.recv().await {
-                let alive = weak
-                    .update(cx, |this, cx| this.handle_event(ev, cx))
-                    .is_ok();
+                let alive = weak.update(cx, |this, cx| this.handle_event(ev, cx)).is_ok();
                 if !alive {
                     break;
                 }
             }
-            let _ = cmd_tx.send(UiCommand::Shutdown).await;
         })
         .detach();
     });
