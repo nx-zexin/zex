@@ -152,6 +152,88 @@ impl Agent {
         self.cancelled.clone()
     }
 
+    /// 首轮对话后自动给会话起标题。
+    ///
+    /// 用一次独立的小请求（不带工具、输出上限很小）。返回 `Some(标题)`
+    /// 表示已在库里写好；任何一步失败都返回 `Ok(None)` —— 起标题是锦上
+    /// 添花，不该让主流程报错。
+    pub async fn maybe_autotitle(&self) -> Result<Option<String>> {
+        // 已有标题就不覆盖：用户手动改过的名字更该留住
+        if let Some(s) = self.store.get_session(&self.session)? {
+            if !s.title.trim().is_empty() {
+                return Ok(None);
+            }
+        }
+
+        // 只给"刚开始"的会话起名。历史一长，第一条往往是「你好」，
+        // 拿它当标题既不贴切也没意义 —— 那种情况留给用户手动改。
+        let user_turns = self
+            .history
+            .iter()
+            .filter(|m| matches!(m, Message::User { .. }))
+            .count();
+        if user_turns > 2 {
+            return Ok(None);
+        }
+
+        let Some(user_text) = self
+            .history
+            .iter()
+            .find_map(|m| match m {
+                Message::User { .. } => Some(m.text()),
+                _ => None,
+            })
+            .filter(|t| !t.trim().is_empty())
+        else {
+            return Ok(None);
+        };
+
+        let assistant_text = self
+            .history
+            .iter()
+            .find_map(|m| match m {
+                Message::Assistant { tool_calls, .. } if tool_calls.is_empty() => Some(m.text()),
+                _ => None,
+            })
+            .unwrap_or_default();
+
+        let excerpt = format!(
+            "用户：{}\n助手：{}",
+            truncate_chars(&user_text, 400),
+            truncate_chars(&assistant_text, 200)
+        );
+
+        let req = ChatRequest {
+            system: Some(
+                "你负责给对话起标题。只输出标题本身，不要引号、不要解释、不要以标点结尾。"
+                    .to_string(),
+            ),
+            messages: vec![Message::user(format!(
+                "用不超过 12 个汉字概括下面这段对话的主题：\n\n{excerpt}"
+            ))],
+            tools: Vec::new(),
+            max_tokens: 48,
+            temperature: Some(0.2),
+        };
+
+        let mut stream =
+            zex_llm::stream_chat(&self.http, &self.cfg.provider, &self.cfg.model, req).await?;
+        let mut raw = String::new();
+        while let Some(item) = stream.next().await {
+            if let StreamEvent::Text(t) = item? {
+                raw.push_str(&t);
+            }
+        }
+
+        let title = clean_title(&raw);
+        if title.is_empty() {
+            return Ok(None);
+        }
+        self.store.rename_session(&self.session, &title)?;
+        tracing::info!(session = %self.session, title = %title, "自动生成会话标题");
+        Ok(Some(title))
+    }
+
     /// 请求中断当前轮。已经结束的轮次不受影响。
     pub fn request_cancel(&self) {
         self.cancelled.store(true, Ordering::SeqCst);
@@ -684,6 +766,28 @@ impl Agent {
     }
 }
 
+/// 按字符数截断（不是字节），避免切碎多字节字符。
+fn truncate_chars(s: &str, limit: usize) -> String {
+    let n = s.chars().count();
+    if n <= limit {
+        s.to_string()
+    } else {
+        format!("{}…", s.chars().take(limit).collect::<String>())
+    }
+}
+
+/// 清理模型返回的标题：去引号、去末尾标点、压到一行。
+fn clean_title(raw: &str) -> String {
+    let line = raw.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+    let trimmed = line
+        .trim()
+        .trim_matches(['"', '\'', '「', '」', '『', '』', '《', '》', '*', '#', ' '])
+        .trim_end_matches(['。', '.', '，', ',', '！', '!', '？', '?', '：', ':'])
+        .trim();
+    // 再兜一层长度上限：模型偶尔不听话，会写一整句
+    truncate_chars(trimmed, 20)
+}
+
 /// 工具结果的一句话摘要，供 UI 展示（不塞全文，避免 UI 卡顿）。
 fn brief(content: &str) -> String {
     let first = content.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
@@ -709,6 +813,27 @@ pub fn ensure_call_id(id: &ToolCallId, index: usize) -> ToolCallId {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clean_title_strips_quotes_and_punctuation() {
+        assert_eq!(clean_title("「关于贪吃蛇」"), "关于贪吃蛇");
+        assert_eq!(clean_title("\"调试滚动问题。\""), "调试滚动问题");
+        assert_eq!(clean_title("  **密钥保护**  "), "密钥保护");
+        // 模型偶尔不听话写一整句，要截断
+        assert!(clean_title(&"标".repeat(50)).chars().count() <= 21);
+    }
+
+    #[test]
+    fn clean_title_skips_leading_blank_lines() {
+        assert_eq!(clean_title("\n\n真正的标题\n第二行"), "真正的标题");
+    }
+
+    #[test]
+    fn truncate_chars_counts_chars_not_bytes() {
+        // 中文按字符算，不能按字节切（否则会切碎 UTF-8）
+        assert_eq!(truncate_chars("中文测试", 2).chars().count(), 3); // "中文…"
+        assert_eq!(truncate_chars("abc", 10), "abc");
+    }
 
     #[test]
     fn brief_truncates_long_first_line() {

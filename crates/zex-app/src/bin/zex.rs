@@ -74,6 +74,10 @@ struct ChatView {
     input: Entity<InputState>,
     messages: Vec<MsgItem>,
     streaming: Option<String>,
+    /// 重命名会话用的输入框（侧栏内联编辑）。
+    rename_input: Entity<InputState>,
+    /// 是否正处于重命名状态。
+    renaming: bool,
     /// 消息区的虚拟列表状态。
     ///
     /// 之前用手写的 `ScrollHandle` + `overflow_y_scrollbar`，但实测
@@ -139,12 +143,15 @@ impl ChatView {
         }
 
         let scroller = cx.new(|cx| MessageScrollerState::new(history.len(), cx));
+        let rename_input = cx.new(|cx| InputState::new(window, cx).placeholder("会话标题"));
 
         ChatView {
             input,
             messages: history,
             streaming: None,
             scroller,
+            rename_input,
+            renaming: false,
             running_tool: None,
             status: "Ready".into(),
             approval: None,
@@ -359,11 +366,24 @@ impl ChatView {
             CoreEvent::Warning { message } => {
                 self.messages.push(MsgItem { kind: MsgKind::System, text: message });
             }
-            CoreEvent::SessionSwitched { session, history } => {
+            CoreEvent::SessionTitled { session, title } => {
+                // 侧栏和当前标题一起更新：这个事件既可能来自自动起名，
+                // 也可能来自用户手动重命名
+                if let Some(item) = self.sessions.iter_mut().find(|s| s.id == session) {
+                    item.title = title.clone();
+                }
+                self.status = "Ready".into();
+            }
+            CoreEvent::SessionSwitched {
+                session,
+                history,
+                sessions,
+            } => {
                 // 整体替换而不是追加：切换会话是"换一个世界"，
                 // 旧消息一条都不该留下。
                 self.messages = history_to_items(&history);
                 self.active_session = session;
+                self.sessions = summaries_to_items(&sessions);
                 self.streaming = None;
                 self.running_tool = None;
                 self.status = "Ready".into();
@@ -601,35 +621,64 @@ impl ChatView {
 
         for s in &self.sessions {
             let active = s.id == self.active_session;
-            // Button 的 on_click 是固有方法；Div 在这个 kit 里没有暴露点击能力，
-            // 所以可点行直接用 ghost 按钮。
-            let mut btn = Button::new(s.id.clone())
-                .ghost()
+            // 用 div 自己排版而不是 Button：Button 只有单个 label，
+            // 标题和时间拼在一起时会被整体截断（"初次问候 · 2m" 变成 "·候 · 2m"）。
+            let mut row = div()
                 .w_full()
-                .label(format!("{}  ·  {}", s.title, s.when));
+                .h(px(34.0))
+                .px_3()
+                .flex()
+                .items_center()
+                .gap_2()
+                .rounded(px(6.0))
+                .text_sm()
+                .cursor_pointer();
 
-            if active {
-                btn = btn.toggled(true);
+            row = if active {
+                row.bg(rgb(BG_HOVER)).text_color(rgb(TEXT))
             } else {
+                row.text_color(rgb(TEXT_MUTED))
+            };
+
+            row = row
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .truncate()
+                        .child(s.title.clone()),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .text_xs()
+                        .text_color(rgb(TEXT_DIM))
+                        .child(s.when.clone()),
+                );
+
+            if !active {
                 let id = s.id.clone();
                 let tx = self.cmd_tx.clone();
-                btn = btn.on_click(cx.listener(move |this, _ev: &ClickEvent, _window, cx| {
-                    let id = id.clone();
-                    let tx = tx.clone();
-                    this.status = "切换中…".into();
-                    cx.spawn(async move |_this, _cx| {
-                        let _ = tx
-                            .send(UiCommand::SwitchSession {
-                                session: zex_core::SessionId::from(id),
-                            })
-                            .await;
-                    })
-                    .detach();
-                    cx.notify();
-                }));
+                row = row.on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _ev, _window, cx| {
+                        let id = id.clone();
+                        let tx = tx.clone();
+                        this.status = "切换中…".into();
+                        cx.spawn(async move |_this, _cx| {
+                            let _ = tx
+                                .send(UiCommand::SwitchSession {
+                                    session: zex_core::SessionId::from(id),
+                                })
+                                .await;
+                        })
+                        .detach();
+                        cx.notify();
+                    }),
+                );
             }
 
-            list = list.child(btn);
+            list = list.child(row);
         }
 
         div()
@@ -696,9 +745,94 @@ impl ChatView {
                 ),
             )
             .child(div().flex_1().min_h(px(0.0)).child(list))
-            // 清空当前会话：开新话题时不用留一堆旧消息占着上下文
+            // 重命名 / 清空
             .child(
-                div().px_3().pb_2().child(
+                div()
+                    .px_3()
+                    .pb_2()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(if self.renaming {
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(Input::new(&self.rename_input))
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap_2()
+                                    .child(
+                                        Button::new("rename-ok")
+                                            .primary()
+                                            .label("确定")
+                                            .on_click(cx.listener(
+                                                |this, _: &ClickEvent, _w, cx| {
+                                                    let title = this
+                                                        .rename_input
+                                                        .read(cx)
+                                                        .value()
+                                                        .trim()
+                                                        .to_string();
+                                                    if title.is_empty() {
+                                                        this.renaming = false;
+                                                        cx.notify();
+                                                        return;
+                                                    }
+                                                    let session =
+                                                        this.active_session.clone();
+                                                    let tx = this.cmd_tx.clone();
+                                                    this.renaming = false;
+                                                    cx.spawn(async move |_this, _cx| {
+                                                        let _ = tx
+                                                            .send(UiCommand::RenameSession {
+                                                                session:
+                                                                    zex_core::SessionId::from(
+                                                                        session,
+                                                                    ),
+                                                                title,
+                                                            })
+                                                            .await;
+                                                    })
+                                                    .detach();
+                                                    cx.notify();
+                                                },
+                                            )),
+                                    )
+                                    .child(
+                                        Button::new("rename-cancel")
+                                            .label("取消")
+                                            .on_click(cx.listener(
+                                                |this, _: &ClickEvent, _w, cx| {
+                                                    this.renaming = false;
+                                                    cx.notify();
+                                                },
+                                            )),
+                                    ),
+                            )
+                    } else {
+                        div().child(
+                            Button::new("rename-start")
+                                .ghost()
+                                .w_full()
+                                .label("重命名当前会话")
+                                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                    // 预填当前标题，改起来省事
+                                    let current = this
+                                        .sessions
+                                        .iter()
+                                        .find(|s| s.id == this.active_session)
+                                        .map(|s| s.title.clone())
+                                        .unwrap_or_default();
+                                    this.rename_input
+                                        .update(cx, |st, cx| st.set_value(current, window, cx));
+                                    this.renaming = true;
+                                    cx.notify();
+                                })),
+                        )
+                    })
+                    .child(
                     Button::new("clear-session")
                         .ghost()
                         .w_full()
@@ -1069,6 +1203,37 @@ fn history_to_items(msgs: &[zex_core::Message]) -> Vec<MsgItem> {
 }
 
 /// 从数据库读出最近的会话，供侧栏展示。
+/// 把内核送来的会话摘要转成侧栏项（含相对时间）。
+fn summaries_to_items(list: &[zex_core::event::SessionSummary]) -> Vec<SessionItem> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
+    list.iter()
+        .map(|s| {
+            let delta = (now - s.updated_at).max(0);
+            let when = if delta < 60 {
+                "刚刚".to_string()
+            } else if delta < 3600 {
+                format!("{}m", delta / 60)
+            } else if delta < 86_400 {
+                format!("{}h", delta / 3600)
+            } else {
+                format!("{}d", delta / 86_400)
+            };
+            let title = if s.title.trim().is_empty() {
+                let raw = s.id.as_str();
+                let tail = if raw.len() > 6 { &raw[raw.len() - 6..] } else { raw };
+                format!("会话 {tail}")
+            } else {
+                s.title.clone()
+            };
+            SessionItem { id: s.id.clone(), title, when }
+        })
+        .collect()
+}
+
 fn load_sessions(store: &zex_store::Store, active: &str) -> Vec<SessionItem> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1080,16 +1245,15 @@ fn load_sessions(store: &zex_store::Store, active: &str) -> Vec<SessionItem> {
         .unwrap_or_default()
         .into_iter()
         .map(|s| {
-            let delta = now - s.updated_at;
-            let when = if delta < 3600 {
-                format!("{} 分钟前", (delta / 60).max(1))
+            let delta = (now - s.updated_at).max(0);
+            let when = if delta < 60 {
+                "刚刚".to_string()
+            } else if delta < 3600 {
+                format!("{}m", delta / 60)
             } else if delta < 86_400 {
-                format!("{} 小时前", delta / 3600)
-            } else if delta < 172_800 {
-                "昨天".to_string()
+                format!("{}h", delta / 3600)
             } else {
-                // 简化：只显示天数差，避免引入时间格式化依赖
-                format!("{} 天前", delta / 86_400)
+                format!("{}d", delta / 86_400)
             };
             let title = if s.title.trim().is_empty() {
                 // session id 形如 ses_<uuidv7>，前缀是时间戳所以彼此相同；

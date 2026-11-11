@@ -118,6 +118,13 @@ pub enum CoreEvent {
         /// 描述。
         message: String,
     },
+    /// 会话标题已更新（自动生成或用户重命名）。
+    SessionTitled {
+        /// 会话 id。
+        session: String,
+        /// 新标题。
+        title: String,
+    },
     /// 已切换到另一个会话，附带该会话的完整历史。
     ///
     /// 历史随事件一起送来，UI 不必再去查库 —— 否则容易和内核的
@@ -127,6 +134,8 @@ pub enum CoreEvent {
         session: String,
         /// 历史消息。
         history: Vec<crate::message::Message>,
+        /// 最新的会话列表（新建/清空/切换后侧栏要跟着变）。
+        sessions: Vec<SessionSummary>,
     },
 }
 
@@ -149,6 +158,20 @@ pub struct ApprovalRequest {
     pub grantable: bool,
     /// 参数是否含有来自不可信来源的内容（提示注入防线，见 SECURITY.md §5.2）。
     pub tainted: bool,
+}
+
+/// 侧栏用的会话摘要。
+///
+/// `zex-core` 不依赖 `zex-store`（分层：内核不认识 SQLite），所以这里
+/// 用一个最简 DTO 把必要字段带过去。
+#[derive(Debug, Clone)]
+pub struct SessionSummary {
+    /// 会话 id。
+    pub id: String,
+    /// 标题（可能为空，由 UI 决定怎么显示）。
+    pub title: String,
+    /// 最后更新时间（unix 秒）。
+    pub updated_at: i64,
 }
 
 /// UI → 内核的命令。
@@ -184,6 +207,13 @@ pub enum UiCommand {
     NewSession,
     /// 清空当前会话的消息（保留会话本身）。
     ClearSession,
+    /// 给会话改名。
+    RenameSession {
+        /// 目标会话。
+        session: SessionId,
+        /// 新标题。
+        title: String,
+    },
     /// 切换到另一个会话。
     SwitchSession {
         /// 目标会话。

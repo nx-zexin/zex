@@ -89,6 +89,21 @@ pub struct CoreHandles {
 /// 在独立线程上启动 tokio 内核。
 ///
 /// 这是 ADR-002 双世界桥接的落地：gpui 主线程只做渲染，
+/// 从 store 读最近会话，转成事件里的摘要。
+fn session_summaries(agent: &Agent) -> Vec<zex_core::event::SessionSummary> {
+    agent
+        .store()
+        .list_sessions(20)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| zex_core::event::SessionSummary {
+            id: s.id.to_string(),
+            title: s.title,
+            updated_at: s.updated_at,
+        })
+        .collect()
+}
+
 /// 内核在 tokio 世界里跑，两者用 channel 通信（内存 channel，零序列化）。
 pub fn spawn_core(mut agent: Agent) -> CoreHandles {
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<UiCommand>(64);
@@ -117,6 +132,23 @@ pub fn spawn_core(mut agent: Agent) -> CoreHandles {
                                     .send(CoreEvent::Fatal { message: e.to_string() })
                                     .await;
                             }
+                            // 首轮之后给会话起个名字。内部会跳过已有标题的会话，
+                            // 所以后续轮次不会重复请求模型。
+                            match agent.maybe_autotitle().await {
+                                Ok(Some(title)) => {
+                                    let _ = ev_tx
+                                        .send(CoreEvent::SessionTitled {
+                                            session: agent.session_id().to_string(),
+                                            title,
+                                        })
+                                        .await;
+                                }
+                                Ok(None) => {}
+                                Err(e) => {
+                                    // 起标题失败不值得打扰用户
+                                    tracing::warn!(error = %e, "自动生成标题失败");
+                                }
+                            }
                         }
                         UiCommand::Approve { id, remember } => {
                             let _ = broker
@@ -128,6 +160,29 @@ pub fn spawn_core(mut agent: Agent) -> CoreHandles {
                                 .resolve(&id, ApprovalDecision::Reject { reason })
                                 .await;
                         }
+                        UiCommand::RenameSession { session, title } => {
+                            let title = title.trim().to_string();
+                            if title.is_empty() {
+                                let _ = ev_tx
+                                    .send(CoreEvent::Warning {
+                                        message: "标题不能为空".into(),
+                                    })
+                                    .await;
+                            } else if let Err(e) = agent.store().rename_session(&session, &title) {
+                                let _ = ev_tx
+                                    .send(CoreEvent::Warning {
+                                        message: format!("重命名失败：{e}"),
+                                    })
+                                    .await;
+                            } else {
+                                let _ = ev_tx
+                                    .send(CoreEvent::SessionTitled {
+                                        session: session.to_string(),
+                                        title,
+                                    })
+                                    .await;
+                            }
+                        }
                         UiCommand::ClearSession => {
                             match agent.clear() {
                                 Ok(()) => {
@@ -135,6 +190,7 @@ pub fn spawn_core(mut agent: Agent) -> CoreHandles {
                                         .send(CoreEvent::SessionSwitched {
                                             session: agent.session_id().to_string(),
                                             history: Vec::new(),
+                                            sessions: session_summaries(&agent),
                                         })
                                         .await;
                                 }
@@ -154,6 +210,7 @@ pub fn spawn_core(mut agent: Agent) -> CoreHandles {
                                         .send(CoreEvent::SessionSwitched {
                                             session: agent.session_id().to_string(),
                                             history: Vec::new(),
+                                            sessions: session_summaries(&agent),
                                         })
                                         .await;
                                 }
@@ -173,6 +230,7 @@ pub fn spawn_core(mut agent: Agent) -> CoreHandles {
                                         .send(CoreEvent::SessionSwitched {
                                             session: session.to_string(),
                                             history: agent.history().to_vec(),
+                                            sessions: session_summaries(&agent),
                                         })
                                         .await;
                                 }
