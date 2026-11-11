@@ -65,6 +65,9 @@ cargo run -p zex-app --bin zex-cli -- "帮我看看当前目录是什么项目"
 | [docs/SECURITY.md](docs/SECURITY.md) | 权限分级、审批、审计、提示注入防护 |
 | [docs/M0-PLAN.md](docs/M0-PLAN.md) | M0 逐项任务与验收标准 |
 | [docs/research/inherited-design.md](docs/research/inherited-design.md) | 从 Zebra 继承的设计资产筛选 |
+| [docs/M1-REPORT.md](docs/M1-REPORT.md) | M1 完成报告（权限闸门 / 持久化 / 压缩 / 界面） |
+| [docs/design/ui-spec.md](docs/design/ui-spec.md) | **界面规格**：最终产品形态、布局、视觉令牌 |
+| [docs/design/ui-prompt.md](docs/design/ui-prompt.md) | 文生图提示词（用于产出设计稿） |
 
 ---
 
