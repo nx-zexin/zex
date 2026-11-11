@@ -8839,7 +8839,10 @@ dependencies = [
 name = "zex-agent"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "reqwest",
+ "schemars",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",

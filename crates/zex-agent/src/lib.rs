@@ -12,6 +12,7 @@
 #![warn(missing_docs)]
 
 pub mod approval;
+pub mod subagent;
 pub mod compress;
 pub mod context;
 pub mod prompt;

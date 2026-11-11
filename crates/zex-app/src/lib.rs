@@ -130,8 +130,28 @@ pub fn spawn_core(mut agent: Agent) -> CoreHandles {
     // 任务执行器的原料。都是克隆成本很低的类型（Arc / 配置结构），
     // 每个任务拿一份，互不干扰。
     let cfg = agent.config().clone();
-    let tools = agent.tools().to_vec();
     let store = agent.store().clone();
+
+    // 子智能体注册表：所有会话共用一个。工具要拿到 Arc 才能 spawn，
+    // 而注册表又要工具集才能构造子 agent —— 用 install 打破这个循环。
+    let registry = Arc::new(zex_agent::subagent::AgentRegistry::new());
+    let mut tools = agent.tools().to_vec();
+    tools.push(Arc::new(zex_agent::subagent::SpawnAgent {
+        registry: registry.clone(),
+    }));
+    tools.push(Arc::new(zex_agent::subagent::TeamStatus {
+        registry: registry.clone(),
+    }));
+    tools.push(Arc::new(zex_agent::subagent::WaitForAgents {
+        registry: registry.clone(),
+    }));
+    registry.install(
+        cfg.clone(),
+        tools.clone(),
+        store.clone(),
+        ev_tx.clone(),
+        broker.clone(),
+    );
     let session_locks: SessionLocks = Arc::new(Mutex::new(HashMap::new()));
 
     let spawn_result = std::thread::Builder::new()
