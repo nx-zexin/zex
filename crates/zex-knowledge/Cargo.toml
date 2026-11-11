@@ -1,0 +1,15 @@
+[package]
+name = "zex-knowledge"
+description = "知识库：切块、embedding、混合检索"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+zex-core.workspace = true
+

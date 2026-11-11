@@ -1,0 +1,83 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/adam/zex"
+authors = ["Adam"]
+
+[workspace.dependencies]
+# ─── 内部 crate ───
+zex-core = { path = "crates/zex-core" }
+zex-llm = { path = "crates/zex-llm" }
+zex-store = { path = "crates/zex-store" }
+zex-policy = { path = "crates/zex-policy" }
+zex-agent = { path = "crates/zex-agent" }
+zex-tools = { path = "crates/zex-tools" }
+zex-platform = { path = "crates/zex-platform" }
+zex-browser = { path = "crates/zex-browser" }
+zex-knowledge = { path = "crates/zex-knowledge" }
+zex-evolve = { path = "crates/zex-evolve" }
+zex-schedule = { path = "crates/zex-schedule" }
+zex-app = { path = "crates/zex-app" }
+
+# ─── 序列化 ───
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "1"
+
+# ─── 错误处理 ───
+thiserror = "2"
+anyhow = "1"
+
+# ─── 异步 ───
+async-trait = "0.1"
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "sync",
+    "time",
+    "fs",
+    "process",
+    "io-util",
+    "net",
+] }
+tokio-util = { version = "0.7", features = ["codec"] }
+futures = "0.3"
+bytes = "1"
+
+# ─── 网络 ───
+reqwest = { version = "0.13", default-features = false, features = [
+    "json",
+    "stream",
+    "rustls-tls",
+] }
+
+# ─── 存储 ───
+rusqlite = { version = "0.41", features = ["bundled"] }
+
+# ─── 观测 ───
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# ─── 杂项 ───
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# ─── UI ───
+gpui-kit = "0.9"
+
+[workspace.lints.rust]
+unsafe_code = "warn"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+# 三平台代码里最危险的宏：在 Linux 上永远跑不到，在 Windows 上一跑就崩（见 docs/PLATFORM.md §3）
+todo = "deny"
+unimplemented = "deny"
+unwrap_used = "warn"
+expect_used = "warn"

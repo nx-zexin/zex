@@ -1,0 +1,15 @@
+[package]
+name = "zex-llm"
+description = "LLM 客户端：OpenAI 兼容 + Anthropic 双协议，SSE 流式"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+zex-core.workspace = true
+

@@ -1,0 +1,109 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  # ─────────────────────────────────────────────────────────────
+  # 三平台矩阵。铁律：任何 commit 不允许只有一个平台绿
+  # （见 docs/PLATFORM.md §4）。
+  #
+  # fail-fast: false 是关键 —— 一个平台挂了不应该取消其他平台的运行，
+  # 否则你永远不知道另外两个平台是不是也挂了。
+  # ─────────────────────────────────────────────────────────────
+  test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: 缓存
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ matrix.os }}
+
+      # Linux 需要 gpui 的系统库
+      - name: 安装 Linux 依赖
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxkbcommon-dev \
+            libwayland-dev \
+            libx11-dev \
+            libxcb1-dev \
+            libfontconfig1-dev \
+            libfreetype6-dev \
+            libasound2-dev \
+            libssl-dev \
+            pkg-config \
+            cmake
+
+      - name: 格式检查
+        run: cargo fmt --all -- --check
+
+      - name: 编译
+        run: cargo check --workspace --all-targets
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: 测试
+        run: cargo test --workspace
+
+  # ─────────────────────────────────────────────────────────────
+  # 架构约束检查。这些不是风格问题，是分层破坏。
+  # ─────────────────────────────────────────────────────────────
+  architecture:
+    name: 分层约束
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: zex-core 不得依赖 IO / 异步运行时 / UI
+        run: |
+          set -e
+          forbidden='tokio|reqwest|rusqlite|gpui-kit|gpui\b|hyper|sqlx'
+          if grep -Eq "$forbidden" crates/zex-core/Cargo.toml; then
+            echo "::error::zex-core 依赖了禁止的 crate（见 docs/ARCHITECTURE.md §3）"
+            grep -En "$forbidden" crates/zex-core/Cargo.toml
+            exit 1
+          fi
+
+      - name: 内核不得依赖 gpui
+        run: |
+          set -e
+          for c in zex-agent zex-llm zex-store zex-policy zex-tools; do
+            if grep -Eq 'gpui-kit' "crates/$c/Cargo.toml"; then
+              echo "::error::$c 依赖了 gpui-kit，破坏内核/UI 分层（ADR-002）"
+              exit 1
+            fi
+          done
+
+      - name: 平台代码不得有 todo!() / unimplemented!()
+        run: |
+          set -e
+          if grep -rnE 'todo!|unimplemented!' crates/zex-platform/src/ 2>/dev/null; then
+            echo "::error::三平台代码里的 todo!() 在 Linux 上永远跑不到，在 Windows 上一跑就崩（docs/PLATFORM.md §3）"
+            exit 1
+          fi

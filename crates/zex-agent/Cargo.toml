@@ -1,0 +1,15 @@
+[package]
+name = "zex-agent"
+description = "agent loop、上下文预算、压缩、工具调度"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+zex-core.workspace = true
+

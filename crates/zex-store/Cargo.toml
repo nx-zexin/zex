@@ -1,0 +1,15 @@
+[package]
+name = "zex-store"
+description = "SQLite 持久化：会话、记忆、知识库、审计。唯一数据入口"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+zex-core.workspace = true
+

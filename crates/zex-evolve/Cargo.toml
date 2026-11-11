@@ -1,0 +1,15 @@
+[package]
+name = "zex-evolve"
+description = "自我进化：distill / 提案 / 验证 / 落盘"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+zex-core.workspace = true
+

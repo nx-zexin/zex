@@ -1,0 +1,15 @@
+[package]
+name = "zex-tools"
+description = "工具实现（fs / shell / web / memory / os / browser …）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+zex-core.workspace = true
+

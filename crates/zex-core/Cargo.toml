@@ -1,0 +1,24 @@
+[package]
+name = "zex-core"
+description = "Zex 核心类型层：不依赖 IO、不依赖 tokio、不依赖 gpui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+# ⚠️ 本 crate 的依赖白名单是硬性约束（见 docs/ARCHITECTURE.md §3）。
+# 出现 tokio / reqwest / rusqlite / gpui-kit 即为分层破坏，CI 会拦截。
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+schemars.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true }
