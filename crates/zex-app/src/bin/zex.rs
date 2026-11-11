@@ -717,6 +717,8 @@ impl ChatView {
             let active = s.id == self.active_session;
             let is_renaming = self.renaming.as_deref() == Some(s.id.as_str());
 
+            // 每行一个独立的 group：同名 group 会让 hover 一行点亮全部行
+            let group = format!("item-{}", s.id);
             let mut row = div()
                 .w_full()
                 .h(px(34.0))
@@ -724,7 +726,8 @@ impl ChatView {
                 .flex()
                 .items_center()
                 .gap_1()
-                .rounded(px(6.0));
+                .rounded(px(6.0))
+                .group(group.clone());
 
             if active {
                 row = row.bg(rgb(BG_HOVER));
@@ -772,16 +775,42 @@ impl ChatView {
                     );
                 }
 
-                row = row
-                    .child(title)
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_xs()
-                            .text_color(rgb(TEXT_DIM))
-                            .child(s.when.clone()),
-                    )
-                    .child(self.render_item_menu(&s.id, cx));
+                // 时间和 ⋯ 叠在同一个格子里：默认看时间，hover 时换成按钮，
+                // 不额外占宽度（侧栏只有 240，多一列标题就放不下了）
+                let (g_time, g_menu) = (group.clone(), group.clone());
+                row = row.child(title).child(
+                    div()
+                        .flex_none()
+                        .relative()
+                        .w(px(44.0))
+                        .h_full()
+                        .child(
+                            div()
+                                .absolute()
+                                .top_0()
+                                .right_0()
+                                .bottom_0()
+                                .flex()
+                                .items_center()
+                                .justify_end()
+                                .text_xs()
+                                .text_color(rgb(TEXT_DIM))
+                                .child(s.when.clone())
+                                .group_hover(g_time, |st| st.invisible()),
+                        )
+                        .child(
+                            div()
+                                .absolute()
+                                .top_0()
+                                .right_0()
+                                .bottom_0()
+                                .flex()
+                                .items_center()
+                                .invisible()
+                                .group_hover(g_menu, |st| st.visible())
+                                .child(self.render_item_menu(&s.id, cx)),
+                        ),
+                );
             }
 
             list = list.child(row);
