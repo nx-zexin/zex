@@ -298,6 +298,8 @@ impl ChatView {
         }
 
         self.input.update(cx, |state, cx| state.set_value("", window, cx));
+        // 派了活就要看到它跑：从工作台自动进入对话视图
+        self.mode = ViewMode::Chat;
         self.messages.push(MsgItem { kind: MsgKind::User, text: text.clone() });
         self.streaming = Some(String::new());
         self.status = "思考中…".into();
@@ -733,6 +735,11 @@ impl ChatView {
                 .child(div().text_sm().text_color(rgb(TEXT_MUTED)).child(headline)),
         );
 
+        // ─── 新任务输入 ───
+        // 放在最上方：打开工作台的第一件事通常是派活，
+        // 而不是先翻旧任务。
+        col = col.child(self.render_composer(cx));
+
         // ─── 需要处理（失败） ───
         if !failed.is_empty() {
             col = col.child(self.render_task_section("需要处理", failed.clone(), cx));
@@ -774,20 +781,6 @@ impl ChatView {
                     ),
             );
         }
-
-        // ─── 开始新对话 ───
-        col = col.child(
-            div().pt_2().child(
-                Button::new("dashboard-new-chat")
-                    .primary()
-                    .label("开始新对话")
-                    .on_click(cx.listener(|this, _: &ClickEvent, _w, cx| {
-                        this.mode = ViewMode::Chat;
-                        let _ = this.cmd_tx.try_send(UiCommand::NewSession);
-                        cx.notify();
-                    })),
-            ),
-        );
 
         col.into_any_element()
     }
