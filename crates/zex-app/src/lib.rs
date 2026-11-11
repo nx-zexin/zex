@@ -28,6 +28,13 @@ pub fn open_store() -> zex_core::Result<Store> {
 /// 把已解析的配置装配成内核。
 pub fn build_agent(cfg: &ResolvedConfig, cwd: PathBuf) -> zex_core::Result<zex_agent::Agent> {
     let store = open_store()?;
+    // 上次进程退出时还在 running 的任务已经不可能再跑了：标成失败并
+    // 写明原因，否则它们会永远挂在「运行中」，dashboard 上说谎。
+    match store.fail_orphaned_running_tasks() {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(count = n, "已标记上次退出时未完成的任务"),
+        Err(e) => tracing::warn!(error = %e, "清理孤儿任务失败"),
+    }
     let agent_cfg = zex_agent::AgentConfig::new(cfg.provider.clone(), cfg.model.clone(), cwd);
     zex_agent::Agent::new(agent_cfg, zex_tools::default_tools(), store)
 }
@@ -38,6 +45,13 @@ pub fn build_agent(cfg: &ResolvedConfig, cwd: PathBuf) -> zex_core::Result<zex_a
 /// 而不是每次都开一个空白会话。
 pub fn build_agent_resuming(cfg: &ResolvedConfig, cwd: PathBuf) -> zex_core::Result<zex_agent::Agent> {
     let store = open_store()?;
+    // 上次进程退出时还在 running 的任务已经不可能再跑了：标成失败并
+    // 写明原因，否则它们会永远挂在「运行中」，dashboard 上说谎。
+    match store.fail_orphaned_running_tasks() {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(count = n, "已标记上次退出时未完成的任务"),
+        Err(e) => tracing::warn!(error = %e, "清理孤儿任务失败"),
+    }
     let agent_cfg = zex_agent::AgentConfig::new(cfg.provider.clone(), cfg.model.clone(), cwd);
 
     // 跳过空会话：每次启动都会留下一个没说话的会话壳，
@@ -125,9 +139,42 @@ pub fn spawn_core(mut agent: Agent) -> CoreHandles {
                 while let Some(cmd) = cmd_rx.recv().await {
                     match cmd {
                         UiCommand::UserPrompt { text, .. } => {
+                            // 每轮都落一条任务记录：这是「我不在的时候它做了
+                            // 什么」的唯一数据来源。建任务失败不影响执行本身。
+                            let task_id = zex_core::TaskId::generate().to_string();
+                            let session = agent.session_id().as_str().to_string();
+                            if let Err(e) =
+                                agent.store().create_task(&task_id, &session, &text, "")
+                            {
+                                tracing::warn!(error = %e, "建任务记录失败，继续执行");
+                            }
+                            let _ = agent.store().start_task(&task_id);
+
+                            let outcome = agent.run_turn(text, Some(&ev_tx)).await;
+
+                            match &outcome {
+                                Ok(done) => {
+                                    let summary: String = done.chars().take(120).collect();
+                                    let _ = agent.store().finish_task(
+                                        &task_id,
+                                        zex_store::tasks::TaskStatus::Completed,
+                                        Some(&summary),
+                                        None,
+                                    );
+                                }
+                                Err(e) => {
+                                    let _ = agent.store().finish_task(
+                                        &task_id,
+                                        zex_store::tasks::TaskStatus::Failed,
+                                        None,
+                                        Some(&e.to_string()),
+                                    );
+                                }
+                            }
+
                             // 单轮失败不应杀掉整个内核：把错误作为事件上报，
                             // 会话继续可用。
-                            if let Err(e) = agent.run_turn(text, Some(&ev_tx)).await {
+                            if let Err(e) = outcome {
                                 let _ = ev_tx
                                     .send(CoreEvent::Fatal { message: e.to_string() })
                                     .await;

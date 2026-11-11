@@ -57,6 +57,11 @@ define_id! {
 }
 
 define_id! {
+    /// 任务 id（一轮对话在持久化层里的身份）。
+    TaskId, "task"
+}
+
+define_id! {
     /// 单轮对话 id（一次用户输入到最终回复）。
     TurnId, "turn"
 }

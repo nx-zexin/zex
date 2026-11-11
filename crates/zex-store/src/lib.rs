@@ -23,6 +23,7 @@ pub mod grants;
 pub mod migrate;
 pub mod msg;
 pub mod session;
+pub mod tasks;
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};

@@ -7,7 +7,7 @@ use rusqlite::Connection;
 use zex_core::{Error, Result};
 
 /// 当前 schema 版本。新增迁移时 +1。
-pub const LATEST: i64 = 1;
+pub const LATEST: i64 = 2;
 
 /// 跑完所有未应用的迁移。
 pub fn run(conn: &Connection) -> Result<()> {
@@ -26,6 +26,7 @@ pub fn run(conn: &Connection) -> Result<()> {
     while version < LATEST {
         match version {
             0 => v1_initial(conn)?,
+            1 => v2_tasks(conn)?,
             other => {
                 // 正常情况下不可达：version 已在上面校验过 <= LATEST
                 return Err(Error::Store(format!("迁移分支缺失: 版本 {other}")));
@@ -113,6 +114,41 @@ fn v1_initial(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v2：任务表。
+///
+/// 这是「异步执行」的底座：一轮对话不再只是一串消息，而是一条有状态的
+/// 任务。有了它，用户关掉窗口再回来才能回答「我不在的时候它做了什么」。
+fn v2_tasks(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS tasks (
+            id          TEXT PRIMARY KEY,
+            session_id  TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+            -- 原始输入：重跑、审计、展示都用得上
+            prompt      TEXT NOT NULL,
+            -- 展示用标题（沿用会话标题或首行摘要）
+            title       TEXT NOT NULL DEFAULT '',
+            status      TEXT NOT NULL,
+            created_at  INTEGER NOT NULL,
+            started_at  INTEGER,
+            ended_at    INTEGER,
+            -- 成功时的结果摘要
+            summary     TEXT,
+            -- 失败原因
+            error       TEXT,
+            -- 用户是否已在界面上看过（dashboard 的未读标记）
+            seen        INTEGER NOT NULL DEFAULT 0
+        );
+
+        -- dashboard 的主查询：按状态+时间捞
+        CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_tasks_session ON tasks(session_id);
+        "#,
+    )
+    .map_err(|e| Error::Store(format!("v2 迁移失败: {e}")))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -136,7 +172,7 @@ mod tests {
             .map(|r| r.unwrap())
             .collect();
         names.sort();
-        assert_eq!(names, vec!["audit", "grants", "messages", "sessions"]);
+        assert_eq!(names, vec!["audit", "grants", "messages", "sessions", "tasks"]);
     }
 
     #[test]
