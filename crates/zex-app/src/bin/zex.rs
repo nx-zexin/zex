@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerState};
 use gpui_kit::component::text::markdown;
-use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::*;
 
 use tokio::sync::mpsc;
@@ -74,8 +74,14 @@ struct ChatView {
     input: Entity<InputState>,
     messages: Vec<MsgItem>,
     streaming: Option<String>,
-    /// 消息区滚动句柄：新内容到达时跟到底部。
-    feed_scroll: gpui_kit::ScrollHandle,
+    /// 消息区的虚拟列表状态。
+    ///
+    /// 之前用手写的 `ScrollHandle` + `overflow_y_scrollbar`，但实测
+    /// `bounds` 与 `max_offset` 恒为 0（容器没拿到尺寸），滚动定位
+    /// 从未生效过。改用组件库的 `MessageScroller`：它内置
+    /// `FollowMode::Tail`，新内容到达时自动贴底，切会话时 `reset`
+    /// 即可，且是虚拟列表，几百条消息也不会卡。
+    scroller: Entity<MessageScrollerState>,
     running_tool: Option<String>,
     status: String,
     approval: Option<ApprovalRequest>,
@@ -132,11 +138,13 @@ impl ChatView {
             }
         }
 
+        let scroller = cx.new(|cx| MessageScrollerState::new(history.len(), cx));
+
         ChatView {
             input,
             messages: history,
             streaming: None,
-            feed_scroll: gpui_kit::ScrollHandle::new(),
+            scroller,
             running_tool: None,
             status: "Ready".into(),
             approval: None,
@@ -147,6 +155,78 @@ impl ChatView {
             cwd,
             model,
             usage: Usage::default(),
+        }
+    }
+
+    /// 渲染虚拟列表的第 `ix` 行。
+    ///
+    /// `messages.len()` 那一行留给流式中的回复 —— 这样"正在输出"和
+    /// "已落定的消息"共用同一套跟随逻辑，不必单独处理滚动。
+    fn render_row(&self, ix: usize, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        if ix < self.messages.len() {
+            self.render_message(&self.messages[ix], ix, cx)
+        } else {
+            self.render_streaming(cx)
+        }
+    }
+
+    /// 正在流式输出的那条回复。
+    fn render_streaming(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(text) = self.streaming.as_ref() else {
+            return div().into_any_element();
+        };
+
+        if text.is_empty() {
+            // 请求已发出但还没吐字：界面上必须有东西，
+            // 否则用户看到的是一个静默的空白，会以为卡死
+            return div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .px_8()
+                .py_3()
+                .child(role_label("ZEX"))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(div().text_lg().text_color(rgb(TEXT_DIM)).child("思考中"))
+                        .child(div().size(px(6.0)).rounded_full().bg(rgb(BRAND))),
+                )
+                .into_any_element();
+        }
+
+        let content = markdown(text.clone()).into_any_element();
+        let _ = cx;
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .px_8()
+            .py_3()
+            .child(role_label("ZEX"))
+            .child(content)
+            .into_any_element()
+    }
+
+    /// 让虚拟列表的行数与当前实际内容对齐。
+    ///
+    /// 只在内容真的变化时动它，避免每帧 reset 把用户滚到一半的位置顶掉。
+    fn sync_scroller(&mut self, cx: &mut Context<Self>) {
+        let target = self.messages.len() + usize::from(self.streaming.is_some());
+        let current = self.scroller.read(cx).item_count();
+        if target == current {
+            return;
+        }
+        if target > current {
+            self.scroller.update(cx, |s, cx| {
+                s.append(target - current, cx);
+            });
+        } else {
+            self.scroller.update(cx, |s, cx| {
+                s.reset(target, cx);
+            });
         }
     }
 
@@ -167,7 +247,7 @@ impl ChatView {
         })
         .detach();
 
-        self.feed_scroll.scroll_to_bottom();
+        self.sync_scroller(cx);
         cx.notify();
     }
 
@@ -225,10 +305,10 @@ impl ChatView {
             }
             CoreEvent::Token { text, .. } => {
                 self.streaming.get_or_insert_with(String::new).push_str(&text);
-                self.feed_scroll.scroll_to_bottom();
+                self.sync_scroller(cx);
             }
             CoreEvent::ToolCallBegin { name, arguments, risk, .. } => {
-                self.flush_streaming();
+                self.flush_streaming(cx);
                 self.running_tool = Some(name.clone());
                 self.status = format!("执行 {name}");
                 self.messages.push(MsgItem {
@@ -239,7 +319,7 @@ impl ChatView {
                     },
                     text: String::new(),
                 });
-                self.feed_scroll.scroll_to_bottom();
+                self.sync_scroller(cx);
             }
             CoreEvent::ToolCallEnd { ok, brief, .. } => {
                 // take 而不是 clean：结果卡要显示是哪个工具产出的
@@ -249,10 +329,10 @@ impl ChatView {
                     kind: MsgKind::ToolResult { ok, output: brief, name },
                     text: String::new(),
                 });
-                self.feed_scroll.scroll_to_bottom();
+                self.sync_scroller(cx);
             }
             CoreEvent::ApprovalRequired { req } => {
-                self.flush_streaming();
+                self.flush_streaming(cx);
                 self.status = "等待确认".into();
                 self.approval = Some(req);
             }
@@ -263,7 +343,7 @@ impl ChatView {
                 });
             }
             CoreEvent::TurnEnded { reason, usage, .. } => {
-                self.flush_streaming();
+                self.flush_streaming(cx);
                 // 取消/失败路径不会有 flush 收尾，这里兜住，避免输入框锁死
                 self.streaming = None;
                 self.running_tool = None;
@@ -287,10 +367,10 @@ impl ChatView {
                 self.streaming = None;
                 self.running_tool = None;
                 self.status = "Ready".into();
-                self.feed_scroll.scroll_to_bottom();
+                self.sync_scroller(cx);
             }
             CoreEvent::Fatal { message } => {
-                self.flush_streaming();
+                self.flush_streaming(cx);
                 // 必须清掉流式标记：submit() 用它判断"是否正在跑"，
                 // 不清就会永久锁死输入框，出错后一句话都发不出去
                 self.streaming = None;
@@ -303,13 +383,13 @@ impl ChatView {
         cx.notify();
     }
 
-    fn flush_streaming(&mut self) {
+    fn flush_streaming(&mut self, cx: &mut Context<Self>) {
         if let Some(text) = self.streaming.take() {
             if !text.trim().is_empty() {
                 self.messages.push(MsgItem { kind: MsgKind::Assistant, text });
-                self.feed_scroll.scroll_to_bottom();
             }
         }
+        self.sync_scroller(cx);
     }
 }
 
@@ -802,7 +882,7 @@ impl ChatView {
 }
 
 impl Render for ChatView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // ─── 顶部状态栏 ───
         let status_dot_color = if self.status == "Ready" { OK } else { BRAND };
         let status_bg = if self.status == "Ready" { OK_SOFT } else { BRAND_SOFT };
@@ -865,66 +945,16 @@ impl Render for ChatView {
             );
 
         // ─── 消息流 ───
-        let mut feed = div().flex().flex_col().gap_6().px_8().py_8();
-        for (i, m) in self.messages.iter().enumerate() {
-            feed = feed.child(self.render_message(m, i, cx));
-        }
-        if let Some(s) = &self.streaming {
-            if s.is_empty() {
-                // 请求已发出但还没吐字：界面上必须有东西，
-                // 否则用户看到的是一个静默的空白，会以为卡死
-                feed = feed.child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_2()
-                        .child(role_label("ZEX"))
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .child(div().text_lg().text_color(rgb(TEXT_DIM)).child("思考中"))
-                                .child(
-                                    div()
-                                        .size(px(6.0))
-                                        .rounded_full()
-                                        .bg(rgb(BRAND)),
-                                ),
-                        ),
-                );
-            } else {
-                feed = feed.child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_2()
-                        .child(role_label("ZEX"))
-                        .child(
-                            div()
-                                .flex()
-                                .items_end()
-                                .gap_1()
-                                .child(div().text_lg().text_color(rgb(TEXT)).child(s.clone()))
-                                // 流式光标
-                                .child(
-                                    div()
-                                        .w(px(3.0))
-                                        .h(px(18.0))
-                                        .bg(rgb(BRAND))
-                                        .mb(px(3.0)),
-                                ),
-                        ),
-                );
-            }
-        }
-
-        let feed_scroll = div()
-            .flex_1()
-            .min_h(px(0.0))
-            .bg(rgb(BG_MAIN))
-            .overflow_y_scrollbar()
-            .child(feed);
+        // 交给组件库的虚拟列表：它用 FollowMode::Tail 贴住最新内容，
+        // 用户往上翻时不会被强行拽回，翻回底部后自动恢复跟随。
+        let weak = cx.entity().downgrade();
+        let feed = MessageScroller::new("feed", self.scroller.clone(), move |ix, window, cx| {
+            weak.update(cx, |view, cx| view.render_row(ix, window, cx))
+                .unwrap_or_else(|_| div().into_any_element())
+        })
+        .flex_1()
+        .min_h(px(0.0))
+        .bg(rgb(BG_MAIN));
 
         // ─── 底部区域 ───
         let mut bottom = div().flex().flex_col().gap_3().px_8().pb_5();
@@ -948,7 +978,7 @@ impl Render for ChatView {
                     .flex()
                     .flex_col()
                     .child(header)
-                    .child(feed_scroll)
+                    .child(feed)
                     .child(bottom),
             )
     }
