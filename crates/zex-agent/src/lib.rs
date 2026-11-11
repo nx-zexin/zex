@@ -690,6 +690,44 @@ mod tests {
     }
 
     #[test]
+    fn switch_session_swaps_history_and_target() {
+        let store = Store::in_memory().unwrap();
+        let mut agent = Agent::new(test_cfg(), vec![], store.clone()).unwrap();
+        let a = agent.session_id().clone();
+        store.append_message(&a, &Message::user("在 A 里"), 1).unwrap();
+        agent.history.push(Message::user("在 A 里"));
+
+        // 另起一个会话，写两条
+        let other = Agent::new(test_cfg(), vec![], store.clone()).unwrap();
+        let b = other.session_id().clone();
+        assert_ne!(a, b, "两次 new 应得到不同会话");
+        store.append_message(&b, &Message::user("在 B 里"), 1).unwrap();
+        store.append_message(&b, &Message::user("B 的第二条"), 1).unwrap();
+
+        agent.switch_session(b.clone()).unwrap();
+
+        assert_eq!(agent.session_id(), &b, "会话 id 应已切换");
+        assert_eq!(agent.history().len(), 2, "历史应换成目标会话的");
+        assert_eq!(agent.history()[1].text(), "B 的第二条");
+    }
+
+    #[test]
+    fn switch_to_unknown_session_loads_empty_history() {
+        let store = Store::in_memory().unwrap();
+        let mut agent = Agent::new(test_cfg(), vec![], store.clone()).unwrap();
+        store
+            .append_message(agent.session_id(), &Message::user("旧"), 1)
+            .unwrap();
+        agent.history.push(Message::user("旧"));
+
+        // 一个库里没有的会话 id：不该 panic，历史清空即可
+        let ghost = SessionId::from("ses_does_not_exist".to_string());
+        agent.switch_session(ghost.clone()).unwrap();
+        assert_eq!(agent.session_id(), &ghost);
+        assert!(agent.history().is_empty());
+    }
+
+    #[test]
     fn clear_empties_both_memory_and_db() {
         let store = Store::in_memory().unwrap();
         let mut agent = Agent::new(test_cfg(), vec![], store.clone()).unwrap();
