@@ -11,22 +11,29 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 #![warn(missing_docs)]
 
+pub mod approval;
 pub mod context;
 pub mod prompt;
 pub mod toolctx;
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::mpsc;
 use zex_core::tool::ErasedTool;
 use zex_core::{
-    CoreEvent, EndReason, Error, Message, Result, SessionId, ToolCallId, TurnId, Usage,
+    ApprovalId, CoreEvent, EndReason, Error, Message, Result, Risk, SessionId, ToolCallId, TurnId,
+    Usage,
 };
 use zex_llm::{ChatRequest, ProviderConfig, StreamEvent};
+use zex_policy::{ApprovedBy, Mode, Policy, Verdict};
+use zex_store::Store;
+use zex_store::audit::{AuditEntry, digest_args};
 
-use crate::context::ContextBudget;
-use crate::toolctx::AgentCtx;
+pub use approval::{ApprovalBroker, ApprovalDecision};
+use context::ContextBudget;
+use toolctx::AgentCtx;
 
 /// 内核配置。
 #[derive(Debug, Clone)]
@@ -43,6 +50,10 @@ pub struct AgentConfig {
     pub cwd: PathBuf,
     /// 上下文预算。
     pub budget: ContextBudget,
+    /// 运行模式。
+    pub mode: Mode,
+    /// 审批等待时长。
+    pub approval_timeout: Duration,
 }
 
 impl AgentConfig {
@@ -55,6 +66,8 @@ impl AgentConfig {
             max_tokens: 8192,
             cwd,
             budget: ContextBudget::default(),
+            mode: Mode::Normal,
+            approval_timeout: approval::DEFAULT_TIMEOUT,
         }
     }
 }
@@ -66,22 +79,50 @@ pub struct Agent {
     tools: Vec<Arc<dyn ErasedTool>>,
     history: Vec<Message>,
     session: SessionId,
+    store: Store,
+    policy: Policy,
+    approvals: Arc<ApprovalBroker>,
     /// 累计 token 用量（整个会话）。
     usage: Usage,
 }
 
 impl Agent {
-    /// 新建 agent。
-    pub fn new(cfg: AgentConfig, tools: Vec<Arc<dyn ErasedTool>>) -> Result<Self> {
+    /// 新建 agent（带持久化与权限闸门）。
+    pub fn new(cfg: AgentConfig, tools: Vec<Arc<dyn ErasedTool>>, store: Store) -> Result<Self> {
         let http = zex_llm::build_http_client()?;
+        let session = store.create_session("", &cfg.model, &cfg.cwd.display().to_string())?;
+        let policy = Policy::new(store.clone());
         Ok(Agent {
             cfg,
             http,
             tools,
             history: Vec::new(),
-            session: SessionId::generate(),
+            session: session.id,
+            store,
+            policy,
+            approvals: Arc::new(ApprovalBroker::new()),
             usage: Usage::default(),
         })
+    }
+
+    /// 恢复一个已有会话。
+    pub fn resume(
+        cfg: AgentConfig,
+        tools: Vec<Arc<dyn ErasedTool>>,
+        store: Store,
+        session: SessionId,
+    ) -> Result<Self> {
+        let mut agent = Self::new(cfg, tools, store)?;
+        agent.session = session.clone();
+        let stored = agent.store.load_messages(&session)?;
+        agent.history = stored.into_iter().map(|s| s.message).collect();
+        tracing::info!(session = %session, messages = agent.history.len(), "已恢复会话");
+        Ok(agent)
+    }
+
+    /// 审批注册表。UI/CLI 需要 clone 它来回复审批。
+    pub fn approvals(&self) -> Arc<ApprovalBroker> {
+        self.approvals.clone()
     }
 
     /// 当前会话 id。
@@ -99,22 +140,31 @@ impl Agent {
         &self.history
     }
 
-    /// 清空上下文（保留会话 id）。
-    pub fn clear(&mut self) {
+    /// 存储句柄（UI 读历史/审计用）。
+    pub fn store(&self) -> &Store {
+        &self.store
+    }
+
+    /// 切换运行模式。
+    pub fn set_mode(&mut self, mode: Mode) {
+        self.cfg.mode = mode;
+    }
+
+    /// 清空上下文（同时清库）。
+    pub fn clear(&mut self) -> Result<()> {
         self.history.clear();
+        self.store.clear_messages(&self.session)?;
+        Ok(())
     }
 
     /// 执行一轮：接收用户输入，跑完整 loop，返回最终文本。
-    ///
-    /// `events` 用于把过程推给 UI/CLI。传 `None` 表示不需要过程事件
-    /// （测试与非交互场景）。
     pub async fn run_turn(
         &mut self,
         input: impl Into<String>,
         events: Option<&mpsc::Sender<CoreEvent>>,
     ) -> Result<String> {
         let turn = TurnId::generate();
-        self.checkpoint(
+        self.emit(
             CoreEvent::TurnStarted {
                 session: self.session.clone(),
                 turn: turn.clone(),
@@ -122,7 +172,9 @@ impl Agent {
             events,
         );
 
-        self.history.push(Message::user(input));
+        let user_msg = Message::user(input);
+        self.record(&user_msg)?;
+        self.history.push(user_msg);
 
         let mut final_text = String::new();
         let mut end_reason = EndReason::Completed;
@@ -142,8 +194,7 @@ impl Agent {
                 match self.stream_once(req, &turn, events).await {
                     Ok(v) => v,
                     Err(e) => {
-                        // 把错误也作为一轮结束上报，UI 才能把 loading 收掉
-                        self.checkpoint(
+                        self.emit(
                             CoreEvent::TurnEnded {
                                 turn: turn.clone(),
                                 reason: EndReason::Failed {
@@ -159,8 +210,7 @@ impl Agent {
 
             self.usage.add(usage);
 
-            // 记录 assistant 消息（含工具调用），这是后续 tool_result 配对的依据
-            self.history.push(Message::Assistant {
+            let assistant = Message::Assistant {
                 content: if thinking.is_empty() {
                     vec![zex_core::Part::text(text.clone())]
                 } else {
@@ -172,31 +222,35 @@ impl Agent {
                     ]
                 },
                 tool_calls: tool_calls.clone(),
-            });
+            };
+            self.record(&assistant)?;
+            self.history.push(assistant);
 
             if tool_calls.is_empty() {
                 final_text = text;
                 break;
             }
 
-            // 串行执行工具。并行留到 M2 —— 串行的可观测性好得多，
-            // 而且审批必须逐个过，并行会让审批顺序混乱。
+            // 串行执行：审批必须逐个过，并行会让审批顺序混乱。
             for call in &tool_calls {
-                self.checkpoint(
+                let risk = self.risk_of(&call.name);
+
+                self.emit(
                     CoreEvent::ToolCallBegin {
                         turn: turn.clone(),
                         call_id: call.id.clone(),
                         name: call.name.clone(),
                         arguments: call.arguments.clone(),
-                        risk: self.risk_of(&call.name),
+                        risk,
                     },
                     events,
                 );
 
                 let ctx = AgentCtx::new(self.cfg.cwd.clone(), self.session.clone());
-                let (content, is_error) = self.dispatch(&ctx, call).await;
+                let (content, is_error) =
+                    self.dispatch_gated(&ctx, call, risk, &turn, events).await;
 
-                self.checkpoint(
+                self.emit(
                     CoreEvent::ToolCallEnd {
                         turn: turn.clone(),
                         call_id: call.id.clone(),
@@ -206,16 +260,18 @@ impl Agent {
                     events,
                 );
 
-                self.history.push(Message::Tool {
+                let tool_msg = Message::Tool {
                     call_id: call.id.clone(),
                     name: Some(call.name.clone()),
                     content,
                     is_error,
-                });
+                };
+                self.record(&tool_msg)?;
+                self.history.push(tool_msg);
             }
         }
 
-        self.checkpoint(
+        self.emit(
             CoreEvent::TurnEnded {
                 turn,
                 reason: end_reason,
@@ -226,7 +282,7 @@ impl Agent {
         Ok(final_text)
     }
 
-    /// 组装一次请求。上下文压缩在 M1 接入，这里先只做系统提示。
+    /// 组装一次请求。
     fn build_request(&self) -> ChatRequest {
         let system = prompt::system_prompt(&self.cfg.cwd);
         let req = ChatRequest::new(self.history.clone())
@@ -254,14 +310,14 @@ impl Agent {
             // 先推事件再聚合：用户应该看到 token 落在屏幕上，
             // 而不是等整段结束才看到（流式的全部意义在这里）。
             match &ev {
-                StreamEvent::Text(t) => self.checkpoint(
+                StreamEvent::Text(t) => self.emit(
                     CoreEvent::Token {
                         turn: turn.clone(),
                         text: t.clone(),
                     },
                     events,
                 ),
-                StreamEvent::Thinking(t) => self.checkpoint(
+                StreamEvent::Thinking(t) => self.emit(
                     CoreEvent::Thinking {
                         turn: turn.clone(),
                         text: t.clone(),
@@ -278,41 +334,162 @@ impl Agent {
     }
 
     /// 查一个工具的风险等级（未知工具按 L2 处理 —— 保守）。
-    fn risk_of(&self, name: &str) -> zex_core::Risk {
+    fn risk_of(&self, name: &str) -> Risk {
         self.tools
             .iter()
             .find(|t| t.spec().name == name)
             .map(|t| t.spec().risk)
-            .unwrap_or(zex_core::Risk::Impactful)
+            .unwrap_or(Risk::Impactful)
     }
 
-    /// 分发一次工具调用。
+    /// 过闸门后执行一次工具调用。
     ///
-    /// M0 阶段**不做权限闸门**（按 M0-PLAN 的约定），所有调用直通。
-    /// M1 在此处插入 `zex_policy::gate`：Allow 则执行、Ask 则挂起等审批、
-    /// Deny 则返回拒绝原因给模型。这个函数的签名已经为此留好位（返回 `(content, is_error)`）。
-    async fn dispatch(&self, ctx: &AgentCtx, call: &zex_core::ToolCall) -> (String, bool) {
+    /// 这是 `docs/SECURITY.md` §10 四步叠加的落地点。三条不变量：
+    /// - Deny 不可被任何配置绕过
+    /// - 审批超时 = 拒绝
+    /// - 每一次调用都写审计（含被拒绝的）
+    async fn dispatch_gated(
+        &self,
+        ctx: &AgentCtx,
+        call: &zex_core::ToolCall,
+        risk: Risk,
+        turn: &TurnId,
+        events: Option<&mpsc::Sender<CoreEvent>>,
+    ) -> (String, bool) {
         let Some(tool) = self.tools.iter().find(|t| t.spec().name == call.name) else {
             return (
                 format!("没有名为 `{}` 的工具，请从可用工具中选择。", call.name),
                 true,
             );
         };
-        match tool.call_json(ctx, call.arguments.clone()).await {
-            Ok(out) => (out.content, out.is_error),
-            Err(Error::BadArgs { tool, message }) => {
-                // 参数错误要让模型看见并自行纠正，属于"可恢复失败"
-                (
-                    format!("调用 `{tool}` 的参数不合法：{message}。请检查参数后重试。"),
-                    true,
-                )
+        let spec = tool.spec();
+        let verdict = self.policy.evaluate(&spec, &call.arguments, self.cfg.mode);
+
+        let approved_by = match verdict {
+            Verdict::Deny { reason } => {
+                self.audit(risk, &call.name, &call.arguments, "denied", &reason);
+                return (format!("操作被拒绝：{reason}"), true);
             }
+            Verdict::Allow { by, snapshot } => {
+                if snapshot {
+                    // M1 只记录意图；真正的文件级快照在 M2（见 docs/SECURITY.md §9）
+                    tracing::debug!(tool = %call.name, "该调用声明需要快照");
+                }
+                by
+            }
+            Verdict::Ask {
+                reason,
+                grantable,
+                double_confirm,
+            } => {
+                let id = ApprovalId::generate();
+                let rx = self.approvals.register(id.clone()).await;
+                self.emit(
+                    CoreEvent::ApprovalRequired {
+                        req: zex_core::event::ApprovalRequest {
+                            id: id.clone(),
+                            turn: turn.clone(),
+                            tool: call.name.clone(),
+                            risk,
+                            arguments: call.arguments.clone(),
+                            summary: reason,
+                            grantable,
+                            // 污点追踪在 M2（SECURITY.md §5.2）
+                            tainted: false,
+                        },
+                    },
+                    events,
+                );
+
+                let decision = self
+                    .approvals
+                    .wait(&id, rx, self.cfg.approval_timeout)
+                    .await;
+
+                match decision {
+                    ApprovalDecision::Reject { reason: why } => {
+                        self.audit(risk, &call.name, &call.arguments, "rejected", &why);
+                        return (format!("用户拒绝了该操作：{why}"), true);
+                    }
+                    ApprovalDecision::Approve { remember } => {
+                        // 需要二次确认的高危操作，不接受"记住"
+                        if let Some(scope) = remember {
+                            if double_confirm {
+                                tracing::warn!(tool = %call.name, "高危操作不接受授权记忆，已忽略");
+                            } else if let Err(e) = self.persist_grant(&call.name, &scope) {
+                                self.emit(
+                                    CoreEvent::Warning {
+                                        message: format!("授权记忆保存失败: {e}"),
+                                    },
+                                    events,
+                                );
+                            }
+                        }
+                        ApprovedBy::User
+                    }
+                }
+            }
+        };
+
+        // 执行
+        let (content, is_error) = match tool.call_json(ctx, call.arguments.clone()).await {
+            Ok(out) => (out.content, out.is_error),
+            Err(Error::BadArgs { tool, message }) => (
+                format!("调用 `{tool}` 的参数不合法：{message}。请检查参数后重试。"),
+                true,
+            ),
             Err(e) => (format!("工具 `{}` 执行失败：{e}", call.name), true),
+        };
+
+        let result_brief = if is_error { "失败" } else { "成功" };
+        self.audit(
+            risk,
+            &call.name,
+            &call.arguments,
+            &approved_by.as_audit_str(),
+            result_brief,
+        );
+        (content, is_error)
+    }
+
+    /// 把"记住这个授权"落库。
+    fn persist_grant(&self, tool: &str, scope: &zex_core::event::RememberScope) -> Result<()> {
+        use zex_core::event::RememberScope;
+        let risk = self.risk_of(tool);
+        match scope {
+            RememberScope::Exact => {
+                // 精确记忆需要具体参数，M1 简化为"该工具全部参数"，
+                // 真正的 exact 匹配在 M2（需要把参数摘要存进 pattern）
+                self.store.add_grant(tool, "", risk, None)?;
+            }
+            RememberScope::Pattern { pattern, days } => {
+                self.store
+                    .add_grant(tool, pattern.as_deref().unwrap_or(""), risk, *days)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// 写一条审计。
+    fn audit(&self, risk: Risk, tool: &str, args: &serde_json::Value, by: &str, result: &str) {
+        let entry = AuditEntry::tool_call(risk, tool, digest_args(args), by, self.session.as_str())
+            .with_result(result);
+        if let Err(e) = self.store.write_audit(&entry) {
+            // 审计写不进去是严重问题，但不能因此让整个任务崩掉；
+            // 用 error 级别日志留下痕迹。
+            tracing::error!(error = %e, "写审计失败");
         }
     }
 
+    /// 落库一条消息。
+    fn record(&self, msg: &Message) -> Result<()> {
+        let tokens = context::estimate_message_tokens(msg);
+        self.store.append_message(&self.session, msg, tokens)?;
+        Ok(())
+    }
+
     /// 事件投递。接收端已关闭时静默忽略 —— UI 关掉不代表内核必须崩。
-    fn checkpoint(&self, ev: CoreEvent, events: Option<&mpsc::Sender<CoreEvent>>) {
+    fn emit(&self, ev: CoreEvent, events: Option<&mpsc::Sender<CoreEvent>>) {
         if let Some(tx) = events {
             if tx.try_send(ev).is_err() {
                 // 队列满或已关闭：丢弃事件而不是阻塞内核。
@@ -336,8 +513,6 @@ fn brief(content: &str) -> String {
 }
 
 /// 便捷构造：工具调用 id 的兼容处理。
-///
-/// 部分 provider 会给出空 id，这里补一个稳定的兜底。
 pub fn ensure_call_id(id: &ToolCallId, index: usize) -> ToolCallId {
     if id.as_str().is_empty() {
         ToolCallId::new(format!("call_{index}"))
@@ -371,5 +546,55 @@ mod tests {
     #[test]
     fn brief_skips_leading_blank_lines() {
         assert_eq!(brief("\n\nactual"), "actual");
+    }
+
+    fn test_cfg() -> AgentConfig {
+        use zex_llm::ProviderKind;
+        AgentConfig::new(
+            ProviderConfig {
+                kind: ProviderKind::OpenAiCompat,
+                base_url: "http://127.0.0.1:1".into(),
+                api_key_env: None,
+                headers: Default::default(),
+            },
+            "test-model",
+            PathBuf::from("/tmp"),
+        )
+    }
+
+    #[test]
+    fn new_agent_creates_persisted_session() {
+        let store = Store::in_memory().unwrap();
+        let agent = Agent::new(test_cfg(), vec![], store.clone()).unwrap();
+        let sid = agent.session_id().clone();
+        assert!(store.get_session(&sid).unwrap().is_some(), "会话应已落库");
+    }
+
+    #[test]
+    fn resume_restores_history() {
+        let store = Store::in_memory().unwrap();
+        let agent = Agent::new(test_cfg(), vec![], store.clone()).unwrap();
+        let sid = agent.session_id().clone();
+        // 直接往库里写两条
+        store.append_message(&sid, &Message::user("hi"), 1).unwrap();
+        store
+            .append_message(&sid, &Message::system("sys"), 1)
+            .unwrap();
+
+        let resumed = Agent::resume(test_cfg(), vec![], store, sid).unwrap();
+        assert_eq!(resumed.history().len(), 2);
+    }
+
+    #[test]
+    fn clear_empties_both_memory_and_db() {
+        let store = Store::in_memory().unwrap();
+        let mut agent = Agent::new(test_cfg(), vec![], store.clone()).unwrap();
+        let sid = agent.session_id().clone();
+        store.append_message(&sid, &Message::user("a"), 1).unwrap();
+        agent.history.push(Message::user("a"));
+
+        agent.clear().unwrap();
+        assert!(agent.history().is_empty());
+        assert_eq!(store.count_messages(&sid).unwrap(), 0);
     }
 }

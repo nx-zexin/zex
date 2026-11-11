@@ -10,13 +10,34 @@
 
 pub mod config;
 
+use std::path::PathBuf;
+
 pub use config::{ResolvedConfig, config_dir, load};
+use zex_store::Store;
+
+/// 主数据库路径 `~/.zex/zex.db`。
+pub fn db_path() -> PathBuf {
+    config_dir().join("zex.db")
+}
+
+/// 打开（或创建）主数据库。
+pub fn open_store() -> zex_core::Result<Store> {
+    Store::open(db_path())
+}
 
 /// 把已解析的配置装配成内核。
-pub fn build_agent(
-    cfg: &ResolvedConfig,
-    cwd: std::path::PathBuf,
-) -> zex_core::Result<zex_agent::Agent> {
+pub fn build_agent(cfg: &ResolvedConfig, cwd: PathBuf) -> zex_core::Result<zex_agent::Agent> {
+    let store = open_store()?;
     let agent_cfg = zex_agent::AgentConfig::new(cfg.provider.clone(), cfg.model.clone(), cwd);
-    zex_agent::Agent::new(agent_cfg, zex_tools::default_tools())
+    zex_agent::Agent::new(agent_cfg, zex_tools::default_tools(), store)
+}
+
+/// 装配一个用内存数据库的内核（测试与 --ephemeral 模式）。
+pub fn build_ephemeral_agent(
+    cfg: &ResolvedConfig,
+    cwd: PathBuf,
+) -> zex_core::Result<zex_agent::Agent> {
+    let store = Store::in_memory()?;
+    let agent_cfg = zex_agent::AgentConfig::new(cfg.provider.clone(), cfg.model.clone(), cwd);
+    zex_agent::Agent::new(agent_cfg, zex_tools::default_tools(), store)
 }

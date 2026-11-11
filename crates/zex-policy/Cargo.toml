@@ -12,4 +12,7 @@ workspace = true
 
 [dependencies]
 zex-core.workspace = true
-
+zex-store.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true

@@ -17,6 +17,9 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 zex-core.workspace = true
 zex-llm.workspace = true
 zex-tools.workspace = true
+zex-store.workspace = true
+zex-policy.workspace = true
 tokio.workspace = true
 reqwest.workspace = true
+serde_json.workspace = true
 tracing.workspace = true
