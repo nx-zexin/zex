@@ -10,8 +10,7 @@ use std::sync::Arc;
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
-use gpui_kit::component::button::DropdownButton;
-use gpui_kit::component::menu::PopupMenuItem;
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerState};
 use gpui_kit::component::text::markdown;
 use gpui_kit::*;
@@ -659,13 +658,12 @@ impl ChatView {
         let tx = self.cmd_tx.clone();
         let sid_owned = sid.to_string();
 
-        DropdownButton::new(ElementId::Name(format!("menu-{sid_owned}").into()))
-            .button(
-                Button::new(ElementId::Name(format!("menu-btn-{sid_owned}").into()))
-                    .ghost()
-                    .label("⋯"),
-            )
-            .dropdown_menu({
+        // 直接用 Button 的 dropdown_menu：DropdownButton 会额外渲染一个
+        // 带箭头的半按钮，在 240px 的侧栏里占掉两倍宽度。
+        Button::new(ElementId::Name(format!("menu-{sid_owned}").into()))
+            .ghost()
+            .label("⋯")
+            .dropdown_menu_with_anchor(Anchor::BottomLeft, {
                 let sid = sid_owned.clone();
                 let view = view.clone();
                 let tx = tx.clone();
