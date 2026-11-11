@@ -262,6 +262,12 @@ fn command_risk(argv: &[String]) -> Risk {
         return Risk::Impactful;
     }
 
+    // 只读命令不该被要求审批。这套判据和工具侧共用同一份
+    // （`zex_core::shell_risk`），否则会出现"工具说只读、策略说不是"。
+    if zex_core::shell_risk::is_read_only(&joined) {
+        return Risk::ReadOnly;
+    }
+
     Risk::Impactful
 }
 

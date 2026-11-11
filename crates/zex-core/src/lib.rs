@@ -16,6 +16,7 @@ pub mod event;
 pub mod ids;
 pub mod message;
 pub mod risk;
+pub mod shell_risk;
 pub mod tool;
 
 pub use error::{Error, Result};

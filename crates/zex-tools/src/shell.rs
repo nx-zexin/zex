@@ -50,6 +50,20 @@ impl Tool for Shell {
          需要读文件内容时优先用 fs_read，它能给出更清晰的行号。"
     }
 
+    /// 只读命令不需要授权。
+    ///
+    /// 这不是安全降级：列目录和删库都走同一个工具，但前者不改任何状态。
+    /// 一律要审批的后果是弹窗泛滥 —— 用户学会无脑点「批准」，反而更危险。
+    ///
+    /// 判定刻意保守：认不出来的一律当 L2，宁可多问一句。
+    fn risk_for(&self, args: &ShellArgs) -> Risk {
+        if zex_core::shell_risk::is_read_only(&args.command) {
+            Risk::ReadOnly
+        } else {
+            Risk::Impactful
+        }
+    }
+
     async fn call(&self, cx: &dyn ToolCtx, args: ShellArgs) -> Result<ToolOutput> {
         let timeout_secs = args
             .timeout_secs
@@ -293,5 +307,22 @@ mod tests {
     #[test]
     fn risk_is_impactful() {
         assert_eq!(Shell::RISK, Risk::Impactful);
+    }
+}
+
+#[cfg(test)]
+mod erased_risk_test {
+    use super::*;
+    use std::sync::Arc;
+    use zex_core::tool::ErasedTool;
+
+    #[test]
+    fn erased_trait_sees_per_call_risk() {
+        let tool: Arc<dyn ErasedTool> = Arc::new(Shell);
+        let read = serde_json::json!({"command": "ls crates"});
+        let write = serde_json::json!({"command": "touch x"});
+        assert_eq!(tool.risk_for(&read), Risk::ReadOnly, "只读命令应静默");
+        assert_eq!(tool.risk_for(&write), Risk::Impactful);
+        assert_eq!(tool.spec().risk, Risk::Impactful, "静态等级不变");
     }
 }

@@ -111,6 +111,14 @@ pub trait Tool: Send + Sync + 'static {
     /// 给模型看的描述。写"什么时候用"，不只是"做什么"。
     fn description() -> &'static str;
 
+    /// 按**具体参数**判断风险等级。
+    ///
+    /// 默认取静态的 [`Self::RISK`]。只有参数会实质改变风险的工具有理由覆盖它——
+    /// 典型是 shell：`ls` 和 `rm -rf` 都是"执行命令"，但风险天差地别。
+    fn risk_for(&self, _args: &Self::Args) -> Risk {
+        Self::RISK
+    }
+
     /// 执行。
     async fn call(&self, cx: &dyn ToolCtx, args: Self::Args) -> Result<ToolOutput>;
 }
@@ -122,6 +130,12 @@ pub trait Tool: Send + Sync + 'static {
 pub trait ErasedTool: Send + Sync {
     /// 元数据（含自动生成的 schema）。
     fn spec(&self) -> ToolSpec;
+
+    /// 按参数判断风险。参数解析失败时退回静态等级（保守）。
+    fn risk_for(&self, args: &serde_json::Value) -> Risk {
+        let _ = args;
+        self.spec().risk
+    }
 
     /// 用未解析的 JSON 调用。
     ///
@@ -137,6 +151,14 @@ impl<T: Tool> ErasedTool for T {
             description: T::description(),
             input_schema: schema_of::<T::Args>(),
             risk: T::RISK,
+        }
+    }
+
+    fn risk_for(&self, args: &serde_json::Value) -> Risk {
+        match serde_json::from_value::<T::Args>(args.clone()) {
+            Ok(parsed) => Tool::risk_for(self, &parsed),
+            // 参数都解析不了，按静态等级走 —— 宁可多问一句
+            Err(_) => T::RISK,
         }
     }
 

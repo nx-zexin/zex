@@ -442,7 +442,7 @@ impl Agent {
                     end_reason = EndReason::Cancelled;
                     break;
                 }
-                let risk = self.risk_of(&call.name);
+                let risk = self.risk_of(&call.name, &call.arguments);
 
                 self.emit(
                     CoreEvent::ToolCallBegin {
@@ -626,12 +626,14 @@ impl Agent {
         Ok((out.text, out.thinking, out.tool_calls, out.usage))
     }
 
-    /// 查一个工具的风险等级（未知工具按 L2 处理 —— 保守）。
-    fn risk_of(&self, name: &str) -> Risk {
+    /// 查一次工具调用的风险等级（未知工具按 L2 处理 —— 保守）。
+    ///
+    /// 带上参数：`shell` 的风险取决于具体命令，`ls` 和 `rm -rf` 不该同一档。
+    fn risk_of(&self, name: &str, arguments: &serde_json::Value) -> Risk {
         self.tools
             .iter()
             .find(|t| t.spec().name == name)
-            .map(|t| t.spec().risk)
+            .map(|t| t.risk_for(arguments))
             .unwrap_or(Risk::Impactful)
     }
 
@@ -655,7 +657,10 @@ impl Agent {
                 true,
             );
         };
-        let spec = tool.spec();
+        // spec 里的 risk 是静态默认值。shell 这类工具的风险取决于具体命令，
+        // 所以用判定过的等级覆盖它再交给策略层 —— 否则 `ls` 也会被要求审批。
+        let mut spec = tool.spec();
+        spec.risk = risk;
         let verdict = self.policy.evaluate(&spec, &call.arguments, self.cfg.mode);
 
         let approved_by = match verdict {
@@ -761,7 +766,7 @@ impl Agent {
         args: &serde_json::Value,
     ) -> Result<()> {
         use zex_core::event::RememberScope;
-        let risk = self.risk_of(tool);
+        let risk = self.risk_of(tool, args);
         match scope {
             RememberScope::Exact => {
                 // 只记住这一次的参数
