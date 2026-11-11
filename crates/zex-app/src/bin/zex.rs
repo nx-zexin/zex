@@ -428,7 +428,18 @@ impl ChatView {
                         .team
                         .iter()
                         .find(|a| a.session == session.as_str())
-                        .map(|a| a.id.clone());
+                        .map(|a| a.id.clone())
+                        // 兜底：TeamUpdated 走的是 try_send，主对话流式输出
+                        // 时通道可能被 token 挤满，团队事件就丢了。查一次库
+                        // 比让子智能体的动作凭空消失强。
+                        .or_else(|| {
+                            self.store
+                                .list_sub_agents()
+                                .ok()?
+                                .into_iter()
+                                .find(|r| r.session_id == session.as_str())
+                                .map(|r| r.id)
+                        });
                     if let Some(agent) = owner {
                         self.messages.push(MsgItem {
                             kind: MsgKind::SubAgentStep {
@@ -2012,6 +2023,23 @@ fn main() {
                         // 先不关：等用户在确认层里做决定
                         false
                     });
+                }
+
+                // 测试钩子：设了 ZEX_AUTO_PROMPT 就自动提交一条任务。
+                // 只用于无人值守地跑通 GUI 全链路（Wayland 下没法模拟输入）。
+                if let Ok(prompt) = std::env::var("ZEX_AUTO_PROMPT") {
+                    if !prompt.trim().is_empty() {
+                        let tx = view.read_with(cx, |v, _| v.cmd_tx.clone());
+                        let session = view.read_with(cx, |v, _| v.active_session.clone());
+                        {
+                            // 同步投递即可：内核那边是独立线程
+                            let _ = tx.try_send(UiCommand::UserPrompt {
+                                session: zex_core::SessionId::from(session),
+                                text: prompt,
+                                attachments: vec![],
+                            });
+                        }
+                    }
                 }
 
                 view
