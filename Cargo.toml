@@ -51,10 +51,14 @@ futures = "0.3"
 bytes = "1"
 
 # ─── 网络 ───
+# reqwest 0.13 的 feature 名与 0.12 不同：rustls-tls → rustls。
+# 用 rustls + 系统根证书：跨平台且企业代理环境友好。
 reqwest = { version = "0.13", default-features = false, features = [
     "json",
     "stream",
-    "rustls-tls",
+    "rustls",
+    "rustls-native-certs",
+    "http2",
 ] }
 
 # ─── 存储 ───

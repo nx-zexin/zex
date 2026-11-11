@@ -12,4 +12,9 @@ workspace = true
 
 [dependencies]
 zex-core.workspace = true
-
+serde.workspace = true
+serde_json.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
+futures.workspace = true
+tracing.workspace = true
