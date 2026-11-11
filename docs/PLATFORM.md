@@ -239,6 +239,40 @@ macOS 失败点在 `aws-lc-sys`（reqwest/rustls 的传递依赖）：它要用
 | `zex-app/config.rs` | `HOME` / `USERPROFILE` 兜底 |
 | `zex-policy/rules.rs` | 同上，拿不到 HOME 时保守判定 |
 
+### Wine 实测（2026-11）
+
+用 wine 11.19 + mingw 交叉编译的 exe 做了一次真实运行。**这不是
+目标平台，但能提前暴露平台假设。**
+
+**能跑的：**
+
+| 项 | 结果 |
+|---|---|
+| PE 加载、Rust 运行时 | ✅ |
+| 配置文件读取（`C:\users\<user>\.zex`） | ✅ |
+| SQLite 存储 | ✅ |
+| tokio 运行时 | ✅ |
+| reqwest / rustls 网络栈 | ✅ |
+| 完整 agent 循环（模型调用 + 流式输出） | ✅ |
+| `cmd /C` 执行 + 结果解析 | ✅ |
+
+**跑不了的：**
+
+| 项 | 原因 |
+|---|---|
+| GUI | wine 的 `IDWriteFontSet::GetMatchingFonts` 未实现（`E_NOTIMPL`），GPUI 拿不到字体就 panic |
+
+**Wine 专属限制（真机不受影响）：**
+
+- `chcp 65001` 无效 → 中文输出仍是 GBK 乱码。真机上这条命令有效，
+  代码里已经加了。
+
+**这一轮抓到的真 bug：**
+
+- `dir` 不在只读白名单里，导致 Windows 上每个列目录操作都弹审批。
+  白名单原本是纯 Unix 视角。已补 `dir` / `where` / `findstr` / `more`
+  等，并加了单测锁住。
+
 ### 还没验证的具体项
 
 - `on_window_should_close` 在 Windows/macOS 的实现 —— gpui 有对应

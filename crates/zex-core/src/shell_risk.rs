@@ -13,11 +13,15 @@
 /// 只收"读了就完事"的：列目录、看文件、算校验和。任何可能写盘、
 /// 联网发数据、启动服务的都不在列。
 const READ_ONLY_COMMANDS: &[&str] = &[
+    // Unix
     "ls", "cat", "head", "tail", "wc", "grep", "rg", "find", "pwd", "echo",
     "which", "type", "file", "stat", "du", "df", "tree", "basename", "dirname",
     "realpath", "readlink", "whoami", "uname", "date", "sort", "uniq", "cut",
     "tr", "column", "nl", "md5sum", "sha256sum", "printenv", "locale", "ps",
     "free", "uptime", "hostname", "id", "groups",
+    // Windows cmd 内建 / 常用工具。`dir` 和 `ls` 一样只是列目录，
+    // 漏掉它会让 Windows 上每个列目录操作都弹审批。
+    "dir", "where", "findstr", "more", "ver", "vol", "set", "path",
 ];
 
 /// 一旦出现就意味着可能在写、在串联、在求值。
@@ -116,6 +120,19 @@ mod tests {
     fn pipeline_ending_in_writer() {
         assert!(!is_read_only("cat list | xargs touch"));
         assert!(!is_read_only("find . | xargs rm"));
+    }
+
+    #[test]
+    fn windows_reads_are_allowed() {
+        assert!(is_read_only("dir"));
+        assert!(is_read_only("dir /s"));
+        assert!(is_read_only("where cargo"));
+        assert!(is_read_only("findstr foo file.txt"));
+        assert!(is_read_only("type Cargo.toml"));
+        // 危险的那些不能被放进来
+        assert!(!is_read_only("del x.txt"));
+        assert!(!is_read_only("rd /s /q dir"));
+        assert!(!is_read_only("format c:"));
     }
 
     #[test]
