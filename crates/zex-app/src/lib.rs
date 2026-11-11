@@ -183,13 +183,24 @@ pub fn spawn_core(mut agent: Agent) -> CoreHandles {
                                     .await;
                             }
                         }
-                        UiCommand::ClearSession => {
-                            match agent.clear() {
+                        UiCommand::ClearSession { session } => {
+                            let result = if session == *agent.session_id() {
+                                agent.clear()
+                            } else {
+                                agent.store().clear_messages(&session).map(|_| ())
+                            };
+                            match result {
                                 Ok(()) => {
+                                    // 只有清的是当前会话才需要重置视图，否则只刷新侧栏
+                                    let (history, active) = if session == *agent.session_id() {
+                                        (Vec::new(), agent.session_id().to_string())
+                                    } else {
+                                        (agent.history().to_vec(), agent.session_id().to_string())
+                                    };
                                     let _ = ev_tx
                                         .send(CoreEvent::SessionSwitched {
-                                            session: agent.session_id().to_string(),
-                                            history: Vec::new(),
+                                            session: active,
+                                            history,
                                             sessions: session_summaries(&agent),
                                         })
                                         .await;
@@ -198,6 +209,39 @@ pub fn spawn_core(mut agent: Agent) -> CoreHandles {
                                     let _ = ev_tx
                                         .send(CoreEvent::Warning {
                                             message: format!("清空会话失败：{e}"),
+                                        })
+                                        .await;
+                                }
+                            }
+                        }
+                        UiCommand::DeleteSession { session } => {
+                            let was_active = session == *agent.session_id();
+                            match agent.store().delete_session(&session) {
+                                Ok(()) => {
+                                    // 删掉的正是当前会话：换个地方落脚，
+                                    // 否则 UI 会停在一个已经不存在的会话上
+                                    if was_active {
+                                        match agent.store().list_sessions(1) {
+                                            Ok(list) if !list.is_empty() => {
+                                                let _ = agent.switch_session(list[0].id.clone());
+                                            }
+                                            _ => {
+                                                let _ = agent.new_session();
+                                            }
+                                        }
+                                    }
+                                    let _ = ev_tx
+                                        .send(CoreEvent::SessionSwitched {
+                                            session: agent.session_id().to_string(),
+                                            history: agent.history().to_vec(),
+                                            sessions: session_summaries(&agent),
+                                        })
+                                        .await;
+                                }
+                                Err(e) => {
+                                    let _ = ev_tx
+                                        .send(CoreEvent::Warning {
+                                            message: format!("删除会话失败：{e}"),
                                         })
                                         .await;
                                 }

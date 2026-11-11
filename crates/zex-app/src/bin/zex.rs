@@ -10,6 +10,8 @@ use std::sync::Arc;
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::button::DropdownButton;
+use gpui_kit::component::menu::PopupMenuItem;
 use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerState};
 use gpui_kit::component::text::markdown;
 use gpui_kit::*;
@@ -76,8 +78,11 @@ struct ChatView {
     streaming: Option<String>,
     /// 重命名会话用的输入框（侧栏内联编辑）。
     rename_input: Entity<InputState>,
-    /// 是否正处于重命名状态。
-    renaming: bool,
+    /// 正在就地重命名的会话 id（`None` 表示没有）。
+    ///
+    /// 用 id 而不是 bool：菜单可以对任意一行发起重命名，
+    /// 而不只是当前会话。
+    renaming: Option<String>,
     /// 消息区的虚拟列表状态。
     ///
     /// 之前用手写的 `ScrollHandle` + `overflow_y_scrollbar`，但实测
@@ -111,6 +116,7 @@ impl ChatView {
         cx: &mut Context<Self>,
     ) -> Self {
         let input = cx.new(|cx| InputState::new(window, cx).placeholder("请输入您的指令，或选择一个快捷操作…"));
+        let rename_input = cx.new(|cx| InputState::new(window, cx).placeholder("会话标题"));
 
         // Enter 发送，Shift+Enter 换行。输入框自己无法区分这两者的语义，
         // 由外层决定"按下回车意味着提交"。
@@ -121,6 +127,18 @@ impl ChatView {
                 }
             }
         })
+        .detach();
+
+        // 重命名输入框里按回车等于点"确定"
+        cx.subscribe_in(
+            &rename_input,
+            window,
+            |this, _input, ev: &InputEvent, _window, cx| {
+                if let InputEvent::PressEnter { .. } = ev {
+                    this.commit_rename(cx);
+                }
+            },
+        )
         .detach();
 
         // 调试用：启动后自动发一条，方便在没有人手的情况下验证流式、
@@ -143,7 +161,6 @@ impl ChatView {
         }
 
         let scroller = cx.new(|cx| MessageScrollerState::new(history.len(), cx));
-        let rename_input = cx.new(|cx| InputState::new(window, cx).placeholder("会话标题"));
 
         ChatView {
             input,
@@ -151,7 +168,7 @@ impl ChatView {
             streaming: None,
             scroller,
             rename_input,
-            renaming: false,
+            renaming: None,
             running_tool: None,
             status: "Ready".into(),
             approval: None,
@@ -163,6 +180,26 @@ impl ChatView {
             model,
             usage: Usage::default(),
         }
+    }
+
+    /// 就地重命名：把输入框里的标题发给内核。
+    fn commit_rename(&mut self, cx: &mut Context<Self>) {
+        let Some(session) = self.renaming.take() else {
+            return;
+        };
+        let title = self.rename_input.read(cx).value().trim().to_string();
+        if !title.is_empty() {
+            if let Ok(_) = self
+                .cmd_tx
+                .try_send(UiCommand::RenameSession {
+                    session: zex_core::SessionId::from(session),
+                    title,
+                })
+            {
+                // 发出去了，等 SessionTitled 事件回来更新侧栏
+            }
+        }
+        cx.notify();
     }
 
     /// 渲染虚拟列表的第 `ix` 行。
@@ -616,66 +653,135 @@ impl ChatView {
         }
     }
 
+    /// 单行会话的操作菜单（重命名 / 清空 / 删除）。
+    fn render_item_menu(&self, sid: &str, cx: &mut Context<Self>) -> AnyElement {
+        let view = cx.entity().downgrade();
+        let tx = self.cmd_tx.clone();
+        let sid_owned = sid.to_string();
+
+        DropdownButton::new(ElementId::Name(format!("menu-{sid_owned}").into()))
+            .button(
+                Button::new(ElementId::Name(format!("menu-btn-{sid_owned}").into()))
+                    .ghost()
+                    .label("⋯"),
+            )
+            .dropdown_menu({
+                let sid = sid_owned.clone();
+                let view = view.clone();
+                let tx = tx.clone();
+                move |menu, _window, _cx| {
+                    let (sid_rename, view_rename) = (sid.clone(), view.clone());
+                    let (sid_clear, tx_clear) = (sid.clone(), tx.clone());
+                    let (sid_del, tx_del) = (sid.clone(), tx.clone());
+
+                    menu.item(
+                        PopupMenuItem::new("重命名").on_click(move |_, window, cx| {
+                            let sid = sid_rename.clone();
+                            view_rename
+                                .update(cx, |this, cx| {
+                                    // 预填当前标题，改起来省事
+                                    let current = this
+                                        .sessions
+                                        .iter()
+                                        .find(|s| s.id == sid)
+                                        .map(|s| s.title.clone())
+                                        .unwrap_or_default();
+                                    this.rename_input
+                                        .update(cx, |st, cx| st.set_value(current, window, cx));
+                                    this.renaming = Some(sid.clone());
+                                    cx.notify();
+                                })
+                                .ok();
+                        }),
+                    )
+                    .separator()
+                    .item(PopupMenuItem::new("清空会话").on_click(move |_, _w, _cx| {
+                        let _ = tx_clear.try_send(UiCommand::ClearSession {
+                            session: zex_core::SessionId::from(sid_clear.clone()),
+                        });
+                    }))
+                    .item(PopupMenuItem::new("删除会话").on_click(move |_, _w, _cx| {
+                        let _ = tx_del.try_send(UiCommand::DeleteSession {
+                            session: zex_core::SessionId::from(sid_del.clone()),
+                        });
+                    }))
+                }
+            })
+            .into_any_element()
+    }
+
     fn render_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
         let mut list = div().flex().flex_col().gap_1().px_3();
 
         for s in &self.sessions {
             let active = s.id == self.active_session;
-            // 用 div 自己排版而不是 Button：Button 只有单个 label，
-            // 标题和时间拼在一起时会被整体截断（"初次问候 · 2m" 变成 "·候 · 2m"）。
+            let is_renaming = self.renaming.as_deref() == Some(s.id.as_str());
+
             let mut row = div()
                 .w_full()
                 .h(px(34.0))
-                .px_3()
+                .px_2()
                 .flex()
                 .items_center()
-                .gap_2()
-                .rounded(px(6.0))
-                .text_sm()
-                .cursor_pointer();
+                .gap_1()
+                .rounded(px(6.0));
 
-            row = if active {
-                row.bg(rgb(BG_HOVER)).text_color(rgb(TEXT))
+            if active {
+                row = row.bg(rgb(BG_HOVER));
+            }
+
+            if is_renaming {
+                // 就地重命名：复用这一行的位置，不弹窗
+                row = row
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .child(Input::new(&self.rename_input)),
+                    )
+                    .child(
+                        Button::new("rename-ok")
+                            .primary()
+                            .label("✓")
+                            .on_click(cx.listener(|this, _: &ClickEvent, _w, cx| {
+                                this.commit_rename(cx)
+                            })),
+                    );
             } else {
-                row.text_color(rgb(TEXT_MUTED))
-            };
+                let color = if active { TEXT } else { TEXT_MUTED };
+                let mut title = div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .truncate()
+                    .text_sm()
+                    .text_color(rgb(color))
+                    .child(s.title.clone());
 
-            row = row
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .truncate()
-                        .child(s.title.clone()),
-                )
-                .child(
-                    div()
-                        .flex_none()
-                        .text_xs()
-                        .text_color(rgb(TEXT_DIM))
-                        .child(s.when.clone()),
-                );
+                if !active {
+                    let id = s.id.clone();
+                    let tx = self.cmd_tx.clone();
+                    title = title.cursor_pointer().on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _ev, _window, cx| {
+                            let _ = tx.try_send(UiCommand::SwitchSession {
+                                session: zex_core::SessionId::from(id.clone()),
+                            });
+                            this.status = "切换中…".into();
+                            cx.notify();
+                        }),
+                    );
+                }
 
-            if !active {
-                let id = s.id.clone();
-                let tx = self.cmd_tx.clone();
-                row = row.on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _ev, _window, cx| {
-                        let id = id.clone();
-                        let tx = tx.clone();
-                        this.status = "切换中…".into();
-                        cx.spawn(async move |_this, _cx| {
-                            let _ = tx
-                                .send(UiCommand::SwitchSession {
-                                    session: zex_core::SessionId::from(id),
-                                })
-                                .await;
-                        })
-                        .detach();
-                        cx.notify();
-                    }),
-                );
+                row = row
+                    .child(title)
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_xs()
+                            .text_color(rgb(TEXT_DIM))
+                            .child(s.when.clone()),
+                    )
+                    .child(self.render_item_menu(&s.id, cx));
             }
 
             list = list.child(row);
@@ -745,108 +851,6 @@ impl ChatView {
                 ),
             )
             .child(div().flex_1().min_h(px(0.0)).child(list))
-            // 重命名 / 清空
-            .child(
-                div()
-                    .px_3()
-                    .pb_2()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(if self.renaming {
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_2()
-                            .child(Input::new(&self.rename_input))
-                            .child(
-                                div()
-                                    .flex()
-                                    .gap_2()
-                                    .child(
-                                        Button::new("rename-ok")
-                                            .primary()
-                                            .label("确定")
-                                            .on_click(cx.listener(
-                                                |this, _: &ClickEvent, _w, cx| {
-                                                    let title = this
-                                                        .rename_input
-                                                        .read(cx)
-                                                        .value()
-                                                        .trim()
-                                                        .to_string();
-                                                    if title.is_empty() {
-                                                        this.renaming = false;
-                                                        cx.notify();
-                                                        return;
-                                                    }
-                                                    let session =
-                                                        this.active_session.clone();
-                                                    let tx = this.cmd_tx.clone();
-                                                    this.renaming = false;
-                                                    cx.spawn(async move |_this, _cx| {
-                                                        let _ = tx
-                                                            .send(UiCommand::RenameSession {
-                                                                session:
-                                                                    zex_core::SessionId::from(
-                                                                        session,
-                                                                    ),
-                                                                title,
-                                                            })
-                                                            .await;
-                                                    })
-                                                    .detach();
-                                                    cx.notify();
-                                                },
-                                            )),
-                                    )
-                                    .child(
-                                        Button::new("rename-cancel")
-                                            .label("取消")
-                                            .on_click(cx.listener(
-                                                |this, _: &ClickEvent, _w, cx| {
-                                                    this.renaming = false;
-                                                    cx.notify();
-                                                },
-                                            )),
-                                    ),
-                            )
-                    } else {
-                        div().child(
-                            Button::new("rename-start")
-                                .ghost()
-                                .w_full()
-                                .label("重命名当前会话")
-                                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                                    // 预填当前标题，改起来省事
-                                    let current = this
-                                        .sessions
-                                        .iter()
-                                        .find(|s| s.id == this.active_session)
-                                        .map(|s| s.title.clone())
-                                        .unwrap_or_default();
-                                    this.rename_input
-                                        .update(cx, |st, cx| st.set_value(current, window, cx));
-                                    this.renaming = true;
-                                    cx.notify();
-                                })),
-                        )
-                    })
-                    .child(
-                    Button::new("clear-session")
-                        .ghost()
-                        .w_full()
-                        .label("清空当前会话")
-                        .on_click(cx.listener(|this, _: &ClickEvent, _w, cx| {
-                            let tx = this.cmd_tx.clone();
-                            cx.spawn(async move |_this, _cx| {
-                                let _ = tx.send(UiCommand::ClearSession).await;
-                            })
-                            .detach();
-                            cx.notify();
-                        })),
-                ),
-            )
             // 底部图标
             .child(
                 div()

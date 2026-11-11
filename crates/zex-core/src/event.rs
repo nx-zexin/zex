@@ -205,8 +205,16 @@ pub enum UiCommand {
     },
     /// 开一个新会话。
     NewSession,
-    /// 清空当前会话的消息（保留会话本身）。
-    ClearSession,
+    /// 清空指定会话的消息（保留会话本身）。
+    ClearSession {
+        /// 目标会话。
+        session: SessionId,
+    },
+    /// 删除会话。
+    DeleteSession {
+        /// 目标会话。
+        session: SessionId,
+    },
     /// 给会话改名。
     RenameSession {
         /// 目标会话。
