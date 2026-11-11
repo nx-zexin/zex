@@ -93,6 +93,22 @@ impl Store {
     }
 
     /// 消息条数。
+    /// 会话累计 token。
+    ///
+    /// 只用于界面展示（恢复会话时至少不是 0），不参与压缩判断 ——
+    /// 那必须用本地全量估算，混用会双重计数。
+    pub fn session_tokens(&self, session: &SessionId) -> Result<i64> {
+        self.with_conn(|c| {
+            c.query_row(
+                "SELECT COALESCE(SUM(tokens), 0) FROM messages WHERE session_id = ?1",
+                params![session.as_str()],
+                |r| r.get(0),
+            )
+            .map_err(|e| Error::Store(format!("统计 token 失败: {e}")))
+        })
+    }
+
+    /// 会话里的消息条数。
     pub fn count_messages(&self, session: &SessionId) -> Result<i64> {
         self.with_conn(|c| {
             c.query_row(

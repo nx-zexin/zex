@@ -128,7 +128,14 @@ impl Agent {
         agent.session = session.clone();
         let stored = agent.store.load_messages(&session)?;
         agent.history = stored.into_iter().map(|s| s.message).collect();
-        tracing::info!(session = %session, messages = agent.history.len(), "已恢复会话");
+        // 历史消息里存了各自的 token 数，恢复后带上，界面才不会一片 0
+        let total = agent.store.session_tokens(&agent.session).unwrap_or(0);
+        agent.usage = Usage {
+            input_tokens: total.max(0) as u64,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+        };
+        tracing::info!(session = %session, messages = agent.history.len(), tokens = total, "已恢复会话");
         Ok(agent)
     }
 

@@ -813,11 +813,16 @@ impl Render for ChatView {
                         div()
                             .text_sm()
                             .text_color(rgb(TEXT))
-                            .child(format!(
-                                "{:.1}k / {}",
-                                self.usage.input_tokens as f64 / 1000.0,
-                                self.usage.output_tokens
-                            )),
+                            .child({
+                                // 历史消息只存了每条的总 token，分不出入力/出力，
+                                // 所以顶部显示合计，避免出现 "0.0k / 0" 这种假象
+                                let total = self.usage.input_tokens + self.usage.output_tokens;
+                                // 不足一千就给准确数字，"0.0k" 看着像统计坏了
+                                match total {
+                                    0..=999 => format!("{total} tokens"),
+                                    _ => format!("{:.1}k tokens", total as f64 / 1000.0),
+                                }
+                            }),
                     ),
             );
 
