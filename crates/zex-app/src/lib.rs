@@ -41,3 +41,73 @@ pub fn build_ephemeral_agent(
     let agent_cfg = zex_agent::AgentConfig::new(cfg.provider.clone(), cfg.model.clone(), cwd);
     zex_agent::Agent::new(agent_cfg, zex_tools::default_tools(), store)
 }
+
+// ─── 内核线程 ───
+
+use tokio::sync::mpsc;
+use zex_agent::{Agent, ApprovalDecision};
+use zex_core::{CoreEvent, UiCommand};
+
+/// 内核侧的运行参数。
+pub struct CoreHandles {
+    /// UI → 内核。
+    pub cmd_tx: mpsc::Sender<UiCommand>,
+    /// 内核 → UI。
+    pub event_rx: mpsc::Receiver<CoreEvent>,
+}
+
+/// 在独立线程上启动 tokio 内核。
+///
+/// 这是 ADR-002 双世界桥接的落地：gpui 主线程只做渲染，
+/// 内核在 tokio 世界里跑，两者用 channel 通信（内存 channel，零序列化）。
+pub fn spawn_core(mut agent: Agent) -> CoreHandles {
+    let (cmd_tx, mut cmd_rx) = mpsc::channel::<UiCommand>(64);
+    let (ev_tx, ev_rx) = mpsc::channel::<CoreEvent>(256);
+    let broker = agent.approvals();
+
+    let spawn_result = std::thread::Builder::new()
+        .name("zex-core".into())
+        .spawn(move || {
+            let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+                Ok(rt) => rt,
+                Err(e) => {
+                    tracing::error!(error = %e, "无法创建内核运行时");
+                    return;
+                }
+            };
+            rt.block_on(async move {
+                while let Some(cmd) = cmd_rx.recv().await {
+                    match cmd {
+                        UiCommand::UserPrompt { text, .. } => {
+                            // 单轮失败不应杀掉整个内核：把错误作为事件上报，
+                            // 会话继续可用。
+                            if let Err(e) = agent.run_turn(text, Some(&ev_tx)).await {
+                                let _ = ev_tx
+                                    .send(CoreEvent::Fatal { message: e.to_string() })
+                                    .await;
+                            }
+                        }
+                        UiCommand::Approve { id, remember } => {
+                            let _ = broker
+                                .resolve(&id, ApprovalDecision::Approve { remember })
+                                .await;
+                        }
+                        UiCommand::Reject { id, reason } => {
+                            let _ = broker
+                                .resolve(&id, ApprovalDecision::Reject { reason })
+                                .await;
+                        }
+                        UiCommand::Shutdown => break,
+                        _ => {}
+                    }
+                }
+            });
+        });
+    if let Err(e) = spawn_result {
+        // 起不来内核线程时 UI 仍可显示，只是发出去的命令没人接 ——
+        // 比直接 panic 让整个应用起不来要好。
+        tracing::error!(error = %e, "无法启动内核线程");
+    }
+
+    CoreHandles { cmd_tx, event_rx: ev_rx }
+}

@@ -12,6 +12,7 @@
 #![warn(missing_docs)]
 
 pub mod approval;
+pub mod compress;
 pub mod context;
 pub mod prompt;
 pub mod toolctx;
@@ -32,6 +33,7 @@ use zex_store::Store;
 use zex_store::audit::{AuditEntry, digest_args};
 
 pub use approval::{ApprovalBroker, ApprovalDecision};
+use compress::{CompressionPlan, Compressor};
 use context::ContextBudget;
 use toolctx::AgentCtx;
 
@@ -82,7 +84,8 @@ pub struct Agent {
     store: Store,
     policy: Policy,
     approvals: Arc<ApprovalBroker>,
-    /// 累计 token 用量（整个会话）。
+    compressor: Compressor,
+    /// 累计 token 用量（整个会话）。只用于成本统计，**不用于压缩判断**。
     usage: Usage,
 }
 
@@ -92,6 +95,7 @@ impl Agent {
         let http = zex_llm::build_http_client()?;
         let session = store.create_session("", &cfg.model, &cfg.cwd.display().to_string())?;
         let policy = Policy::new(store.clone());
+        let compressor = Compressor::new(cfg.budget.clone());
         Ok(Agent {
             cfg,
             http,
@@ -101,6 +105,7 @@ impl Agent {
             store,
             policy,
             approvals: Arc::new(ApprovalBroker::new()),
+            compressor,
             usage: Usage::default(),
         })
     }
@@ -188,6 +193,15 @@ impl Agent {
                 break;
             }
             step += 1;
+
+            // 压缩判断放在每次调用模型之前。
+            //
+            // token 判断**只用本地全量估算**，不混用 provider 回报的 usage：
+            // 后者代表的是"上一次请求"的用量，再叠加增量就是双重计数 ——
+            // 那正是 Zebra 提前触发压缩的原因。估算成本随消息数线性增长，
+            // 几百条消息的规模完全可忽略。
+            self.compressor.tick_turn();
+            self.maybe_compress(&turn, events).await;
 
             let req = self.build_request();
             let (text, thinking, tool_calls, usage) =
@@ -280,6 +294,83 @@ impl Agent {
             events,
         );
         Ok(final_text)
+    }
+
+    /// 按预算判断是否需要压缩，需要则执行。
+    ///
+    /// 两档策略：先截断过长的工具结果（不惊动 LLM），再走摘要。
+    async fn maybe_compress(
+        &mut self,
+        turn: &TurnId,
+        events: Option<&mpsc::Sender<CoreEvent>>,
+    ) {
+        let before = context::estimate_history_tokens(&self.history);
+        let plan = self.compressor.plan(&self.history, None);
+
+        match plan {
+            CompressionPlan::None => {}
+            CompressionPlan::ShrinkToolResults { indices } => {
+                self.history = Compressor::apply_shrink(&self.history, &indices);
+                let after = context::estimate_history_tokens(&self.history);
+                tracing::info!(before, after, count = indices.len(), "已截断过长的工具结果");
+                self.emit(
+                    CoreEvent::ContextCompacted {
+                        turn: turn.clone(),
+                        before_tokens: before as u64,
+                        after_tokens: after as u64,
+                        strategy: "shrink_tool_results".into(),
+                    },
+                    events,
+                );
+            }
+            CompressionPlan::Summarize { drop_before, .. } => {
+                let dropped: Vec<Message> = self.history[..drop_before].to_vec();
+                let summary = self.summarize(&dropped).await;
+
+                // 先取出 history，避免与 compressor 的可变借用冲突
+                let history = std::mem::take(&mut self.history);
+                self.history = self.compressor.apply_summary(&history, drop_before, summary);
+                let after = context::estimate_history_tokens(&self.history);
+
+                tracing::info!(before, after, dropped = drop_before, "已压缩上下文");
+                self.emit(
+                    CoreEvent::ContextCompacted {
+                        turn: turn.clone(),
+                        before_tokens: before as u64,
+                        after_tokens: after as u64,
+                        strategy: "summarize".into(),
+                    },
+                    events,
+                );
+            }
+        }
+    }
+
+    /// 让模型生成本次摘要。
+    ///
+    /// 失败或返回空时走降级方案 —— **摘要永远不返回空**，
+    /// 空摘要等于让模型丢失全部前情。
+    async fn summarize(&self, dropped: &[Message]) -> String {
+        let prompt = compress::summary_prompt(
+            self.compressor.summary(),
+            dropped,
+            self.cfg.budget.summary_max_tokens,
+        );
+        let req = ChatRequest::new(vec![Message::user(prompt)])
+            .with_system("你是一个精确的对话摘要器。只输出摘要正文，不要任何前言或解释。");
+
+        let turn = TurnId::generate();
+        match self.stream_once(req, &turn, None).await {
+            Ok((text, _, _, _)) if !text.trim().is_empty() => text,
+            Ok(_) => {
+                tracing::warn!("摘要模型返回空内容，使用降级摘要");
+                self.compressor.fallback_summary(dropped)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "摘要生成失败，使用降级摘要");
+                self.compressor.fallback_summary(dropped)
+            }
+        }
     }
 
     /// 组装一次请求。

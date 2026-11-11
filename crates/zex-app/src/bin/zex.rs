@@ -1,69 +1,358 @@
 //! Zex GUI 二进制。
 //!
-//! M0 阶段目标（`docs/M0-PLAN.md` T4）：验证 **gpui 世界 ↔ tokio 世界** 的桥接。
-//! 验收标准：tokio 线程每秒发一个事件，UI 上的计数逐秒递增且不 panic。
+//! 双世界桥接的 UI 侧（ADR-002）：gpui 主线程只做渲染与输入，
+//! 内核在独立 tokio 线程里跑，两者用 channel 通信。
 //!
-//! 这不是最终 UI。真正的对话界面在 T8 实现。
+//! M1 范围：流式对话 + 审批弹层 + 工具调用展示。
+//! Markdown 渲染与消息虚拟滚动留到 M2。
 
+use std::sync::Arc;
+
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::Sizable as _;
+use gpui_kit::component::scroll::ScrollableElement as _;
+use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::*;
 use tokio::sync::mpsc;
+use zex_agent::ApprovalBroker;
+use zex_app::{build_agent, CoreHandles};
+use zex_core::{ApprovalId, ApprovalRequest, CoreEvent, RememberScope, UiCommand};
 
-/// 内核 → UI 的示例事件。
-///
-/// 真实实现使用 `zex_core::CoreEvent`；这里刻意用一个最小类型，
-/// 让桥接本身成为唯一被验证的东西。
-#[derive(Debug)]
-enum DemoEvent {
-    Tick(u64),
+/// 一条展示用的消息。
+#[derive(Clone)]
+struct MsgItem {
+    /// 角色标签。
+    role: &'static str,
+    /// 正文。
+    text: String,
+    /// 是否是错误。
+    error: bool,
 }
 
-/// 内核侧：跑在独立 tokio runtime 线程上。
-///
-/// 真实实现里这里是整个 agent 内核。它**完全不知道 gpui 存在** ——
-/// 这正是能在 CLI 里复用同一内核的原因（ADR-002 / ADR-009）。
-fn spawn_core_thread(tx: mpsc::Sender<DemoEvent>) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || {
-        let rt = match tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(rt) => rt,
-            Err(e) => {
-                eprintln!("无法创建 tokio runtime: {e}");
-                return;
-            }
-        };
-        rt.block_on(async move {
-            let mut n = 0u64;
-            loop {
-                n += 1;
-                // 用 blocking_send 会阻塞 tokio worker；这里用 send().await
-                if tx.send(DemoEvent::Tick(n)).await.is_err() {
-                    // UI 已关闭，内核优雅退出
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            }
+/// 主视图。
+struct ChatView {
+    input: Entity<InputState>,
+    messages: Vec<MsgItem>,
+    /// 正在流式输出的内容。
+    streaming: Option<String>,
+    /// 正在执行的工具。
+    running_tool: Option<String>,
+    /// 底部状态栏文本。
+    status: String,
+    /// 待审批请求。
+    approval: Option<ApprovalRequest>,
+    /// UI → 内核。
+    cmd_tx: mpsc::Sender<UiCommand>,
+    /// 回复审批用。
+    broker: Arc<ApprovalBroker>,
+}
+
+impl ChatView {
+    fn new(
+        cmd_tx: mpsc::Sender<UiCommand>,
+        broker: Arc<ApprovalBroker>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder("给 Zex 下达任务…"));
+
+        ChatView {
+            input,
+            messages: Vec::new(),
+            streaming: None,
+            running_tool: None,
+            status: "就绪".into(),
+            approval: None,
+            cmd_tx,
+            broker,
+        }
+    }
+
+    /// 提交输入框里的内容。
+    fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.input.read(cx).value().trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+        if self.streaming.is_some() {
+            self.status = "上一轮还在进行中".into();
+            cx.notify();
+            return;
+        }
+
+        self.input.update(cx, |state, cx| {
+            state.set_value("", window, cx);
         });
-    })
+        self.messages.push(MsgItem { role: "你", text: text.clone(), error: false });
+        self.streaming = Some(String::new());
+        self.status = "思考中…".into();
+
+        let tx = self.cmd_tx.clone();
+        cx.spawn(async move |_this, _cx| {
+            let _ = tx.send(UiCommand::UserPrompt { text, attachments: vec![] }).await;
+        })
+        .detach();
+
+        cx.notify();
+    }
+
+    /// 回复审批。
+    fn respond(&mut self, approve: bool, remember: bool, cx: &mut Context<Self>) {
+        let Some(req) = self.approval.take() else {
+            return;
+        };
+        let broker = self.broker.clone();
+        let cmd_tx = self.cmd_tx.clone();
+        let id: ApprovalId = req.id.clone();
+        let grantable = req.grantable;
+
+        self.status = if approve { "已批准，执行中…".into() } else { "已拒绝".into() };
+
+        cx.spawn(async move |_this, _cx| {
+            let (cmd, decision_scope) = if approve {
+                let scope = if remember && grantable {
+                    Some(RememberScope::Pattern { pattern: None, days: None })
+                } else {
+                    None
+                };
+                (UiCommand::Approve { id: id.clone(), remember: scope.clone() }, scope)
+            } else {
+                (UiCommand::Reject { id: id.clone(), reason: "用户在界面上拒绝".into() }, None)
+            };
+            // 直接交给 broker 更快，也保证 UI 与内核看到同一个决定
+            if let UiCommand::Approve { id, remember } = &cmd {
+                let _ = broker
+                    .resolve(
+                        id,
+                        zex_agent::ApprovalDecision::Approve { remember: remember.clone() },
+                    )
+                    .await;
+            } else if let UiCommand::Reject { id, reason } = &cmd {
+                let _ = broker
+                    .resolve(id, zex_agent::ApprovalDecision::Reject { reason: reason.clone() })
+                    .await;
+            }
+            let _ = decision_scope;
+            let _ = cmd_tx;
+        })
+        .detach();
+
+        cx.notify();
+    }
+
+    /// 处理一个内核事件。
+    fn handle_event(&mut self, ev: CoreEvent, cx: &mut Context<Self>) {
+        match ev {
+            CoreEvent::TurnStarted { .. } => {
+                self.streaming.get_or_insert_with(String::new);
+                self.status = "思考中…".into();
+            }
+            CoreEvent::Token { text, .. } => {
+                self.streaming.get_or_insert_with(String::new).push_str(&text);
+            }
+            CoreEvent::ToolCallBegin { name, arguments, risk, .. } => {
+                // 把已流出的文本先落到消息列表，工具调用作为独立条目
+                self.flush_streaming();
+                self.running_tool = Some(name.clone());
+                let brief = compact_args(&arguments);
+                self.messages.push(MsgItem {
+                    role: "工具",
+                    text: format!("[{}] {name} {brief}", risk.label()),
+                    error: false,
+                });
+            }
+            CoreEvent::ToolCallEnd { ok, brief, .. } => {
+                self.running_tool = None;
+                self.messages.push(MsgItem {
+                    role: if ok { "  结果" } else { "  失败" },
+                    text: brief,
+                    error: !ok,
+                });
+            }
+            CoreEvent::ApprovalRequired { req } => {
+                self.flush_streaming();
+                self.status = "等待你的确认".into();
+                self.approval = Some(req);
+            }
+            CoreEvent::ContextCompacted { before_tokens, after_tokens, strategy, .. } => {
+                self.messages.push(MsgItem {
+                    role: "系统",
+                    text: format!(
+                        "上下文已压缩（{strategy}）：{before_tokens} → {after_tokens} tokens"
+                    ),
+                    error: false,
+                });
+            }
+            CoreEvent::TurnEnded { reason, usage, .. } => {
+                self.flush_streaming();
+                self.status = format!(
+                    "{:?} · in {} / out {} tokens",
+                    reason, usage.input_tokens, usage.output_tokens
+                );
+            }
+            CoreEvent::Warning { message } => {
+                self.messages.push(MsgItem { role: "警告", text: message, error: true });
+            }
+            CoreEvent::Fatal { message } => {
+                self.flush_streaming();
+                self.status = "出错".into();
+                self.messages.push(MsgItem { role: "错误", text: message, error: true });
+            }
+            CoreEvent::Thinking { .. } => {}
+        }
+        cx.notify();
+    }
+
+    /// 把流式缓冲落成一条消息。
+    fn flush_streaming(&mut self) {
+        if let Some(text) = self.streaming.take() {
+            if !text.trim().is_empty() {
+                self.messages.push(MsgItem { role: "Zex", text, error: false });
+            }
+        }
+    }
 }
 
-struct DemoApp {
-    ticks: u64,
-}
+impl Render for ChatView {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut list = div().flex().flex_col().gap_2().p_4();
 
-impl Render for DemoApp {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        div()
+        for m in &self.messages {
+            let color = if m.error { rgb(0xd04040) } else { rgb(0x888888) };
+            list = list.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(div().text_xs().text_color(color).child(m.role))
+                    .child(div().text_sm().child(m.text.clone())),
+            );
+        }
+
+        // 正在流式输出的内容
+        if let Some(s) = &self.streaming {
+            if !s.is_empty() {
+                list = list.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(div().text_xs().text_color(rgb(0x888888)).child("Zex"))
+                        .child(div().text_sm().child(s.clone())),
+                );
+            }
+        }
+
+        // 审批区
+        let approval_bar = match &self.approval {
+            Some(req) => {
+                let grantable = req.grantable;
+                let mut bar = div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .p_4()
+                    .bg(rgb(0x3a2f1a))
+                    .child(
+                        div()
+                            .text_sm()
+                            .child(format!("需要确认 [{}] {}", req.risk.label(), req.tool)),
+                    )
+                    .child(div().text_xs().child(req.summary.clone()))
+                    .child(div().text_xs().child(compact_args(&req.arguments)));
+
+                let mut buttons = div().flex().gap_2();
+                buttons = buttons.child(
+                    Button::new("ok").primary().small().label("批准").on_click(cx.listener(
+                        |this, _: &ClickEvent, _window, cx| this.respond(true, false, cx),
+                    )),
+                );
+                buttons = buttons.child(
+                    Button::new("no").small().label("拒绝").on_click(cx.listener(
+                        |this, _: &ClickEvent, _window, cx| this.respond(false, false, cx),
+                    )),
+                );
+                if grantable {
+                    buttons = buttons.child(
+                        Button::new("always").small().label("批准并记住此类").on_click(
+                            cx.listener(|this, _: &ClickEvent, _window, cx| {
+                                this.respond(true, true, cx)
+                            }),
+                        ),
+                    );
+                }
+                bar = bar.child(buttons);
+                Some(bar)
+            }
+            None => None,
+        };
+
+        let mut root = div()
             .size_full()
             .flex()
             .flex_col()
-            .items_center()
-            .justify_center()
-            .gap_2()
-            .child(div().text_xl().child("Zex"))
-            .child(div().child(format!("内核心跳: {}", self.ticks)))
-            .child(div().text_sm().child("M0 · 双世界桥接验证"))
+            .bg(rgb(0x1a1a1a))
+            .text_color(rgb(0xe0e0e0))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .px_4()
+                    .py_2()
+                    .bg(rgb(0x242424))
+                    .child(div().text_sm().child("Zex"))
+                    .child(div().text_xs().text_color(rgb(0x888888)).child(self.status.clone())),
+            )
+            .child(div().flex_1().overflow_y_scrollbar().child(list));
+
+        if let Some(bar) = approval_bar {
+            root = root.child(bar);
+        }
+
+        root.child(
+            div()
+                .flex()
+                .gap_2()
+                .p_4()
+                .bg(rgb(0x242424))
+                .child(div().flex_1().child(Input::new(&self.input)))
+                .child(
+                    Button::new("send")
+                        .primary()
+                        .label("发送")
+                        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.submit(window, cx))),
+                ),
+        )
+    }
+}
+
+/// 按平台选择 UI 字体。
+///
+/// 默认的虚拟字体 `.SystemUIFont` 在 Linux 上解析不到（会回退到 Segoe UI，
+/// 那也是 Windows 字体），结果中文渲染成方框。这里显式指定一个装了的字体，
+/// 并允许用 `ZEX_UI_FONT` 覆盖。
+fn apply_platform_font(cx: &mut App) {
+    let candidate = std::env::var("ZEX_UI_FONT").ok().unwrap_or_else(|| {
+        if cfg!(target_os = "linux") {
+            "Noto Sans CJK SC".to_string()
+        } else if cfg!(target_os = "macos") {
+            "PingFang SC".to_string()
+        } else {
+            "Microsoft YaHei".to_string()
+        }
+    });
+    let theme = cx.global_mut::<gpui_kit::component::Theme>();
+    theme.font_family = candidate.into();
+}
+
+/// 把 JSON 参数压成一行短摘要。
+fn compact_args(v: &serde_json::Value) -> String {
+    let s = v.to_string().replace('\n', " ");
+    if s.chars().count() > 160 {
+        format!("{}…", s.chars().take(160).collect::<String>())
+    } else {
+        s
     }
 }
 
@@ -71,57 +360,63 @@ fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
         )
         .init();
 
-    // 内核 → UI 的事件通道。容量小是有意的：UI 跟不上时内核应被反压，
-    // 而不是无限堆积事件把内存吃光。
-    let (event_tx, mut event_rx) = mpsc::channel::<DemoEvent>(64);
-    let core_thread = spawn_core_thread(event_tx);
+    let cfg = match zex_app::load() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("配置错误: {e}");
+            std::process::exit(1);
+        }
+    };
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let agent = match build_agent(&cfg, cwd) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("无法初始化内核: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let broker = agent.approvals();
+    let CoreHandles { cmd_tx, mut event_rx } = zex_app::spawn_core(agent);
 
     gpui_kit::application().run(move |cx| {
         gpui_kit::init(cx);
+        apply_platform_font(cx);
 
-        let (handle, view) =
-            match gpui_kit::open_window(WindowOptions::default(), cx, |_window, cx| {
-                cx.new(|_| DemoApp { ticks: 0 })
-            }) {
-                Ok(v) => v,
-                Err(e) => {
-                    eprintln!("无法创建窗口: {e}");
-                    return;
-                }
-            };
-
-        // gpui 侧：消费内核事件并驱动重绘。
-        //
-        // 注意这里 await 的是 tokio 的 mpsc receiver —— tokio 的 channel
-        // 不依赖 runtime 上下文，可以在 gpui 的 smol executor 上安全轮询。
-        // 若将来换成依赖 tokio runtime 的类型（如 tokio::fs），必须经
-        // Handle::spawn 转到内核线程，不能在这里直接 await。
-        //
-        // 用 WeakEntity：窗口关闭后 entity 被释放，update 返回 Err，
-        // 这正是内核优雅退出的信号（见 spawn_core_thread 里的 send 失败分支）。
-        let weak = view.downgrade();
+        let (handle, view) = match gpui_kit::open_window(
+            WindowOptions::default(),
+            cx,
+            |window, cx| {
+                let tx = cmd_tx.clone();
+                let broker = broker.clone();
+                cx.new(|cx| ChatView::new(tx, broker, window, cx))
+            },
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("无法创建窗口: {e}");
+                return;
+            }
+        };
         let _ = handle;
+
+        let weak = view.downgrade();
+        let cmd_tx = cmd_tx.clone();
         cx.spawn(async move |cx| {
             while let Some(ev) = event_rx.recv().await {
-                let DemoEvent::Tick(n) = ev;
                 let alive = weak
-                    .update(cx, |this, cx| {
-                        this.ticks = n;
-                        cx.notify();
-                    })
+                    .update(cx, |this, cx| this.handle_event(ev, cx))
                     .is_ok();
                 if !alive {
                     break;
                 }
             }
+            let _ = cmd_tx.send(UiCommand::Shutdown).await;
         })
         .detach();
     });
-
-    // gpui 事件循环结束后回收内核线程
-    let _ = core_thread.join();
 }
