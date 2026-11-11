@@ -113,6 +113,25 @@ impl ChatView {
         })
         .detach();
 
+        // 调试用：启动后自动发一条，方便在没有人手的情况下验证流式、
+        // 停止按钮、错误提示这些只在"跑起来"时才出现的界面。
+        if let Ok(prompt) = std::env::var("ZEX_DEBUG_PROMPT") {
+            if !prompt.trim().is_empty() {
+                cx.spawn_in(window, async move |this, cx| {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(1200))
+                        .await;
+                    this.update_in(cx, |this, window, cx| {
+                        this.input
+                            .update(cx, |st, cx| st.set_value(prompt, window, cx));
+                        this.submit(window, cx);
+                    })
+                    .ok();
+                })
+                .detach();
+            }
+        }
+
         ChatView {
             input,
             messages: history,
