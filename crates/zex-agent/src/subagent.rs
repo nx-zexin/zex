@@ -298,6 +298,24 @@ impl AgentRegistry {
     /// 不能因此拖住正在派活的 agent。
     fn broadcast(&self) {
         if let Some(deps) = self.deps.get() {
+            // 先落库：进程随时可能没，界面刷新晚一点没关系，数据丢了不行
+            for a in self.snapshot() {
+                let state = match &a.status {
+                    SubAgentStatus::Running => zex_store::subagents::SubAgentState::Running,
+                    SubAgentStatus::Completed => zex_store::subagents::SubAgentState::Completed,
+                    SubAgentStatus::Failed(_) => zex_store::subagents::SubAgentState::Failed,
+                    SubAgentStatus::Terminated => zex_store::subagents::SubAgentState::Terminated,
+                };
+                let _ = deps.store.upsert_sub_agent(
+                    &a.id,
+                    &a.role,
+                    &a.description,
+                    a.session.as_str(),
+                    state,
+                    a.result.as_deref(),
+                );
+            }
+
             let agents = self
                 .snapshot()
                 .into_iter()
@@ -314,6 +332,43 @@ impl AgentRegistry {
                 .ev_tx
                 .try_send(CoreEvent::TeamUpdated { agents });
         }
+    }
+
+    /// 从库里恢复名册。
+    ///
+    /// 上次退出时还在跑的，一律改判「已停止」——进程都换了，
+    /// 那些 agent 手里的上下文没了，标成「执行中」只会让界面撒谎。
+    /// 恢复后仍然可以 `send_message` 追问它们（会话历史还在库里）。
+    pub fn restore(&self) {
+        let Some(deps) = self.deps.get() else {
+            return;
+        };
+        let _ = deps.store.interrupt_orphan_sub_agents();
+        let records = deps.store.list_sub_agents().unwrap_or_default();
+        {
+            let mut map = self.agents.lock().expect("子智能体表中毒");
+            for r in records {
+                let status = match r.status {
+                    zex_store::subagents::SubAgentState::Completed => SubAgentStatus::Completed,
+                    zex_store::subagents::SubAgentState::Failed => {
+                        SubAgentStatus::Failed("上一次执行失败".into())
+                    }
+                    _ => SubAgentStatus::Terminated,
+                };
+                map.insert(
+                    r.id.clone(),
+                    Entry {
+                        role: r.role,
+                        description: r.description,
+                        session: SessionId::from(r.session_id),
+                        status,
+                        result: r.result,
+                        cancel: Arc::new(AtomicBool::new(false)),
+                    },
+                );
+            }
+        }
+        self.broadcast();
     }
 
     /// 当前所有子 agent 的状态。

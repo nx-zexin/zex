@@ -1821,6 +1821,23 @@ fn main() {
                 // niri/sway 这类平铺器会忽略 WindowOptions 里的初始尺寸，
                 // 这里再显式要一次；被忽略也无害（浮动窗口自行决定）。
                 window.resize(size(px(1280.0), px(820.0)));
+
+                // 关窗拦截：还有任务在跑就最小化，别把活儿掐了。
+                // 注意 Linux 只有 minimize，没有窗口级 hide —— niri 这类
+                // 平铺合成器可能忽略最小化请求，那时至少窗口不会关掉。
+                {
+                    let store = store.clone();
+                    window.on_window_should_close(cx, move |window, _cx| {
+                        let busy = store.has_running_work().unwrap_or(false);
+                        if busy {
+                            window.minimize_window();
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                }
+
                 let tx = cmd_tx.clone();
                 let broker = broker.clone();
                 let sessions = sessions.clone();

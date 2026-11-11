@@ -7,7 +7,7 @@ use rusqlite::Connection;
 use zex_core::{Error, Result};
 
 /// 当前 schema 版本。新增迁移时 +1。
-pub const LATEST: i64 = 2;
+pub const LATEST: i64 = 3;
 
 /// 跑完所有未应用的迁移。
 pub fn run(conn: &Connection) -> Result<()> {
@@ -27,6 +27,7 @@ pub fn run(conn: &Connection) -> Result<()> {
         match version {
             0 => v1_initial(conn)?,
             1 => v2_tasks(conn)?,
+            2 => v3_sub_agents(conn)?,
             other => {
                 // 正常情况下不可达：version 已在上面校验过 <= LATEST
                 return Err(Error::Store(format!("迁移分支缺失: 版本 {other}")));
@@ -172,7 +173,10 @@ mod tests {
             .map(|r| r.unwrap())
             .collect();
         names.sort();
-        assert_eq!(names, vec!["audit", "grants", "messages", "sessions", "tasks"]);
+        assert_eq!(
+            names,
+            vec!["audit", "grants", "messages", "sessions", "sub_agents", "tasks"]
+        );
     }
 
     #[test]
@@ -229,4 +233,31 @@ mod tests {
         let err = run(&c).unwrap_err();
         assert!(matches!(err, Error::Store(_)));
     }
+}
+
+/// v3：子智能体名册。
+///
+/// 进程退出后团队是要恢复的 —— 否则用户辛苦派出的一队人，
+/// 关一次窗口就全没了。
+fn v3_sub_agents(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS sub_agents (
+            id          TEXT PRIMARY KEY,
+            role        TEXT NOT NULL,
+            description TEXT NOT NULL,
+            -- 每个子 agent 独占的会话，点进去能看它干了什么
+            session_id  TEXT NOT NULL,
+            status      TEXT NOT NULL,
+            -- 跑完的结果摘要
+            result      TEXT,
+            created_at  INTEGER NOT NULL,
+            updated_at  INTEGER NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_sub_agents_updated ON sub_agents(updated_at DESC);
+        "#,
+    )
+    .map_err(|e| Error::Store(format!("v3 迁移失败: {e}")))?;
+    Ok(())
 }

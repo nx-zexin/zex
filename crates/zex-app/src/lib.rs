@@ -158,6 +158,8 @@ pub fn spawn_core(mut agent: Agent) -> CoreHandles {
         ev_tx.clone(),
         broker.clone(),
     );
+    // 把上次的团队捞回来。必须在 install 之后、开始收命令之前。
+    registry.restore();
     let session_locks: SessionLocks = Arc::new(Mutex::new(HashMap::new()));
 
     let spawn_result = std::thread::Builder::new()
