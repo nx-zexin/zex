@@ -67,7 +67,6 @@ struct MsgItem {
 struct SessionItem {
     id: String,
     title: String,
-    when: String,
 }
 
 /// 主视图。
@@ -725,6 +724,7 @@ impl ChatView {
                 .items_center()
                 .gap_1()
                 .rounded(px(6.0))
+                .relative()
                 .group(group.clone());
 
             if active {
@@ -773,42 +773,24 @@ impl ChatView {
                     );
                 }
 
-                // 时间和 ⋯ 叠在同一个格子里：默认看时间，hover 时换成按钮，
-                // 不额外占宽度（侧栏只有 240，多一列标题就放不下了）
-                let (g_time, g_menu) = (group.clone(), group.clone());
-                row = row.child(title).child(
-                    div()
-                        .flex_none()
-                        .relative()
-                        .w(px(44.0))
-                        .h_full()
-                        .child(
-                            div()
-                                .absolute()
-                                .top_0()
-                                .right_0()
-                                .bottom_0()
-                                .flex()
-                                .items_center()
-                                .justify_end()
-                                .text_xs()
-                                .text_color(rgb(TEXT_DIM))
-                                .child(s.when.clone())
-                                .group_hover(g_time, |st| st.invisible()),
-                        )
-                        .child(
-                            div()
-                                .absolute()
-                                .top_0()
-                                .right_0()
-                                .bottom_0()
-                                .flex()
-                                .items_center()
-                                .invisible()
-                                .group_hover(g_menu, |st| st.visible())
-                                .child(self.render_item_menu(&s.id, cx)),
-                        ),
-                );
+                // 只显示标题，不再显示时间；⋯ 绝对定位在右端，
+                // 平时不可见，hover 时才浮出来 —— 不占布局宽度，
+                // 标题能用满整行（侧栏只有 240px）。
+                let g_menu = group.clone();
+                row = row
+                    .child(title.pr(px(20.0)))
+                    .child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .right_0()
+                            .bottom_0()
+                            .flex()
+                            .items_center()
+                            .invisible()
+                            .group_hover(g_menu, |st| st.visible())
+                            .child(self.render_item_menu(&s.id, cx)),
+                    );
             }
 
             list = list.child(row);
@@ -1236,23 +1218,8 @@ fn history_to_items(msgs: &[zex_core::Message]) -> Vec<MsgItem> {
 /// 从数据库读出最近的会话，供侧栏展示。
 /// 把内核送来的会话摘要转成侧栏项（含相对时间）。
 fn summaries_to_items(list: &[zex_core::event::SessionSummary]) -> Vec<SessionItem> {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-
     list.iter()
         .map(|s| {
-            let delta = (now - s.updated_at).max(0);
-            let when = if delta < 60 {
-                "刚刚".to_string()
-            } else if delta < 3600 {
-                format!("{}m", delta / 60)
-            } else if delta < 86_400 {
-                format!("{}h", delta / 3600)
-            } else {
-                format!("{}d", delta / 86_400)
-            };
             let title = if s.title.trim().is_empty() {
                 let raw = s.id.as_str();
                 let tail = if raw.len() > 6 { &raw[raw.len() - 6..] } else { raw };
@@ -1260,32 +1227,17 @@ fn summaries_to_items(list: &[zex_core::event::SessionSummary]) -> Vec<SessionIt
             } else {
                 s.title.clone()
             };
-            SessionItem { id: s.id.clone(), title, when }
+            SessionItem { id: s.id.clone(), title }
         })
         .collect()
 }
 
-fn load_sessions(store: &zex_store::Store, active: &str) -> Vec<SessionItem> {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-
+fn load_sessions(store: &zex_store::Store) -> Vec<SessionItem> {
     store
         .list_sessions(20)
         .unwrap_or_default()
         .into_iter()
         .map(|s| {
-            let delta = (now - s.updated_at).max(0);
-            let when = if delta < 60 {
-                "刚刚".to_string()
-            } else if delta < 3600 {
-                format!("{}m", delta / 60)
-            } else if delta < 86_400 {
-                format!("{}h", delta / 3600)
-            } else {
-                format!("{}d", delta / 86_400)
-            };
             let title = if s.title.trim().is_empty() {
                 // session id 形如 ses_<uuidv7>，前缀是时间戳所以彼此相同；
                 // 取尾部 6 位才能区分
@@ -1295,11 +1247,7 @@ fn load_sessions(store: &zex_store::Store, active: &str) -> Vec<SessionItem> {
             } else {
                 s.title
             };
-            SessionItem { id: s.id.as_str().to_string(), title, when }
-        })
-        .map(|mut s| {
-            s.id = if s.id == active { active.to_string() } else { s.id };
-            s
+            SessionItem { id: s.id.as_str().to_string(), title }
         })
         .collect()
 }
@@ -1330,7 +1278,7 @@ fn main() {
 
     let broker = agent.approvals();
     let active_session = agent.session_id().as_str().to_string();
-    let sessions = load_sessions(agent.store(), &active_session);
+    let sessions = load_sessions(agent.store());
     let model = cfg.model.clone();
     let cwd_str = cwd.display().to_string();
     let history = history_to_items(agent.history());

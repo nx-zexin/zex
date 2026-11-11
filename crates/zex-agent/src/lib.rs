@@ -96,18 +96,27 @@ pub struct Agent {
 }
 
 impl Agent {
-    /// 新建 agent（带持久化与权限闸门）。
-    pub fn new(cfg: AgentConfig, tools: Vec<Arc<dyn ErasedTool>>, store: Store) -> Result<Self> {
+    /// 装配一个 agent，**不创建会话**。
+    ///
+    /// `new` / `resume` 都走这里。分开的原因是 `resume` 曾经复用了
+    /// `new`，而 `new` 会往库里插一条空会话 —— 结果每启动一次就多出
+    /// 一个空壳，侧栏里堆满「会话 xxxxx」。
+    fn with_session(
+        cfg: AgentConfig,
+        tools: Vec<Arc<dyn ErasedTool>>,
+        store: Store,
+        session: SessionId,
+        history: Vec<Message>,
+    ) -> Result<Self> {
         let http = zex_llm::build_http_client()?;
-        let session = store.create_session("", &cfg.model, &cfg.cwd.display().to_string())?;
         let policy = Policy::new(store.clone());
         let compressor = Compressor::new(cfg.budget.clone());
         Ok(Agent {
             cfg,
             http,
             tools,
-            history: Vec::new(),
-            session: session.id,
+            history,
+            session,
             store,
             policy,
             approvals: Arc::new(ApprovalBroker::new()),
@@ -117,6 +126,12 @@ impl Agent {
         })
     }
 
+    /// 新建 agent（带持久化与权限闸门）。
+    pub fn new(cfg: AgentConfig, tools: Vec<Arc<dyn ErasedTool>>, store: Store) -> Result<Self> {
+        let session = store.create_session("", &cfg.model, &cfg.cwd.display().to_string())?;
+        Self::with_session(cfg, tools, store, session.id, Vec::new())
+    }
+
     /// 恢复一个已有会话。
     pub fn resume(
         cfg: AgentConfig,
@@ -124,10 +139,8 @@ impl Agent {
         store: Store,
         session: SessionId,
     ) -> Result<Self> {
-        let mut agent = Self::new(cfg, tools, store)?;
-        agent.session = session.clone();
-        let stored = agent.store.load_messages(&session)?;
-        agent.history = stored
+        let stored = store.load_messages(&session)?;
+        let history: Vec<Message> = stored
             .into_iter()
             .map(|s| {
                 let mut m = s.message;
@@ -136,6 +149,7 @@ impl Agent {
                 m
             })
             .collect();
+        let mut agent = Self::with_session(cfg, tools, store, session.clone(), history)?;
         // 历史消息里存了各自的 token 数，恢复后带上，界面才不会一片 0
         let total = agent.store.session_tokens(&agent.session).unwrap_or(0);
         agent.usage = Usage {
@@ -878,6 +892,25 @@ mod tests {
         let agent = Agent::new(test_cfg(), vec![], store.clone()).unwrap();
         let sid = agent.session_id().clone();
         assert!(store.get_session(&sid).unwrap().is_some(), "会话应已落库");
+    }
+
+    #[test]
+    fn resume_does_not_create_a_session() {
+        // 回归：resume 曾经复用 new 的构造，而 new 会插一条空会话，
+        // 结果每启动一次就多一个空壳
+        let store = Store::in_memory().unwrap();
+        let agent = Agent::new(test_cfg(), vec![], store.clone()).unwrap();
+        let sid = agent.session_id().clone();
+        let before = store.list_sessions(100).unwrap().len();
+
+        let resumed = Agent::resume(test_cfg(), vec![], store.clone(), sid.clone()).unwrap();
+
+        assert_eq!(resumed.session_id(), &sid);
+        assert_eq!(
+            store.list_sessions(100).unwrap().len(),
+            before,
+            "resume 不应新增会话"
+        );
     }
 
     #[test]
