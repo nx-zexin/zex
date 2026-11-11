@@ -125,6 +125,19 @@ impl Agent {
         Ok(agent)
     }
 
+    /// 切换当前会话，并把历史换成目标会话的历史。
+    ///
+    /// 调用方负责保证此时没有正在进行的轮次 —— 中途切换会让
+    /// 本轮的写入落到新会话上。
+    pub fn switch_session(&mut self, session: SessionId) -> Result<()> {
+        let stored = self.store.load_messages(&session)?;
+        self.session = session.clone();
+        self.history = stored.into_iter().map(|s| s.message).collect();
+        self.usage = Usage::default();
+        tracing::info!(session = %session, messages = self.history.len(), "已切换会话");
+        Ok(())
+    }
+
     /// 审批注册表。UI/CLI 需要 clone 它来回复审批。
     pub fn approvals(&self) -> Arc<ApprovalBroker> {
         self.approvals.clone()

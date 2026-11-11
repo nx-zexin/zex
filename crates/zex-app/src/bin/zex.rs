@@ -12,6 +12,7 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::*;
+
 use tokio::sync::mpsc;
 use zex_agent::ApprovalBroker;
 use zex_core::{ApprovalId, ApprovalRequest, CoreEvent, RememberScope, UiCommand, Usage};
@@ -44,7 +45,12 @@ enum MsgKind {
     User,
     Assistant,
     ToolCall { name: String, args: String, risk: String },
-    ToolResult { ok: bool, output: String },
+    ToolResult {
+        ok: bool,
+        output: String,
+        /// 产出这条结果的工具名。历史消息里可能缺失（老数据没存）。
+        name: Option<String>,
+    },
     System,
 }
 
@@ -67,6 +73,8 @@ struct ChatView {
     input: Entity<InputState>,
     messages: Vec<MsgItem>,
     streaming: Option<String>,
+    /// 消息区滚动句柄：新内容到达时跟到底部。
+    feed_scroll: gpui_kit::ScrollHandle,
     running_tool: Option<String>,
     status: String,
     approval: Option<ApprovalRequest>,
@@ -97,6 +105,7 @@ impl ChatView {
             input,
             messages: history,
             streaming: None,
+            feed_scroll: gpui_kit::ScrollHandle::new(),
             running_tool: None,
             status: "Ready".into(),
             approval: None,
@@ -127,6 +136,7 @@ impl ChatView {
         })
         .detach();
 
+        self.feed_scroll.scroll_to_bottom();
         cx.notify();
     }
 
@@ -170,6 +180,7 @@ impl ChatView {
             }
             CoreEvent::Token { text, .. } => {
                 self.streaming.get_or_insert_with(String::new).push_str(&text);
+                self.feed_scroll.scroll_to_bottom();
             }
             CoreEvent::ToolCallBegin { name, arguments, risk, .. } => {
                 self.flush_streaming();
@@ -183,14 +194,17 @@ impl ChatView {
                     },
                     text: String::new(),
                 });
+                self.feed_scroll.scroll_to_bottom();
             }
             CoreEvent::ToolCallEnd { ok, brief, .. } => {
-                self.running_tool = None;
+                // take 而不是 clean：结果卡要显示是哪个工具产出的
+                let name = self.running_tool.take();
                 self.status = "Ready".into();
                 self.messages.push(MsgItem {
-                    kind: MsgKind::ToolResult { ok, output: brief },
+                    kind: MsgKind::ToolResult { ok, output: brief, name },
                     text: String::new(),
                 });
+                self.feed_scroll.scroll_to_bottom();
             }
             CoreEvent::ApprovalRequired { req } => {
                 self.flush_streaming();
@@ -217,6 +231,16 @@ impl ChatView {
             CoreEvent::Warning { message } => {
                 self.messages.push(MsgItem { kind: MsgKind::System, text: message });
             }
+            CoreEvent::SessionSwitched { session, history } => {
+                // 整体替换而不是追加：切换会话是"换一个世界"，
+                // 旧消息一条都不该留下。
+                self.messages = history_to_items(&history);
+                self.active_session = session;
+                self.streaming = None;
+                self.running_tool = None;
+                self.status = "Ready".into();
+                self.feed_scroll.scroll_to_bottom();
+            }
             CoreEvent::Fatal { message } => {
                 self.flush_streaming();
                 self.status = "出错".into();
@@ -231,6 +255,7 @@ impl ChatView {
         if let Some(text) = self.streaming.take() {
             if !text.trim().is_empty() {
                 self.messages.push(MsgItem { kind: MsgKind::Assistant, text });
+                self.feed_scroll.scroll_to_bottom();
             }
         }
     }
@@ -284,6 +309,37 @@ impl ChatView {
                     "有影响" => (BRAND_SOFT, BRAND),
                     _ => (BG_HOVER, TEXT_MUTED),
                 };
+                let head = div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(rgb(BRAND))
+                                    .child("TOOL CALL"),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_family(MONO)
+                                    .text_color(rgb(TEXT_MUTED))
+                                    .child(name.clone()),
+                            ),
+                    );
+                // 历史消息没有风险等级，此时不画空胶囊
+                let head = if risk.is_empty() {
+                    head
+                } else {
+                    head.child(pill(risk.clone(), bg, fg))
+                };
+
                 div()
                     .flex()
                     .flex_col()
@@ -293,33 +349,7 @@ impl ChatView {
                     .bg(rgb(BG_TOOL))
                     .border_1()
                     .border_color(rgb(BORDER_SOFT))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_3()
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .font_weight(FontWeight::BOLD)
-                                            .text_color(rgb(BRAND))
-                                            .child("TOOL CALL"),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .font_family(MONO)
-                                            .text_color(rgb(TEXT_MUTED))
-                                            .child(name.clone()),
-                                    ),
-                            )
-                            .child(pill(format!("{risk}"), bg, fg)),
-                    )
+                    .child(head)
                     .child(
                         div()
                             .text_sm()
@@ -330,9 +360,15 @@ impl ChatView {
                     .into_any_element()
             }
 
-            MsgKind::ToolResult { ok, output } => {
+            MsgKind::ToolResult { ok, output, name } => {
                 let (dot_bg, mark) = if *ok { (OK_SOFT, "✓") } else { (DANGER_SOFT, "✕") };
                 let mark_color = if *ok { OK } else { DANGER };
+                // 输出可能很长（日志、文件内容），先截断避免一屏全是工具输出
+                let shown = truncate_for_display(output, 1200);
+                let head_label = match name {
+                    Some(n) if !n.is_empty() => format!("TOOL RESULT · {n}"),
+                    _ => "TOOL RESULT".to_string(),
+                };
                 div()
                     .flex()
                     .flex_col()
@@ -352,7 +388,7 @@ impl ChatView {
                                     .text_xs()
                                     .font_weight(FontWeight::BOLD)
                                     .text_color(rgb(TEXT_MUTED))
-                                    .child("TOOL RESULT"),
+                                    .child(head_label),
                             )
                             .child(
                                 div()
@@ -375,7 +411,7 @@ impl ChatView {
                             .text_sm()
                             .font_family(MONO)
                             .text_color(rgb(TEXT_MUTED))
-                            .child(output.clone()),
+                            .child(shown),
                     )
                     .into_any_element()
             }
@@ -398,44 +434,40 @@ impl ChatView {
         }
     }
 
-    fn render_sidebar(&self, _cx: &mut Context<Self>) -> AnyElement {
+    fn render_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
         let mut list = div().flex().flex_col().gap_1().px_3();
 
         for s in &self.sessions {
             let active = s.id == self.active_session;
-            let mut row = div()
+            // Button 的 on_click 是固有方法；Div 在这个 kit 里没有暴露点击能力，
+            // 所以可点行直接用 ghost 按钮。
+            let mut btn = Button::new(s.id.clone())
+                .ghost()
                 .w_full()
-                .h(px(38.0))
-                .px_3()
-                .flex()
-                .items_center()
-                .justify_between()
-                .gap_2()
-                .rounded(px(6.0))
-                .text_sm();
+                .label(format!("{}  ·  {}", s.title, s.when));
 
-            row = if active {
-                row.bg(rgb(BG_HOVER)).text_color(rgb(TEXT))
+            if active {
+                btn = btn.toggled(true);
             } else {
-                row.text_color(rgb(TEXT_MUTED))
-            };
+                let id = s.id.clone();
+                let tx = self.cmd_tx.clone();
+                btn = btn.on_click(cx.listener(move |this, _ev: &ClickEvent, _window, cx| {
+                    let id = id.clone();
+                    let tx = tx.clone();
+                    this.status = "切换中…".into();
+                    cx.spawn(async move |_this, _cx| {
+                        let _ = tx
+                            .send(UiCommand::SwitchSession {
+                                session: zex_core::SessionId::from(id),
+                            })
+                            .await;
+                    })
+                    .detach();
+                    cx.notify();
+                }));
+            }
 
-            row = row
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .truncate()
-                        .child(s.title.clone()),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(TEXT_DIM))
-                        .child(s.when.clone()),
-                );
-
-            list = list.child(row);
+            list = list.child(btn);
         }
 
         div()
@@ -715,7 +747,30 @@ impl Render for ChatView {
             feed = feed.child(self.render_message(m));
         }
         if let Some(s) = &self.streaming {
-            if !s.is_empty() {
+            if s.is_empty() {
+                // 请求已发出但还没吐字：界面上必须有东西，
+                // 否则用户看到的是一个静默的空白，会以为卡死
+                feed = feed.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(role_label("ZEX"))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(div().text_lg().text_color(rgb(TEXT_DIM)).child("思考中"))
+                                .child(
+                                    div()
+                                        .size(px(6.0))
+                                        .rounded_full()
+                                        .bg(rgb(BRAND)),
+                                ),
+                        ),
+                );
+            } else {
                 feed = feed.child(
                     div()
                         .flex()
@@ -786,6 +841,19 @@ fn compact_args(v: &serde_json::Value) -> String {
     }
 }
 
+/// 截断过长的工具输出。
+///
+/// 保留开头和结尾 —— 结尾通常有错误信息，全砍掉反而最有用的一段没了。
+fn truncate_for_display(s: &str, limit: usize) -> String {
+    let n = s.chars().count();
+    if n <= limit {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(limit * 2 / 3).collect();
+    let tail: String = s.chars().skip(n - limit / 3).collect();
+    format!("{head}\n\n… 省略 {} 字符 …\n\n{tail}", n - limit)
+}
+
 /// 按平台选择 UI 字体。
 fn apply_platform_font(cx: &mut App) {
     let candidate = std::env::var("ZEX_UI_FONT").ok().unwrap_or_else(|| {
@@ -813,16 +881,31 @@ fn history_to_items(msgs: &[zex_core::Message]) -> Vec<MsgItem> {
                 out.push(MsgItem { kind: MsgKind::User, text: m.text() });
             }
             Message::Assistant { tool_calls, .. } => {
-                if tool_calls.is_empty() {
-                    let t = m.text();
-                    if !t.trim().is_empty() {
-                        out.push(MsgItem { kind: MsgKind::Assistant, text: t });
-                    }
+                let t = m.text();
+                if !t.trim().is_empty() {
+                    out.push(MsgItem { kind: MsgKind::Assistant, text: t });
+                }
+                // 历史里的工具调用也要还原成卡片，否则回看会话时
+                // 只剩一堆结果、看不出中间发生了什么
+                for call in tool_calls {
+                    out.push(MsgItem {
+                        kind: MsgKind::ToolCall {
+                            name: call.name.clone(),
+                            args: compact_args(&call.arguments),
+                            // 历史里没存风险等级，留空即不画胶囊
+                            risk: String::new(),
+                        },
+                        text: String::new(),
+                    });
                 }
             }
-            Message::Tool { content, is_error, .. } => {
+            Message::Tool { content, is_error, name, .. } => {
                 out.push(MsgItem {
-                    kind: MsgKind::ToolResult { ok: !*is_error, output: content.clone() },
+                    kind: MsgKind::ToolResult {
+                        ok: !*is_error,
+                        output: content.clone(),
+                        name: name.clone(),
+                    },
                     text: String::new(),
                 });
             }

@@ -127,6 +127,26 @@ pub fn spawn_core(mut agent: Agent) -> CoreHandles {
                                 .resolve(&id, ApprovalDecision::Reject { reason })
                                 .await;
                         }
+                        UiCommand::SwitchSession { session } => {
+                            match agent.switch_session(session.clone()) {
+                                Ok(()) => {
+                                    let _ = ev_tx
+                                        .send(CoreEvent::SessionSwitched {
+                                            session: session.to_string(),
+                                            history: agent.history().to_vec(),
+                                        })
+                                        .await;
+                                }
+                                Err(e) => {
+                                    // 切换失败保持原会话，别把用户丢在空会话里
+                                    let _ = ev_tx
+                                        .send(CoreEvent::Warning {
+                                            message: format!("切换会话失败：{e}"),
+                                        })
+                                        .await;
+                                }
+                            }
+                        }
                         UiCommand::Shutdown => break,
                         _ => {}
                     }

@@ -118,6 +118,16 @@ pub enum CoreEvent {
         /// 描述。
         message: String,
     },
+    /// 已切换到另一个会话，附带该会话的完整历史。
+    ///
+    /// 历史随事件一起送来，UI 不必再去查库 —— 否则容易和内核的
+    /// 状态不一致（比如切换过程中又追加了一条消息）。
+    SessionSwitched {
+        /// 新会话 id。
+        session: String,
+        /// 历史消息。
+        history: Vec<crate::message::Message>,
+    },
 }
 
 /// 一条待审批的请求。
