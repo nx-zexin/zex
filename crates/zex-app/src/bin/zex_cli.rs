@@ -146,7 +146,7 @@ async fn async_main() -> ExitCode {
                     let mark = if ok { "ok" } else { "失败" };
                     eprintln!("  └─ {mark}: {brief}");
                 }
-                CoreEvent::ApprovalRequired { req } => {
+                CoreEvent::ApprovalRequired { req, .. } => {
                     eprintln!("\n╭─ 需要确认 [{}] {}", req.risk.label(), req.tool);
                     eprintln!("│ {}", req.summary);
                     eprintln!("│ 参数: {}", compact(&req.arguments));

@@ -109,9 +109,11 @@ struct ChatView {
     broker: Arc<ApprovalBroker>,
     sessions: Vec<SessionItem>,
     active_session: String,
-    /// 哪一轮属于哪个会话。并行执行时，别的会话的 token 不该混进
-    /// 当前正在看的这个会话里。
-    turn_sessions: std::collections::HashMap<String, String>,
+    /// 别的会话发来的授权请求。切到那个会话时再摆出来，
+    /// 免得后台任务把当前视图顶掉。
+    pending_approvals: Vec<(String, ApprovalRequest)>,
+    /// 用来刷新待办列表。后台会话跑完时当前视图不动，但要更新任务。
+    store: Arc<zex_store::Store>,
     cwd: String,
     model: String,
     usage: Usage,
@@ -127,6 +129,7 @@ impl ChatView {
         model: String,
         history: Vec<MsgItem>,
         tasks: Vec<zex_store::tasks::TaskRecord>,
+        store: Arc<zex_store::Store>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -196,7 +199,8 @@ impl ChatView {
             broker,
             sessions,
             active_session,
-            turn_sessions: std::collections::HashMap::new(),
+            pending_approvals: Vec::new(),
+            store,
             cwd,
             model,
             usage: Usage::default(),
@@ -371,32 +375,35 @@ impl ChatView {
         cx.notify();
     }
 
-    /// 这一轮是否属于当前正在看的会话。
+    /// 这个事件是否属于当前正在看的会话。
     ///
-    /// 找不到归属时按「是」处理：单会话的正常路径不该被这条规则影响。
-    fn turn_is_active(&self, turn: &zex_core::TurnId) -> bool {
-        match self.turn_sessions.get(&turn.to_string()) {
-            Some(session) => *session == self.active_session,
-            None => true,
-        }
+    /// 并行执行时内核会同时产出多个会话的事件；不属于当前会话的
+    /// 一律不往视图里放，否则两个任务的内容会串在一起。
+    fn is_active(&self, session: &zex_core::SessionId) -> bool {
+        session.as_str() == self.active_session
     }
 
     fn handle_event(&mut self, ev: CoreEvent, cx: &mut Context<Self>) {
         match ev {
-            CoreEvent::TurnStarted { session, turn } => {
-                self.turn_sessions
-                    .insert(turn.to_string(), session.to_string());
+            CoreEvent::TurnStarted { session, turn: _ } => {
+                if !self.is_active(&session) {
+                    self.status = "其它会话在后台执行".into();
+                    return;
+                }
                 self.streaming.get_or_insert_with(String::new);
                 self.status = "思考中…".into();
             }
-            CoreEvent::Token { turn, text } => {
-                // 别的会话在后台跑，它的输出不往当前视图里塞。
-                if self.turn_is_active(&turn) {
+            CoreEvent::Token { session, turn: _, text } => {
+                if self.is_active(&session) {
                     self.streaming.get_or_insert_with(String::new).push_str(&text);
                     self.sync_scroller(cx);
                 }
             }
-            CoreEvent::ToolCallBegin { name, arguments, risk, .. } => {
+            CoreEvent::ToolCallBegin { session, name, arguments, risk, .. } => {
+                if !self.is_active(&session) {
+                    // 后台会话的工具调用不上台面，但它确实在跑
+                    self.status = format!("其它会话执行 {name}");
+                } else {
                 self.flush_streaming(cx);
                 self.running_tool = Some(name.clone());
                 self.status = format!("执行 {name}");
@@ -409,8 +416,12 @@ impl ChatView {
                     text: String::new(),
                 });
                 self.sync_scroller(cx);
+                }
             }
-            CoreEvent::ToolCallEnd { ok, brief, .. } => {
+            CoreEvent::ToolCallEnd { session, ok, brief, .. } => {
+                if !self.is_active(&session) {
+                    return;
+                }
                 // take 而不是 clean：结果卡要显示是哪个工具产出的
                 let name = self.running_tool.take();
                 self.status = "Ready".into();
@@ -420,19 +431,31 @@ impl ChatView {
                 });
                 self.sync_scroller(cx);
             }
-            CoreEvent::ApprovalRequired { req } => {
+            CoreEvent::ApprovalRequired { session, req } => {
+                // 别的会话要授权时不能顶掉当前视图：放队列里，切过去再看。
+                if !self.is_active(&session) {
+                    self.pending_approvals.push((session.to_string(), req));
+                    return;
+                }
                 self.flush_streaming(cx);
                 self.status = "等待确认".into();
                 self.approval = Some(req);
             }
-            CoreEvent::ContextCompacted { before_tokens, after_tokens, strategy, .. } => {
+            CoreEvent::ContextCompacted { session, before_tokens, after_tokens, strategy, .. } => {
+                if !self.is_active(&session) {
+                    return;
+                }
                 self.messages.push(MsgItem {
                     kind: MsgKind::System,
                     text: format!("上下文已压缩（{strategy}）：{before_tokens} → {after_tokens} tokens"),
                 });
             }
-            CoreEvent::TurnEnded { reason, usage, turn } => {
-                self.turn_sessions.remove(&turn.to_string());
+            CoreEvent::TurnEnded { session, reason, usage, turn: _ } => {
+                if !self.is_active(&session) {
+                    // 后台会话跑完只是刷新待办，不动当前视图
+                    self.tasks = load_tasks(&self.store);
+                    return;
+                }
                 self.flush_streaming(cx);
                 // 取消/失败路径不会有 flush 收尾，这里兜住，避免输入框锁死
                 self.streaming = None;
@@ -465,8 +488,17 @@ impl ChatView {
                 // 整体替换而不是追加：切换会话是"换一个世界"，
                 // 旧消息一条都不该留下。
                 self.messages = history_to_items(&history);
-                self.active_session = session;
+                self.active_session = session.clone();
                 self.sessions = summaries_to_items(&sessions);
+                // 这个会话之前在后台等过授权？现在摆出来。
+                if let Some(pos) = self
+                    .pending_approvals
+                    .iter()
+                    .position(|(s, _)| *s == session)
+                {
+                    let (_, req) = self.pending_approvals.remove(pos);
+                    self.approval = Some(req);
+                }
                 // 切了会话就是要聊，从工作台进对话
                 self.mode = ViewMode::Chat;
                 self.streaming = None;
@@ -1623,6 +1655,7 @@ fn main() {
     let cwd_str = cwd.display().to_string();
     let history = history_to_items(agent.history());
     let tasks = load_tasks(agent.store());
+    let store = Arc::new(agent.store().clone());
     let handles = zex_app::spawn_core(agent);
     let cmd_tx = handles.cmd_tx.clone();
     let mut event_rx = handles.event_rx;
@@ -1663,8 +1696,9 @@ fn main() {
                 let model = model.clone();
                 let history = history.clone();
                 let tasks = tasks.clone();
+                let store = store.clone();
                 cx.new(|cx| {
-                    ChatView::new(tx, broker, sessions, active, cwd, model, history, tasks, window, cx)
+                    ChatView::new(tx, broker, sessions, active, cwd, model, history, tasks, store, window, cx)
                 })
             },
         ) {

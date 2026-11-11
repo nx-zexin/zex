@@ -45,6 +45,8 @@ pub enum CoreEvent {
     },
     /// 模型输出的文本增量。
     Token {
+        /// 所属会话。并行执行时 UI 据此丢弃别的会话的输出。
+        session: SessionId,
         /// 本轮。
         turn: TurnId,
         /// 增量文本（可能为空串，表示心跳）。
@@ -52,6 +54,7 @@ pub enum CoreEvent {
     },
     /// 模型的推理过程增量（若 provider 支持）。
     Thinking {
+        session: SessionId,
         /// 本轮。
         turn: TurnId,
         /// 增量文本。
@@ -59,6 +62,7 @@ pub enum CoreEvent {
     },
     /// 即将执行工具。
     ToolCallBegin {
+        session: SessionId,
         /// 本轮。
         turn: TurnId,
         /// 调用 id。
@@ -72,6 +76,7 @@ pub enum CoreEvent {
     },
     /// 工具执行完毕。
     ToolCallEnd {
+        session: SessionId,
         /// 本轮。
         turn: TurnId,
         /// 调用 id。
@@ -85,11 +90,14 @@ pub enum CoreEvent {
     ///
     /// UI 必须回一个 [`UiCommand::Approve`] 或 [`UiCommand::Reject`]。
     ApprovalRequired {
+        /// 谁在等确认。并行时可能有多个任务同时要授权。
+        session: SessionId,
         /// 审批请求。
         req: ApprovalRequest,
     },
     /// 发生了上下文压缩。
     ContextCompacted {
+        session: SessionId,
         /// 本轮。
         turn: TurnId,
         /// 压缩前 token 估算。
@@ -101,6 +109,7 @@ pub enum CoreEvent {
     },
     /// 一轮结束。
     TurnEnded {
+        session: SessionId,
         /// 本轮。
         turn: TurnId,
         /// 为什么结束。
@@ -275,6 +284,7 @@ mod tests {
     fn core_event_is_clone_and_pure_data() {
         // 能 clone 即说明不含 Entity/Window 这类不可 clone 的 gpui 类型
         let ev = CoreEvent::Token {
+            session: SessionId::generate(),
             turn: TurnId::generate(),
             text: "hi".into(),
         };

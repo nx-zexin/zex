@@ -389,6 +389,7 @@ impl Agent {
                     Err(e) => {
                         self.emit(
                             CoreEvent::TurnEnded {
+                        session: self.session.clone(),
                                 turn: turn.clone(),
                                 reason: EndReason::Failed {
                                     message: e.to_string(),
@@ -435,6 +436,7 @@ impl Agent {
 
                 self.emit(
                     CoreEvent::ToolCallBegin {
+                        session: self.session.clone(),
                         turn: turn.clone(),
                         call_id: call.id.clone(),
                         name: call.name.clone(),
@@ -450,6 +452,7 @@ impl Agent {
 
                 self.emit(
                     CoreEvent::ToolCallEnd {
+                        session: self.session.clone(),
                         turn: turn.clone(),
                         call_id: call.id.clone(),
                         ok: !is_error,
@@ -471,6 +474,7 @@ impl Agent {
 
         self.emit(
             CoreEvent::TurnEnded {
+                        session: self.session.clone(),
                 turn,
                 reason: end_reason,
                 usage: self.usage,
@@ -499,6 +503,7 @@ impl Agent {
                 tracing::info!(before, after, count = indices.len(), "已截断过长的工具结果");
                 self.emit(
                     CoreEvent::ContextCompacted {
+                        session: self.session.clone(),
                         turn: turn.clone(),
                         before_tokens: before as u64,
                         after_tokens: after as u64,
@@ -519,6 +524,7 @@ impl Agent {
                 tracing::info!(before, after, dropped = drop_before, "已压缩上下文");
                 self.emit(
                     CoreEvent::ContextCompacted {
+                        session: self.session.clone(),
                         turn: turn.clone(),
                         before_tokens: before as u64,
                         after_tokens: after as u64,
@@ -587,6 +593,7 @@ impl Agent {
             match &ev {
                 StreamEvent::Text(t) => self.emit(
                     CoreEvent::Token {
+                        session: self.session.clone(),
                         turn: turn.clone(),
                         text: t.clone(),
                     },
@@ -594,6 +601,7 @@ impl Agent {
                 ),
                 StreamEvent::Thinking(t) => self.emit(
                     CoreEvent::Thinking {
+                        session: self.session.clone(),
                         turn: turn.clone(),
                         text: t.clone(),
                     },
@@ -661,6 +669,7 @@ impl Agent {
                 let rx = self.approvals.register(id.clone()).await;
                 self.emit(
                     CoreEvent::ApprovalRequired {
+                        session: self.session.clone(),
                         req: zex_core::event::ApprovalRequest {
                             id: id.clone(),
                             turn: turn.clone(),
