@@ -62,6 +62,15 @@ struct MsgItem {
     text: String,
 }
 
+/// 主区域显示什么。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ViewMode {
+    /// 工作台：离开期间发生了什么。
+    Dashboard,
+    /// 对话。
+    Chat,
+}
+
 /// 会话列表项。
 #[derive(Clone)]
 struct SessionItem {
@@ -74,6 +83,10 @@ struct ChatView {
     input: Entity<InputState>,
     messages: Vec<MsgItem>,
     streaming: Option<String>,
+    /// 任务快照（工作台展示用）。
+    tasks: Vec<zex_store::tasks::TaskRecord>,
+    /// 当前显示的是工作台还是对话。
+    mode: ViewMode,
     /// 重命名会话用的输入框（侧栏内联编辑）。
     rename_input: Entity<InputState>,
     /// 正在就地重命名的会话 id（`None` 表示没有）。
@@ -110,6 +123,7 @@ impl ChatView {
         cwd: String,
         model: String,
         history: Vec<MsgItem>,
+        tasks: Vec<zex_store::tasks::TaskRecord>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -160,8 +174,13 @@ impl ChatView {
 
         let scroller = cx.new(|cx| MessageScrollerState::new(history.len(), cx));
 
+        // 打开就先看工作台：用户想知道「我不在的时候发生了什么」
+        let mode = ViewMode::Dashboard;
+
         ChatView {
             input,
+            tasks,
+            mode,
             messages: history,
             streaming: None,
             scroller,
@@ -419,6 +438,8 @@ impl ChatView {
                 self.messages = history_to_items(&history);
                 self.active_session = session;
                 self.sessions = summaries_to_items(&sessions);
+                // 切了会话就是要聊，从工作台进对话
+                self.mode = ViewMode::Chat;
                 self.streaming = None;
                 self.running_tool = None;
                 self.status = "Ready".into();
@@ -649,6 +670,256 @@ impl ChatView {
                 )
                 .into_any_element(),
         }
+    }
+
+    /// 工作台：离开期间发生了什么。
+    fn render_dashboard(&self, cx: &mut Context<Self>) -> AnyElement {
+        use zex_store::tasks::TaskStatus;
+
+        let running: Vec<_> = self
+            .tasks
+            .iter()
+            .filter(|t| matches!(t.status, TaskStatus::Running | TaskStatus::Queued))
+            .collect();
+        let failed: Vec<_> = self
+            .tasks
+            .iter()
+            .filter(|t| t.status == TaskStatus::Failed)
+            .collect();
+        let finished: Vec<_> = self
+            .tasks
+            .iter()
+            .filter(|t| matches!(t.status, TaskStatus::Completed | TaskStatus::Cancelled))
+            .take(8)
+            .collect();
+
+        let mut col = div()
+            .flex()
+            .flex_col()
+            .gap_6()
+            .px_10()
+            .py_8()
+            .w_full();
+
+        // ─── 标题 ───
+        let headline = if running.is_empty() && failed.is_empty() && finished.is_empty() {
+            "还没有任务。给它派点活试试。".to_string()
+        } else {
+            let mut parts = Vec::new();
+            if !running.is_empty() {
+                parts.push(format!("{} 个在跑", running.len()));
+            }
+            if !finished.is_empty() {
+                parts.push(format!("{} 个已完成", finished.len()));
+            }
+            if !failed.is_empty() {
+                parts.push(format!("{} 个需要处理", failed.len()));
+            }
+            parts.join(" · ")
+        };
+
+        col = col.child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .text_2xl()
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(rgb(TEXT))
+                        .child("工作台"),
+                )
+                .child(div().text_sm().text_color(rgb(TEXT_MUTED)).child(headline)),
+        );
+
+        // ─── 需要处理（失败） ───
+        if !failed.is_empty() {
+            col = col.child(self.render_task_section("需要处理", failed.clone(), cx));
+        }
+
+        // ─── 运行中 ───
+        if !running.is_empty() {
+            col = col.child(self.render_task_section("正在执行", running.clone(), cx));
+        }
+
+        // ─── 最近完成 ───
+        if !finished.is_empty() {
+            col = col.child(self.render_task_section("最近完成", finished.clone(), cx));
+        }
+
+        // ─── 空状态引导 ───
+        if running.is_empty() && failed.is_empty() && finished.is_empty() {
+            col = col.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .p_5()
+                    .rounded_lg()
+                    .bg(rgb(BG_TOOL))
+                    .border_1()
+                    .border_color(rgb(BORDER_SOFT))
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(TEXT_MUTED))
+                            .child("你可以让它读文件、跑命令、查资料。比如："),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(TEXT))
+                            .child("「分析一下这个项目的依赖」「把 /tmp 里的日志整理成要点」"),
+                    ),
+            );
+        }
+
+        // ─── 开始新对话 ───
+        col = col.child(
+            div().pt_2().child(
+                Button::new("dashboard-new-chat")
+                    .primary()
+                    .label("开始新对话")
+                    .on_click(cx.listener(|this, _: &ClickEvent, _w, cx| {
+                        this.mode = ViewMode::Chat;
+                        let _ = this.cmd_tx.try_send(UiCommand::NewSession);
+                        cx.notify();
+                    })),
+            ),
+        );
+
+        col.into_any_element()
+    }
+
+    /// 一组任务卡片。
+    fn render_task_section(
+        &self,
+        title: &str,
+        tasks: Vec<&zex_store::tasks::TaskRecord>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut section = div().flex().flex_col().gap_2().child(
+            div()
+                .text_xs()
+                .font_weight(FontWeight::BOLD)
+                .text_color(rgb(TEXT_MUTED))
+                .child(title.to_uppercase()),
+        );
+        for t in tasks {
+            section = section.child(self.render_task_card(t, cx));
+        }
+        section.into_any_element()
+    }
+
+    /// 单条任务卡片：点一下跳到它所在的会话。
+    fn render_task_card(
+        &self,
+        t: &zex_store::tasks::TaskRecord,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        use zex_store::tasks::TaskStatus;
+
+        let (dot, dot_bg) = match t.status {
+            TaskStatus::Running => (BRAND, BRAND_SOFT),
+            TaskStatus::Queued => (TEXT_MUTED, BG_HOVER),
+            TaskStatus::Completed => (OK, OK_SOFT),
+            TaskStatus::Failed => (DANGER, DANGER_SOFT),
+            TaskStatus::Cancelled => (TEXT_DIM, BG_HOVER),
+        };
+
+        // 标题优先用任务自带的，没有就截 prompt 首行
+        let label = if !t.title.trim().is_empty() {
+            t.title.clone()
+        } else {
+            let first = t.prompt.lines().next().unwrap_or("").trim();
+            let s: String = first.chars().take(40).collect();
+            if s.is_empty() { "（空输入）".into() } else { s }
+        };
+
+        let detail = match t.status {
+            TaskStatus::Failed => t.error.clone().unwrap_or_default(),
+            _ => t.summary.clone().unwrap_or_default(),
+        };
+        let detail: String = detail.chars().take(80).collect();
+
+        let when = relative_time(t.ended_at.unwrap_or(t.created_at));
+
+        let sid = t.session_id.clone();
+        let tx = self.cmd_tx.clone();
+
+        let mut card = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .p_4()
+            .rounded_lg()
+            .bg(rgb(BG_TOOL))
+            .border_1()
+            .border_color(rgb(BORDER_SOFT))
+            .cursor_pointer()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _ev, _window, cx| {
+                    // 跳到那条任务所属的会话
+                    this.mode = ViewMode::Chat;
+                    let _ = tx.try_send(UiCommand::SwitchSession {
+                        session: zex_core::SessionId::from(sid.clone()),
+                    });
+                    cx.notify();
+                }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(div().size(px(6.0)).rounded_full().bg(rgb(dot)))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .truncate()
+                            .text_sm()
+                            .text_color(rgb(TEXT))
+                            .child(label),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .px_2()
+                            .py(px(1.0))
+                            .rounded_full()
+                            .bg(rgb(dot_bg))
+                            .text_xs()
+                            .text_color(rgb(dot))
+                            .child(match t.status {
+                                TaskStatus::Running => "运行中",
+                                TaskStatus::Queued => "排队",
+                                TaskStatus::Completed => "完成",
+                                TaskStatus::Failed => "失败",
+                                TaskStatus::Cancelled => "已取消",
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_xs()
+                            .text_color(rgb(TEXT_DIM))
+                            .child(when),
+                    ),
+            );
+
+        if !detail.trim().is_empty() {
+            card = card.child(
+                div()
+                    .pl(px(14.0))
+                    .text_xs()
+                    .text_color(rgb(TEXT_MUTED))
+                    .child(detail),
+            );
+        }
+        card.into_any_element()
     }
 
     /// 单行会话的操作菜单（重命名 / 清空 / 删除）。
@@ -1074,21 +1345,30 @@ impl Render for ChatView {
                                     .child(self.status.clone()),
                             ),
                     )
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(rgb(TEXT))
-                            .child({
-                                // 历史消息只存了每条的总 token，分不出入力/出力，
-                                // 所以顶部显示合计，避免出现 "0.0k / 0" 这种假象
-                                let total = self.usage.input_tokens + self.usage.output_tokens;
-                                // 不足一千就给准确数字，"0.0k" 看着像统计坏了
-                                match total {
-                                    0..=999 => format!("{total} tokens"),
-                                    _ => format!("{:.1}k tokens", total as f64 / 1000.0),
-                                }
-                            }),
-                    ),
+                    .child({
+                        let total = self.usage.input_tokens + self.usage.output_tokens;
+                        // 不足一千就给准确数字，"0.0k" 看着像统计坏了
+                        let label = match total {
+                            0..=999 => format!("{total} tokens"),
+                            _ => format!("{:.1}k tokens", total as f64 / 1000.0),
+                        };
+                        let mut meta = div().flex().items_center().gap_2().child(
+                            div().text_sm().text_color(rgb(TEXT)).child(label),
+                        );
+                        // 对话模式下给一个回工作台的入口
+                        if self.mode == ViewMode::Chat {
+                            meta = meta.child(
+                                Button::new("back-to-dashboard")
+                                    .ghost()
+                                    .label("工作台")
+                                    .on_click(cx.listener(|this, _: &ClickEvent, _w, cx| {
+                                        this.mode = ViewMode::Dashboard;
+                                        cx.notify();
+                                    })),
+                            );
+                        }
+                        meta
+                    }),
             );
 
         // ─── 消息流 ───
@@ -1117,17 +1397,24 @@ impl Render for ChatView {
             .bg(rgb(BG_MAIN))
             .text_color(rgb(TEXT))
             .child(self.render_sidebar(cx))
-            .child(
-                div()
+            .child({
+                let mut main = div()
                     .flex_1()
                     .min_w(px(0.0))
                     .h_full()
                     .flex()
                     .flex_col()
                     .child(header)
-                    .child(feed)
-                    .child(bottom),
-            )
+                    .child(match self.mode {
+                        ViewMode::Dashboard => self.render_dashboard(cx),
+                        ViewMode::Chat => feed.into_any_element(),
+                    });
+                // 工作台模式下不需要输入框：还没决定要干什么
+                if self.mode == ViewMode::Chat {
+                    main = main.child(bottom);
+                }
+                main
+            })
     }
 }
 
@@ -1232,6 +1519,39 @@ fn summaries_to_items(list: &[zex_core::event::SessionSummary]) -> Vec<SessionIt
         .collect()
 }
 
+/// 把时间戳转成紧凑的相对时间（工作台用）。
+fn relative_time(ts: i64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let d = (now - ts).max(0);
+    if d < 60 {
+        "刚刚".to_string()
+    } else if d < 3600 {
+        format!("{} 分钟前", d / 60)
+    } else if d < 86_400 {
+        format!("{} 小时前", d / 3600)
+    } else {
+        format!("{} 天前", d / 86_400)
+    }
+}
+
+/// 读工作台需要的任务快照：在跑的 + 最近结束的。
+fn load_tasks(store: &zex_store::Store) -> Vec<zex_store::tasks::TaskRecord> {
+    use zex_store::tasks::TaskStatus;
+    let mut all = Vec::new();
+    for group in [
+        vec![TaskStatus::Running, TaskStatus::Queued],
+        vec![TaskStatus::Completed, TaskStatus::Failed, TaskStatus::Cancelled],
+    ] {
+        if let Ok(mut list) = store.list_tasks_by_status(&group, 20) {
+            all.append(&mut list);
+        }
+    }
+    all
+}
+
 fn load_sessions(store: &zex_store::Store) -> Vec<SessionItem> {
     store
         .list_sessions(20)
@@ -1282,6 +1602,7 @@ fn main() {
     let model = cfg.model.clone();
     let cwd_str = cwd.display().to_string();
     let history = history_to_items(agent.history());
+    let tasks = load_tasks(agent.store());
     let handles = zex_app::spawn_core(agent);
     let cmd_tx = handles.cmd_tx.clone();
     let mut event_rx = handles.event_rx;
@@ -1321,7 +1642,10 @@ fn main() {
                 let cwd = cwd_str.clone();
                 let model = model.clone();
                 let history = history.clone();
-                cx.new(|cx| ChatView::new(tx, broker, sessions, active, cwd, model, history, window, cx))
+                let tasks = tasks.clone();
+                cx.new(|cx| {
+                    ChatView::new(tx, broker, sessions, active, cwd, model, history, tasks, window, cx)
+                })
             },
         ) {
             Ok(v) => v,
