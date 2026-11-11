@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::text::markdown;
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::*;
 
@@ -299,7 +300,9 @@ impl ChatView {
                 .flex_col()
                 .gap_2()
                 .child(role_label("ZEX"))
-                .child(div().text_lg().text_color(rgb(TEXT)).child(m.text.clone()))
+                // 模型回复是 markdown：代码块、列表、粗体都要按语义渲染，
+                // 而不是把 ** 和 - 原样吐给用户
+                .child(markdown(m.text.clone()).into_any_element())
                 .into_any_element(),
 
             MsgKind::ToolCall { name, args, risk } => {
