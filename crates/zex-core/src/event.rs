@@ -182,6 +182,8 @@ pub enum UiCommand {
     },
     /// 开一个新会话。
     NewSession,
+    /// 清空当前会话的消息（保留会话本身）。
+    ClearSession,
     /// 切换到另一个会话。
     SwitchSession {
         /// 目标会话。

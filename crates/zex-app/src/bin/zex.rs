@@ -336,7 +336,7 @@ fn pill(label: String, bg: u32, fg: u32) -> impl IntoElement {
 }
 
 impl ChatView {
-    fn render_message(&self, m: &MsgItem) -> AnyElement {
+    fn render_message(&self, m: &MsgItem, idx: usize, cx: &mut Context<Self>) -> AnyElement {
         match &m.kind {
             MsgKind::User => div()
                 .flex()
@@ -352,6 +352,7 @@ impl ChatView {
                 if m.text.trim().is_empty() {
                     return div().into_any_element();
                 }
+                let text = m.text.clone();
                 div()
                     .flex()
                     .flex_col()
@@ -360,6 +361,26 @@ impl ChatView {
                     // 模型回复是 markdown：代码块、列表、粗体都要按语义渲染，
                     // 而不是把 ** 和 - 原样吐给用户
                     .child(markdown(m.text.clone()).into_any_element())
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                Button::new(ElementId::Name(format!("copy-{idx}").into()))
+                                    .ghost()
+                                    .compact()
+                                    .label("复制")
+                                    .on_click(cx.listener(move |this, _: &ClickEvent, _w, cx| {
+                                        // 复制原文而非渲染结果：贴到别处还能保留 markdown
+                                        cx.write_to_clipboard(ClipboardItem::new_string(
+                                            text.clone(),
+                                        ));
+                                        this.status = "已复制".into();
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
                     .into_any_element()
             }
 
@@ -595,6 +616,23 @@ impl ChatView {
                 ),
             )
             .child(div().flex_1().min_h(px(0.0)).child(list))
+            // 清空当前会话：开新话题时不用留一堆旧消息占着上下文
+            .child(
+                div().px_3().pb_2().child(
+                    Button::new("clear-session")
+                        .ghost()
+                        .w_full()
+                        .label("清空当前会话")
+                        .on_click(cx.listener(|this, _: &ClickEvent, _w, cx| {
+                            let tx = this.cmd_tx.clone();
+                            cx.spawn(async move |_this, _cx| {
+                                let _ = tx.send(UiCommand::ClearSession).await;
+                            })
+                            .detach();
+                            cx.notify();
+                        })),
+                ),
+            )
             // 底部图标
             .child(
                 div()
@@ -828,8 +866,8 @@ impl Render for ChatView {
 
         // ─── 消息流 ───
         let mut feed = div().flex().flex_col().gap_6().px_8().py_8();
-        for m in &self.messages {
-            feed = feed.child(self.render_message(m));
+        for (i, m) in self.messages.iter().enumerate() {
+            feed = feed.child(self.render_message(m, i, cx));
         }
         if let Some(s) = &self.streaming {
             if s.is_empty() {
