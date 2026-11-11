@@ -201,6 +201,56 @@ strategy:
 
 ---
 
+## 5.5 验证状态（2026-11 实测）
+
+这一节记录**实际跑过什么**，和上面的"计划怎么应对"区分开。
+没跑过的就是未知，不因为文档写了就当已知。
+
+### 交叉编译（Linux 主机）
+
+| target | 范围 | 结果 |
+|---|---|---|
+| `x86_64-pc-windows-gnu` | 全部 6 个 crate（含 `zex-app` + gpui-kit） | ✅ 通过 |
+| `x86_64-apple-darwin` | 同上 | ⚠️ **卡在 C 依赖** |
+
+Windows 那次把 `gpui-kit`、`gpui-pre-platform`、`accesskit_windows`
+一路编译通过 —— 纯 Rust 部分对 Windows 没有隐藏的 Linux 假设。
+
+macOS 失败点在 `aws-lc-sys`（reqwest/rustls 的传递依赖）：它要用
+`cc` 编译 `.S` 汇编，而 `-mmacosx-version-min` 只有 Apple 的 clang
+认。**这不是我们代码的问题**，是交叉编译本身的限制 —— 在 macOS
+机器上编译同一个 crate 不会遇到。
+
+**结论：macOS 只能靠 CI 或真机验证，交叉编译这条路走不通。**
+
+### 运行时行为
+
+| 平台 | 窗口 | 关窗拦截 | shell | 路径 |
+|---|---|---|---|---|
+| Linux (niri/Wayland) | ✅ 真机 | ✅ 真机（有任务时拦下） | ✅ 真机 | ✅ 真机 |
+| Windows | ❓ | ❓ | ❓ | ❓ |
+| macOS | ❓ | ❓ | ❓ | ❓ |
+
+### 已知的平台相关代码（已做条件编译）
+
+| 位置 | 处理 |
+|---|---|
+| `zex-tools/shell.rs` | `sh -c` / `cmd /C` 分叉，Windows 加 `CREATE_NO_WINDOW` |
+| `zex-app/config.rs` | `HOME` / `USERPROFILE` 兜底 |
+| `zex-policy/rules.rs` | 同上，拿不到 HOME 时保守判定 |
+
+### 还没验证的具体项
+
+- `on_window_should_close` 在 Windows/macOS 的实现 —— gpui 有对应
+  的平台 trait 方法，但行为没实测（Windows 上是 `WM_CLOSE`，
+  macOS 是 `windowShouldClose:`，语义可能不同）
+- 文件名大小写敏感性（Windows 不敏感）
+- 路径分隔符在 `glob` 匹配里的行为
+- 长路径 >260 字符
+- 中文路径 + 控制台编码
+
+---
+
 ## 6. 构建与发布
 
 | 平台 | 产物 | 备注 |
