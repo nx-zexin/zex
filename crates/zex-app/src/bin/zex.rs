@@ -152,6 +152,20 @@ impl ChatView {
         cx.notify();
     }
 
+    fn cancel(&mut self, cx: &mut Context<Self>) {
+        let tx = self.cmd_tx.clone();
+        self.status = "正在停止…".into();
+        cx.spawn(async move |_this, _cx| {
+            let _ = tx
+                .send(UiCommand::Cancel {
+                    turn: zex_core::TurnId::generate(),
+                })
+                .await;
+        })
+        .detach();
+        cx.notify();
+    }
+
     fn respond(&mut self, approve: bool, remember: bool, cx: &mut Context<Self>) {
         let Some(req) = self.approval.take() else { return };
         let broker = self.broker.clone();
@@ -231,6 +245,9 @@ impl ChatView {
             }
             CoreEvent::TurnEnded { reason, usage, .. } => {
                 self.flush_streaming();
+                // 取消/失败路径不会有 flush 收尾，这里兜住，避免输入框锁死
+                self.streaming = None;
+                self.running_tool = None;
                 self.usage.add(usage);
                 self.status = "Ready".into();
                 if !matches!(reason, zex_core::EndReason::Completed) {
@@ -600,14 +617,23 @@ impl ChatView {
                             .py_2()
                             .child(Input::new(&self.input)),
                     )
-                    .child(
-                        Button::new("send")
+                    .child(match self.streaming.is_some() {
+                        // 正在跑就换成停止键：否则用户只能干等长任务跑完
+                        true => Button::new("stop")
+                            .danger()
+                            .label("■")
+                            .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                                this.cancel(cx)
+                            }))
+                            .into_any_element(),
+                        false => Button::new("send")
                             .primary()
                             .label("↑")
                             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                                 this.submit(window, cx)
-                            })),
-                    ),
+                            }))
+                            .into_any_element(),
+                    }),
             )
             .child(
                 div()

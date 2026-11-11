@@ -19,6 +19,7 @@ pub mod toolctx;
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use tokio::sync::mpsc;
@@ -87,6 +88,11 @@ pub struct Agent {
     compressor: Compressor,
     /// 累计 token 用量（整个会话）。只用于成本统计，**不用于压缩判断**。
     usage: Usage,
+    /// 用户中断标志。
+    ///
+    /// 用 AtomicBool 而不是 channel：`run_turn` 的检查点是同步的，
+    /// 而且取消要在 `await` 之间也能看到 —— channel 得额外轮询。
+    cancelled: Arc<AtomicBool>,
 }
 
 impl Agent {
@@ -107,6 +113,7 @@ impl Agent {
             approvals: Arc::new(ApprovalBroker::new()),
             compressor,
             usage: Usage::default(),
+            cancelled: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -123,6 +130,16 @@ impl Agent {
         agent.history = stored.into_iter().map(|s| s.message).collect();
         tracing::info!(session = %session, messages = agent.history.len(), "已恢复会话");
         Ok(agent)
+    }
+
+    /// 取一个取消句柄，可跨线程触发当前轮的中断。
+    pub fn cancel_flag(&self) -> Arc<AtomicBool> {
+        self.cancelled.clone()
+    }
+
+    /// 请求中断当前轮。已经结束的轮次不受影响。
+    pub fn request_cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
     }
 
     /// 开一个新会话，`Agent::new` 时那样留一个空壳。
@@ -194,6 +211,8 @@ impl Agent {
         events: Option<&mpsc::Sender<CoreEvent>>,
     ) -> Result<String> {
         let turn = TurnId::generate();
+        // 新一轮开始，清掉上一轮遗留的中断请求
+        self.cancelled.store(false, Ordering::SeqCst);
         self.emit(
             CoreEvent::TurnStarted {
                 session: self.session.clone(),
@@ -211,6 +230,10 @@ impl Agent {
         let mut step = 0u32;
 
         loop {
+            if self.cancelled.load(Ordering::SeqCst) {
+                end_reason = EndReason::Cancelled;
+                break;
+            }
             if step >= self.cfg.max_steps {
                 end_reason = EndReason::MaxSteps {
                     limit: self.cfg.max_steps,
@@ -272,6 +295,11 @@ impl Agent {
 
             // 串行执行：审批必须逐个过，并行会让审批顺序混乱。
             for call in &tool_calls {
+                // 中断后剩下的工具不再执行 —— 用户按停止就是不想让它继续动
+                if self.cancelled.load(Ordering::SeqCst) {
+                    end_reason = EndReason::Cancelled;
+                    break;
+                }
                 let risk = self.risk_of(&call.name);
 
                 self.emit(

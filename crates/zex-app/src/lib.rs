@@ -94,6 +94,7 @@ pub fn spawn_core(mut agent: Agent) -> CoreHandles {
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<UiCommand>(64);
     let (ev_tx, ev_rx) = mpsc::channel::<CoreEvent>(256);
     let broker = agent.approvals();
+    let cancel_flag = agent.cancel_flag();
 
     let spawn_result = std::thread::Builder::new()
         .name("zex-core".into())
@@ -166,8 +167,11 @@ pub fn spawn_core(mut agent: Agent) -> CoreHandles {
                                 }
                             }
                         }
+                        UiCommand::Cancel { .. } => {
+                            // 内核一次只跑一轮，不必核对 turn id
+                            cancel_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                        }
                         UiCommand::Shutdown => break,
-                        _ => {}
                     }
                 }
             });
