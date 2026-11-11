@@ -359,6 +359,32 @@ impl ChatView {
         cx.notify();
     }
 
+    /// 从队列里挑一个审批摆出来。
+    ///
+    /// 优先当前会话 —— 用户正看着这个，替他串行处理最符合直觉。
+    /// 别的会话的请求会一直排着，直到切过去。
+    fn show_next_approval(&mut self, cx: &mut Context<Self>) {
+        if self.approval.is_some() {
+            return;
+        }
+        let pos = self
+            .pending_approvals
+            .iter()
+            .position(|(s, _)| *s == self.active_session);
+        if let Some(pos) = pos {
+            let (_, req) = self.pending_approvals.remove(pos);
+            self.flush_streaming(cx);
+            self.status = "等待确认".into();
+            self.approval = Some(req);
+        } else if !self.pending_approvals.is_empty() {
+            self.status = format!(
+                "其它会话有 {} 个待确认",
+                self.pending_approvals.len()
+            );
+        }
+        cx.notify();
+    }
+
     fn respond(&mut self, approve: bool, remember: bool, cx: &mut Context<Self>) {
         let Some(req) = self.approval.take() else { return };
         let broker = self.broker.clone();
@@ -366,6 +392,8 @@ impl ChatView {
         let grantable = req.grantable;
 
         self.status = if approve { "执行中…".into() } else { "已拒绝".into() };
+        // 处理完一个就摆出下一个，别让排队的一直等着
+        self.show_next_approval(cx);
 
         cx.spawn(async move |_this, _cx| {
             if approve {
@@ -482,14 +510,23 @@ impl ChatView {
                 self.sync_scroller(cx);
             }
             CoreEvent::ApprovalRequired { session, req } => {
-                // 别的会话要授权时不能顶掉当前视图：放队列里，切过去再看。
-                if !self.is_active(&session) {
-                    self.pending_approvals.push((session.to_string(), req));
-                    return;
+                let key = session.to_string();
+                // 同一时刻只摆一个授权给用户看，其余排队。
+                // 之前是直接覆盖：三个子智能体同时要授权时，前面两个
+                // 会被静默挤掉，等它们超时失败，用户还不知道发生过。
+                if self.approval.is_none() && key == self.active_session {
+                    self.flush_streaming(cx);
+                    self.status = "等待确认".into();
+                    self.approval = Some(req);
+                } else {
+                    self.pending_approvals.push((key, req));
+                    let n = self.pending_approvals.len();
+                    self.status = if self.approval.is_some() {
+                        format!("等待确认（还有 {n} 个排队）")
+                    } else {
+                        "其它会话有待确认的请求".into()
+                    };
                 }
-                self.flush_streaming(cx);
-                self.status = "等待确认".into();
-                self.approval = Some(req);
             }
             CoreEvent::ContextCompacted { session, before_tokens, after_tokens, strategy, .. } => {
                 if !self.is_active(&session) {
@@ -544,14 +581,7 @@ impl ChatView {
                 self.active_session = session.clone();
                 self.sessions = summaries_to_items(&sessions);
                 // 这个会话之前在后台等过授权？现在摆出来。
-                if let Some(pos) = self
-                    .pending_approvals
-                    .iter()
-                    .position(|(s, _)| *s == session)
-                {
-                    let (_, req) = self.pending_approvals.remove(pos);
-                    self.approval = Some(req);
-                }
+                self.show_next_approval(cx);
                 // 切了会话就是要聊，从工作台进对话
                 self.mode = ViewMode::Chat;
                 self.streaming = None;
@@ -1560,6 +1590,18 @@ impl ChatView {
                 )),
             );
         }
+        // 后面还压着几个？写出来，免得用户以为处理完就没事了
+        let queued = self.pending_approvals.len();
+        let actions = if queued == 0 {
+            actions
+        } else {
+            actions.child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(TEXT_MUTED))
+                    .child(format!("还有 {queued} 个排队")),
+            )
+        };
 
         div()
             .flex()
