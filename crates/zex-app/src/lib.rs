@@ -127,6 +127,25 @@ pub fn spawn_core(mut agent: Agent) -> CoreHandles {
                                 .resolve(&id, ApprovalDecision::Reject { reason })
                                 .await;
                         }
+                        UiCommand::NewSession => {
+                            match agent.new_session() {
+                                Ok(()) => {
+                                    let _ = ev_tx
+                                        .send(CoreEvent::SessionSwitched {
+                                            session: agent.session_id().to_string(),
+                                            history: Vec::new(),
+                                        })
+                                        .await;
+                                }
+                                Err(e) => {
+                                    let _ = ev_tx
+                                        .send(CoreEvent::Warning {
+                                            message: format!("新建会话失败：{e}"),
+                                        })
+                                        .await;
+                                }
+                            }
+                        }
                         UiCommand::SwitchSession { session } => {
                             match agent.switch_session(session.clone()) {
                                 Ok(()) => {

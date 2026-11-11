@@ -180,6 +180,8 @@ pub enum UiCommand {
         /// 轮次。
         turn: TurnId,
     },
+    /// 开一个新会话。
+    NewSession,
     /// 切换到另一个会话。
     SwitchSession {
         /// 目标会话。

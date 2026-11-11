@@ -125,6 +125,18 @@ impl Agent {
         Ok(agent)
     }
 
+    /// 开一个新会话，`Agent::new` 时那样留一个空壳。
+    pub fn new_session(&mut self) -> Result<()> {
+        let session = self
+            .store
+            .create_session("", &self.cfg.model, &self.cfg.cwd.display().to_string())?;
+        self.session = session.id;
+        self.history.clear();
+        self.usage = Usage::default();
+        tracing::info!(session = %self.session, "已新建会话");
+        Ok(())
+    }
+
     /// 切换当前会话，并把历史换成目标会话的历史。
     ///
     /// 调用方负责保证此时没有正在进行的轮次 —— 中途切换会让

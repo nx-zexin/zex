@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::text::markdown;
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::*;
@@ -101,6 +101,17 @@ impl ChatView {
         cx: &mut Context<Self>,
     ) -> Self {
         let input = cx.new(|cx| InputState::new(window, cx).placeholder("请输入您的指令，或选择一个快捷操作…"));
+
+        // Enter 发送，Shift+Enter 换行。输入框自己无法区分这两者的语义，
+        // 由外层决定"按下回车意味着提交"。
+        cx.subscribe_in(&input, window, |this, _input, ev: &InputEvent, window, cx| {
+            if let InputEvent::PressEnter { shift, .. } = ev {
+                if !shift {
+                    this.submit(window, cx);
+                }
+            }
+        })
+        .detach();
 
         ChatView {
             input,
@@ -244,6 +255,10 @@ impl ChatView {
             }
             CoreEvent::Fatal { message } => {
                 self.flush_streaming();
+                // 必须清掉流式标记：submit() 用它判断"是否正在跑"，
+                // 不清就会永久锁死输入框，出错后一句话都发不出去
+                self.streaming = None;
+                self.running_tool = None;
                 self.status = "出错".into();
                 self.messages.push(MsgItem { kind: MsgKind::System, text: format!("错误：{message}") });
             }
@@ -295,15 +310,22 @@ impl ChatView {
                 .child(div().text_lg().text_color(rgb(TEXT)).child(m.text.clone()))
                 .into_any_element(),
 
-            MsgKind::Assistant => div()
-                .flex()
-                .flex_col()
-                .gap_2()
-                .child(role_label("ZEX"))
-                // 模型回复是 markdown：代码块、列表、粗体都要按语义渲染，
-                // 而不是把 ** 和 - 原样吐给用户
-                .child(markdown(m.text.clone()).into_any_element())
-                .into_any_element(),
+            MsgKind::Assistant => {
+                // 只有工具调用、没有说话内容的轮次会留下空 assistant 消息，
+                // 渲染出来就是个光秃秃的 "ZEX" 标签，白占一行
+                if m.text.trim().is_empty() {
+                    return div().into_any_element();
+                }
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(role_label("ZEX"))
+                    // 模型回复是 markdown：代码块、列表、粗体都要按语义渲染，
+                    // 而不是把 ** 和 - 原样吐给用户
+                    .child(markdown(m.text.clone()).into_any_element())
+                    .into_any_element()
+            }
 
             MsgKind::ToolCall { name, args, risk } => {
                 // 风险等级决定胶囊配色
@@ -523,7 +545,17 @@ impl ChatView {
                         .text_sm()
                         .text_color(rgb(TEXT))
                         .child(div().text_base().child("＋"))
-                        .child("新建会话"),
+                        .child("新建会话")
+                        .cursor_pointer()
+                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
+                            let tx = this.cmd_tx.clone();
+                            this.status = "新建中…".into();
+                            cx.spawn(async move |_this, _cx| {
+                                let _ = tx.send(UiCommand::NewSession).await;
+                            })
+                            .detach();
+                            cx.notify();
+                        })),
                 ),
             )
             .child(div().flex_1().min_h(px(0.0)).child(list))
@@ -1051,3 +1083,5 @@ fn main() {
         .detach();
     });
 }
+
+
