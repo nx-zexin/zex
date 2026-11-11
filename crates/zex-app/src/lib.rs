@@ -86,6 +86,63 @@ pub fn build_ephemeral_agent(
     zex_agent::Agent::new(agent_cfg, zex_tools::default_tools(), store)
 }
 
+/// 装配带子智能体的工具集。
+///
+/// GUI 和 CLI 共用同一份装配逻辑 —— `zex_cli.rs` 顶部的约定是
+/// 「不得有独立于 GUI 的能力分支」，所以这里不各写一套。
+pub fn attach_team_tools(
+    agent_cfg: zex_agent::AgentConfig,
+    store: Store,
+    ev_tx: mpsc::Sender<CoreEvent>,
+    broker: Arc<zex_agent::ApprovalBroker>,
+) -> (Arc<zex_agent::subagent::AgentRegistry>, Vec<Arc<dyn zex_core::tool::ErasedTool>>) {
+    use zex_agent::subagent::{AgentRegistry, SendMessage, SpawnAgent, TeamStatus, TerminateAgent, WaitForAgents};
+
+    let registry = Arc::new(AgentRegistry::new());
+    let mut tools = zex_tools::default_tools();
+    tools.push(Arc::new(SpawnAgent { registry: registry.clone() }));
+    tools.push(Arc::new(TeamStatus { registry: registry.clone() }));
+    tools.push(Arc::new(WaitForAgents { registry: registry.clone() }));
+    tools.push(Arc::new(SendMessage { registry: registry.clone() }));
+    tools.push(Arc::new(TerminateAgent { registry: registry.clone() }));
+    registry.install(agent_cfg, tools.clone(), store, ev_tx, broker);
+    (registry, tools)
+}
+
+/// 带子智能体能力的常规 agent（落到 `~/.zex/zex.db`）。
+pub fn build_agent_with_team(
+    cfg: &ResolvedConfig,
+    cwd: PathBuf,
+    ev_tx: mpsc::Sender<CoreEvent>,
+) -> zex_core::Result<(zex_agent::Agent, Arc<zex_agent::subagent::AgentRegistry>)> {
+    let store = open_store()?;
+    match store.fail_orphaned_running_tasks() {
+        Ok(0) | Err(_) => {}
+        Ok(n) => tracing::info!(count = n, "已标记上次退出时未完成的任务"),
+    }
+    let agent_cfg = zex_agent::AgentConfig::new(cfg.provider.clone(), cfg.model.clone(), cwd);
+    let broker = Arc::new(zex_agent::ApprovalBroker::new());
+    let (registry, tools) = attach_team_tools(agent_cfg.clone(), store.clone(), ev_tx, broker.clone());
+    let agent = zex_agent::Agent::new(agent_cfg, tools, store)?.with_shared_approvals(broker);
+    Ok((agent, registry))
+}
+
+/// 带子智能体能力的 ephemeral agent（CLI 用）。
+///
+/// 返回注册表：调用方在 `run_turn` 之后还要等子 agent 收尾。
+pub fn build_ephemeral_agent_with_team(
+    cfg: &ResolvedConfig,
+    cwd: PathBuf,
+    ev_tx: mpsc::Sender<CoreEvent>,
+) -> zex_core::Result<(zex_agent::Agent, Arc<zex_agent::subagent::AgentRegistry>)> {
+    let store = Store::in_memory()?;
+    let agent_cfg = zex_agent::AgentConfig::new(cfg.provider.clone(), cfg.model.clone(), cwd);
+    let broker = Arc::new(zex_agent::ApprovalBroker::new());
+    let (registry, tools) = attach_team_tools(agent_cfg.clone(), store.clone(), ev_tx, broker.clone());
+    let agent = zex_agent::Agent::new(agent_cfg, tools, store)?.with_shared_approvals(broker);
+    Ok((agent, registry))
+}
+
 // ─── 内核线程 ───
 
 use std::collections::HashMap;

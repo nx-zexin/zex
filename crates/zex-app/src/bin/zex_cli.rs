@@ -9,7 +9,7 @@ use std::process::ExitCode;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
 use zex_agent::ApprovalDecision;
-use zex_app::{build_agent, build_ephemeral_agent, load};
+use zex_app::{build_agent_with_team, build_ephemeral_agent_with_team, load};
 use zex_core::{CoreEvent, RememberScope};
 
 const HELP: &str = r#"zex-cli — Zex 数字助理的 headless 入口
@@ -97,13 +97,16 @@ async fn async_main() -> ExitCode {
         }
     };
 
+    // 事件通道要先建：子智能体注册表装配时需要它
+    let (tx, mut rx) = mpsc::channel::<CoreEvent>(256);
+
     let built = if ephemeral {
-        build_ephemeral_agent(&cfg, cwd)
+        build_ephemeral_agent_with_team(&cfg, cwd, tx.clone())
     } else {
-        build_agent(&cfg, cwd)
+        build_agent_with_team(&cfg, cwd, tx.clone())
     };
-    let mut agent = match built {
-        Ok(a) => a,
+    let (mut agent, registry) = match built {
+        Ok(v) => v,
         Err(e) => {
             eprintln!("无法初始化内核: {e}");
             return ExitCode::FAILURE;
@@ -114,7 +117,6 @@ async fn async_main() -> ExitCode {
     }
 
     let broker = agent.approvals();
-    let (tx, mut rx) = mpsc::channel::<CoreEvent>(256);
 
     // 事件消费任务：过程走 stderr，结果留给 stdout。
     // 这样 `zex-cli "..." > out.txt` 拿到的是干净的结果。
@@ -189,6 +191,11 @@ async fn async_main() -> ExitCode {
                         reason, usage.input_tokens, usage.output_tokens
                     );
                 }
+                CoreEvent::TeamUpdated { agents } => {
+                    for a in &agents {
+                        eprintln!("  [团队] {} · {} — {}", a.id, a.status, a.description);
+                    }
+                }
                 CoreEvent::Warning { message } => eprintln!("\n警告: {message}"),
                 CoreEvent::Fatal { message } => eprintln!("\n致命错误: {message}"),
                 _ => {}
@@ -197,6 +204,17 @@ async fn async_main() -> ExitCode {
     });
 
     let result = agent.run_turn(prompt, Some(&tx)).await;
+
+    // 主轮结束不代表活干完了：模型可能派了子 agent 却没等。
+    // 进程退出会连带杀掉它们，所以这里兜一次底。
+    let leftovers = registry.wait_all(std::time::Duration::from_secs(180)).await;
+    if !leftovers.is_empty() {
+        eprintln!("\n[收尾] 等子智能体结束：");
+        for a in &leftovers {
+            eprintln!("  {} · {}{}", a.id, a.status.label(),
+                a.result.as_ref().map(|r| format!(" — {}", r.chars().take(80).collect::<String>())).unwrap_or_default());
+        }
+    }
     drop(tx);
     let _ = printer.await;
 
