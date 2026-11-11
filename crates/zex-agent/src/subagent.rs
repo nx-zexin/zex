@@ -12,6 +12,7 @@
 //! 驱动这套机制。
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -35,6 +36,8 @@ pub enum SubAgentStatus {
     Completed,
     /// 出错了。
     Failed(String),
+    /// 被叫停了。
+    Terminated,
 }
 
 impl SubAgentStatus {
@@ -49,6 +52,7 @@ impl SubAgentStatus {
             SubAgentStatus::Running => "执行中",
             SubAgentStatus::Completed => "已完成",
             SubAgentStatus::Failed(_) => "失败",
+            SubAgentStatus::Terminated => "已停止",
         }
     }
 }
@@ -76,6 +80,8 @@ struct Entry {
     session: SessionId,
     status: SubAgentStatus,
     result: Option<String>,
+    /// 叫停这个 agent 的开关。跨轮次有效。
+    cancel: Arc<AtomicBool>,
 }
 
 /// 构造子 agent 需要的原料。
@@ -163,6 +169,7 @@ impl AgentRegistry {
         let mut agent = Agent::new(deps.cfg.clone(), deps.tools.clone(), deps.store.clone())?
             .with_shared_approvals(deps.broker.clone());
         let session = agent.session_id().clone();
+        let cancel = agent.cancel_flag();
         let _ = deps
             .store
             .rename_session(&session, &format!("子智能体 · {id}"));
@@ -175,8 +182,11 @@ impl AgentRegistry {
                 session,
                 status: SubAgentStatus::Running,
                 result: None,
+                cancel,
             },
         );
+
+        self.broadcast();
 
         let ev_tx = deps.ev_tx.clone();
         let this = self.clone();
@@ -196,9 +206,114 @@ impl AgentRegistry {
                     }
                 }
             }
+            drop(map);
+            this.broadcast();
         });
 
         Ok(id)
+    }
+
+    /// 给一个已经跑完的子 agent 再派一轮活。
+    ///
+    /// 它会接着自己那个会话的上下文继续 —— 相当于追问，不是重新开一个。
+    pub fn send(self: &Arc<Self>, to: &str, message: String) -> Result<String> {
+        let deps = self.deps.get().ok_or_else(|| Error::ToolFailed {
+            tool: "send_message".into(),
+            message: "注册表尚未初始化".into(),
+        })?;
+
+        let (session, cancel) = {
+            let mut map = self.agents.lock().expect("子智能体表中毒");
+            let entry = map.get_mut(to).ok_or_else(|| Error::ToolFailed {
+                tool: "send_message".into(),
+                message: format!("没有 `{to}` 这个子智能体"),
+            })?;
+            if !entry.status.is_done() {
+                return Err(Error::ToolFailed {
+                    tool: "send_message".into(),
+                    message: format!("`{to}` 还在执行，等这一轮结束再发"),
+                });
+            }
+            entry.status = SubAgentStatus::Running;
+            entry.result = None;
+            (entry.session.clone(), entry.cancel.clone())
+        };
+
+        // 上一轮如果是被叫停的，开关还是按下状态，得复位
+        cancel.store(false, Ordering::Relaxed);
+
+        let mut agent = Agent::resume(
+            deps.cfg.clone(),
+            deps.tools.clone(),
+            deps.store.clone(),
+            session,
+        )?
+        .with_shared_approvals(deps.broker.clone())
+        .with_cancel_flag(cancel);
+
+        let ev_tx = deps.ev_tx.clone();
+        let this = self.clone();
+        let handle_id = to.to_string();
+        tokio::spawn(async move {
+            let outcome = agent.run_turn(message, Some(&ev_tx)).await;
+            let mut map = this.agents.lock().expect("子智能体表中毒");
+            if let Some(entry) = map.get_mut(&handle_id) {
+                // 被叫停的不要用错误覆盖掉「已停止」这个更有信息量的状态
+                if matches!(entry.status, SubAgentStatus::Terminated) {
+                    return;
+                }
+                match outcome {
+                    Ok(done) => {
+                        entry.status = SubAgentStatus::Completed;
+                        entry.result = Some(done);
+                    }
+                    Err(e) => entry.status = SubAgentStatus::Failed(e.to_string()),
+                }
+            }
+        });
+
+        self.broadcast();
+        Ok(format!("已投递给 `{to}`。"))
+    }
+
+    /// 叫停一个子 agent。
+    ///
+    /// 正在跑的那一轮会在下一个检查点退出；已经跑完的就只是标记状态。
+    pub fn terminate(&self, id: &str) -> Result<String> {
+        let mut map = self.agents.lock().expect("子智能体表中毒");
+        let entry = map.get_mut(id).ok_or_else(|| Error::ToolFailed {
+            tool: "terminate_agent".into(),
+            message: format!("没有 `{id}` 这个子智能体"),
+        })?;
+        entry.cancel.store(true, Ordering::Relaxed);
+        entry.status = SubAgentStatus::Terminated;
+        drop(map);
+        self.broadcast();
+        Ok(format!("已叫停 `{id}`。"))
+    }
+
+    /// 把当前团队状态推给界面。
+    ///
+    /// 用 `try_send`：这是一个"顺便通知一下"的信号，通道满了就算了，
+    /// 不能因此拖住正在派活的 agent。
+    fn broadcast(&self) {
+        if let Some(deps) = self.deps.get() {
+            let agents = self
+                .snapshot()
+                .into_iter()
+                .map(|a| zex_core::event::SubAgentView {
+                    id: a.id,
+                    role: a.role,
+                    status: a.status.label().to_string(),
+                    description: a.description,
+                    session: a.session.to_string(),
+                    result: a.result,
+                })
+                .collect();
+            let _ = deps
+                .ev_tx
+                .try_send(CoreEvent::TeamUpdated { agents });
+        }
     }
 
     /// 当前所有子 agent 的状态。
@@ -374,6 +489,7 @@ impl Tool for WaitForAgents {
                     }
                 }
                 SubAgentStatus::Failed(e) => out.push_str(&format!("错误：{e}\n")),
+                SubAgentStatus::Terminated => out.push_str("已被叫停。\n"),
                 SubAgentStatus::Running => out.push_str("仍在执行，稍后再等。\n"),
             }
             out.push('\n');
@@ -417,5 +533,68 @@ mod tests {
         assert!(!SubAgentStatus::Running.is_done());
         assert!(SubAgentStatus::Completed.is_done());
         assert!(SubAgentStatus::Failed("x".into()).is_done());
+    }
+}
+
+/// `send_message` 的参数。
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SendArgs {
+    /// 目标子智能体的 id。
+    pub to: String,
+    /// 要追加给它的内容。它会接着自己那轮的上下文继续。
+    pub message: String,
+}
+
+/// 给子智能体追加一轮。
+pub struct SendMessage {
+    /// 注册表。
+    pub registry: Arc<AgentRegistry>,
+}
+
+#[async_trait]
+impl Tool for SendMessage {
+    const NAME: &'static str = "send_message";
+    const RISK: Risk = Risk::Reversible;
+    type Args = SendArgs;
+
+    fn description() -> &'static str {
+        "给一个子智能体追加一轮任务。它会接着自己的会话上下文继续，\
+         相当于追问或补充要求，而不是重新开一个。\
+         对方还在执行时会失败 —— 先 wait_for_agents 或 team_status 确认。"
+    }
+
+    async fn call(&self, _cx: &dyn ToolCtx, args: SendArgs) -> Result<ToolOutput> {
+        let msg = self.registry.send(&args.to, args.message)?;
+        Ok(ToolOutput::ok(msg))
+    }
+}
+
+/// `terminate_agent` 的参数。
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct TerminateArgs {
+    /// 要叫停的子智能体 id。
+    pub id: String,
+}
+
+/// 叫停子智能体。
+pub struct TerminateAgent {
+    /// 注册表。
+    pub registry: Arc<AgentRegistry>,
+}
+
+#[async_trait]
+impl Tool for TerminateAgent {
+    const NAME: &'static str = "terminate_agent";
+    const RISK: Risk = Risk::Reversible;
+    type Args = TerminateArgs;
+
+    fn description() -> &'static str {
+        "叫停一个子智能体。它在跑的话会在下一个检查点退出；\
+         发现派错了活或者它跑偏了时用。"
+    }
+
+    async fn call(&self, _cx: &dyn ToolCtx, args: TerminateArgs) -> Result<ToolOutput> {
+        let msg = self.registry.terminate(&args.id)?;
+        Ok(ToolOutput::ok(msg))
     }
 }

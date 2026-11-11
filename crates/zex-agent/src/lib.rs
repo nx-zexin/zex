@@ -172,6 +172,15 @@ impl Agent {
         self
     }
 
+    /// 接上一个外部的取消开关。
+    ///
+    /// 子智能体跑完一轮后实例就被丢弃了，但 `terminate_agent` 仍然
+    /// 要能叫停它后续的轮次 —— 所以取消开关跟着会话走，不跟着实例走。
+    pub fn with_cancel_flag(mut self, flag: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        self.cancelled = flag;
+        self
+    }
+
     /// 取一个取消句柄，可跨线程触发当前轮的中断。
     pub fn cancel_flag(&self) -> Arc<AtomicBool> {
         self.cancelled.clone()

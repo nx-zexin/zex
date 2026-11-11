@@ -109,6 +109,8 @@ struct ChatView {
     broker: Arc<ApprovalBroker>,
     sessions: Vec<SessionItem>,
     active_session: String,
+    /// 子智能体团队。非空时在对话里显示一块团队面板。
+    team: Vec<zex_core::event::SubAgentView>,
     /// 别的会话发来的授权请求。切到那个会话时再摆出来，
     /// 免得后台任务把当前视图顶掉。
     pending_approvals: Vec<(String, ApprovalRequest)>,
@@ -199,6 +201,7 @@ impl ChatView {
             broker,
             sessions,
             active_session,
+            team: Vec::new(),
             pending_approvals: Vec::new(),
             store,
             cwd,
@@ -385,6 +388,10 @@ impl ChatView {
 
     fn handle_event(&mut self, ev: CoreEvent, cx: &mut Context<Self>) {
         match ev {
+            CoreEvent::TeamUpdated { agents } => {
+                self.team = agents;
+                cx.notify();
+            }
             CoreEvent::TurnStarted { session, turn: _ } => {
                 if !self.is_active(&session) {
                     self.status = "其它会话在后台执行".into();
@@ -865,6 +872,119 @@ impl ChatView {
     }
 
     /// 单条任务卡片：点一下跳到它所在的会话。
+    /// 团队面板：主对话里直接看到子智能体在干什么。
+    ///
+    /// 放在对话下方而不是侧栏，是因为它属于「这一轮正在发生的事」；
+    /// 侧栏留给会话，两者是不同的层级。
+    fn render_team(&self, _cx: &mut Context<Self>) -> AnyElement {
+        let running = self.team.iter().filter(|a| a.status == "执行中").count();
+
+        let mut panel = div()
+            .flex_none()
+            .mx_6()
+            .mb_3()
+            .rounded_lg()
+            .border_1()
+            .border_color(rgb(BORDER))
+            .bg(rgb(BG_RESULT))
+            .overflow_hidden();
+
+        // 标题行
+        panel = panel.child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_4()
+                .py_2()
+                .border_b_1()
+                .border_color(rgb(BORDER_SOFT))
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(TEXT))
+                        .child("团队"),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(TEXT_MUTED))
+                        .child(if running > 0 {
+                            format!("{} 个执行中 · 共 {} 个", running, self.team.len())
+                        } else {
+                            format!("{} 个", self.team.len())
+                        }),
+                ),
+        );
+
+        for a in &self.team {
+            let (dot, dot_bg) = match a.status.as_str() {
+                "执行中" => (BRAND, BRAND_SOFT),
+                "已完成" => (OK, OK_SOFT),
+                "失败" => (DANGER, DANGER_SOFT),
+                _ => (TEXT_DIM, BG_HOVER),
+            };
+
+            let mut row = div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_4()
+                .py_2()
+                .child(div().size(px(6.0)).rounded_full().bg(rgb(dot)));
+
+            row = row
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(rgb(TEXT))
+                        .child(a.id.clone()),
+                )
+                .child(
+                    div()
+                        .px_1p5()
+                        .rounded_sm()
+                        .bg(rgb(dot_bg))
+                        .text_color(rgb(dot))
+                        .text_xs()
+                        .child(a.status.clone()),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .text_xs()
+                        .text_color(rgb(TEXT_MUTED))
+                        .overflow_hidden()
+                        .child(a.description.clone()),
+                );
+
+            // 有结果就给一个能点进去看的会话
+            if !a.session.is_empty() {
+                let session = a.session.clone();
+                let tx = self.cmd_tx.clone();
+                row = row.child(
+                    Button::new(SharedString::from(format!("team-open-{}", a.id)))
+                        .ghost()
+                        .label("查看")
+                        .on_click(move |_, _, _| {
+                            // 直接投递即可：切换会话是内核侧的即时动作，
+                            // 不需要在这里等一个往返。
+                            let _ = tx.try_send(UiCommand::SwitchSession {
+                                session: zex_core::SessionId::from(session.clone()),
+                            });
+                        }),
+                );
+            }
+
+            panel = panel.child(row);
+        }
+
+        panel.into_any_element()
+    }
+
     fn render_task_card(
         &self,
         t: &zex_store::tasks::TaskRecord,
@@ -1459,7 +1579,20 @@ impl Render for ChatView {
                     .child(header)
                     .child(match self.mode {
                         ViewMode::Dashboard => self.render_dashboard(cx),
-                        ViewMode::Chat => feed.into_any_element(),
+                        ViewMode::Chat => {
+                            if self.team.is_empty() {
+                                feed.into_any_element()
+                            } else {
+                                div()
+                                    .flex_1()
+                                    .min_h(px(0.0))
+                                    .flex()
+                                    .flex_col()
+                                    .child(feed)
+                                    .child(self.render_team(cx))
+                                    .into_any_element()
+                            }
+                        }
                     });
                 // 工作台模式下不需要输入框：还没决定要干什么
                 if self.mode == ViewMode::Chat {

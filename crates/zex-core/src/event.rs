@@ -54,6 +54,7 @@ pub enum CoreEvent {
     },
     /// 模型的推理过程增量（若 provider 支持）。
     Thinking {
+        /// 所属会话。并行执行时据它判断该往哪个视图投递。
         session: SessionId,
         /// 本轮。
         turn: TurnId,
@@ -62,6 +63,7 @@ pub enum CoreEvent {
     },
     /// 即将执行工具。
     ToolCallBegin {
+        /// 所属会话。并行执行时据它判断该往哪个视图投递。
         session: SessionId,
         /// 本轮。
         turn: TurnId,
@@ -76,6 +78,7 @@ pub enum CoreEvent {
     },
     /// 工具执行完毕。
     ToolCallEnd {
+        /// 所属会话。并行执行时据它判断该往哪个视图投递。
         session: SessionId,
         /// 本轮。
         turn: TurnId,
@@ -97,6 +100,7 @@ pub enum CoreEvent {
     },
     /// 发生了上下文压缩。
     ContextCompacted {
+        /// 所属会话。并行执行时据它判断该往哪个视图投递。
         session: SessionId,
         /// 本轮。
         turn: TurnId,
@@ -109,6 +113,7 @@ pub enum CoreEvent {
     },
     /// 一轮结束。
     TurnEnded {
+        /// 所属会话。并行执行时据它判断该往哪个视图投递。
         session: SessionId,
         /// 本轮。
         turn: TurnId,
@@ -134,6 +139,15 @@ pub enum CoreEvent {
         /// 新标题。
         title: String,
     },
+    /// 子智能体团队的整体状态变了。
+    ///
+    /// 一次推全量而不是增量：团队通常只有几个成员，全量最省心，
+    /// UI 也不用维护差分逻辑。
+    TeamUpdated {
+        /// 当前所有子智能体。
+        agents: Vec<SubAgentView>,
+    },
+
     /// 已切换到另一个会话，附带该会话的完整历史。
     ///
     /// 历史随事件一起送来，UI 不必再去查库 —— 否则容易和内核的
@@ -291,4 +305,23 @@ mod tests {
         let cloned = ev.clone();
         assert!(matches!(cloned, CoreEvent::Token { .. }));
     }
+}
+
+/// 给界面看的子智能体快照。
+///
+/// 独立于内核里的状态机：UI 只关心怎么显示，不关心内部字段。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubAgentView {
+    /// 标识。
+    pub id: String,
+    /// 角色。
+    pub role: String,
+    /// 状态标签（执行中 / 已完成 / 失败 / 已停止）。
+    pub status: String,
+    /// 负责什么。
+    pub description: String,
+    /// 它占用的会话，点进去能看过程。
+    pub session: String,
+    /// 结果摘要（跑完之后才有）。
+    pub result: Option<String>,
 }

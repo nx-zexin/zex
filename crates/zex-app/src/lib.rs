@@ -145,6 +145,12 @@ pub fn spawn_core(mut agent: Agent) -> CoreHandles {
     tools.push(Arc::new(zex_agent::subagent::WaitForAgents {
         registry: registry.clone(),
     }));
+    tools.push(Arc::new(zex_agent::subagent::SendMessage {
+        registry: registry.clone(),
+    }));
+    tools.push(Arc::new(zex_agent::subagent::TerminateAgent {
+        registry: registry.clone(),
+    }));
     registry.install(
         cfg.clone(),
         tools.clone(),
