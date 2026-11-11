@@ -179,6 +179,9 @@ pub struct SessionSummary {
 pub enum UiCommand {
     /// 用户提交了一条输入。
     UserPrompt {
+        /// 目标会话。带上它，不同会话的任务才能并行 ——
+        /// 内核不再假设"当前会话"就是唯一在执行的那个。
+        session: SessionId,
         /// 文本。
         text: String,
         /// 附件（图片等）。

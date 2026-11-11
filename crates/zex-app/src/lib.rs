@@ -88,9 +88,11 @@ pub fn build_ephemeral_agent(
 
 // ─── 内核线程 ───
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
-use zex_agent::{Agent, ApprovalDecision};
-use zex_core::{CoreEvent, UiCommand};
+use zex_agent::{Agent, AgentConfig, ApprovalBroker, ApprovalDecision};
+use zex_core::{CoreEvent, SessionId, UiCommand};
 
 /// 内核侧的运行参数。
 pub struct CoreHandles {
@@ -125,6 +127,13 @@ pub fn spawn_core(mut agent: Agent) -> CoreHandles {
     let broker = agent.approvals();
     let cancel_flag = agent.cancel_flag();
 
+    // 任务执行器的原料。都是克隆成本很低的类型（Arc / 配置结构），
+    // 每个任务拿一份，互不干扰。
+    let cfg = agent.config().clone();
+    let tools = agent.tools().to_vec();
+    let store = agent.store().clone();
+    let session_locks: SessionLocks = Arc::new(Mutex::new(HashMap::new()));
+
     let spawn_result = std::thread::Builder::new()
         .name("zex-core".into())
         .spawn(move || {
@@ -138,64 +147,23 @@ pub fn spawn_core(mut agent: Agent) -> CoreHandles {
             rt.block_on(async move {
                 while let Some(cmd) = cmd_rx.recv().await {
                     match cmd {
-                        UiCommand::UserPrompt { text, .. } => {
-                            // 每轮都落一条任务记录：这是「我不在的时候它做了
-                            // 什么」的唯一数据来源。建任务失败不影响执行本身。
-                            let task_id = zex_core::TaskId::generate().to_string();
-                            let session = agent.session_id().as_str().to_string();
-                            if let Err(e) =
-                                agent.store().create_task(&task_id, &session, &text, "")
-                            {
-                                tracing::warn!(error = %e, "建任务记录失败，继续执行");
-                            }
-                            let _ = agent.store().start_task(&task_id);
-
-                            let outcome = agent.run_turn(text, Some(&ev_tx)).await;
-
-                            match &outcome {
-                                Ok(done) => {
-                                    let summary: String = done.chars().take(120).collect();
-                                    let _ = agent.store().finish_task(
-                                        &task_id,
-                                        zex_store::tasks::TaskStatus::Completed,
-                                        Some(&summary),
-                                        None,
-                                    );
-                                }
-                                Err(e) => {
-                                    let _ = agent.store().finish_task(
-                                        &task_id,
-                                        zex_store::tasks::TaskStatus::Failed,
-                                        None,
-                                        Some(&e.to_string()),
-                                    );
-                                }
-                            }
-
-                            // 单轮失败不应杀掉整个内核：把错误作为事件上报，
-                            // 会话继续可用。
-                            if let Err(e) = outcome {
-                                let _ = ev_tx
-                                    .send(CoreEvent::Fatal { message: e.to_string() })
+                        UiCommand::UserPrompt { session, text, .. } => {
+                            // 派到后台执行，主循环立刻回去收下一条命令 ——
+                            // 否则一个慢任务会把「切会话」「审批」全堵在队列里。
+                            // 同一会话内部仍串行（run_task 里的会话锁），
+                            // 避免两个任务同时往同一条 history 追加。
+                            let (cfg, tools, store, ev, locks, broker) = (
+                                cfg.clone(),
+                                tools.clone(),
+                                store.clone(),
+                                ev_tx.clone(),
+                                session_locks.clone(),
+                                broker.clone(),
+                            );
+                            tokio::spawn(async move {
+                                run_task(cfg, tools, store, session, text, ev, locks, broker)
                                     .await;
-                            }
-                            // 首轮之后给会话起个名字。内部会跳过已有标题的会话，
-                            // 所以后续轮次不会重复请求模型。
-                            match agent.maybe_autotitle().await {
-                                Ok(Some(title)) => {
-                                    let _ = ev_tx
-                                        .send(CoreEvent::SessionTitled {
-                                            session: agent.session_id().to_string(),
-                                            title,
-                                        })
-                                        .await;
-                                }
-                                Ok(None) => {}
-                                Err(e) => {
-                                    // 起标题失败不值得打扰用户
-                                    tracing::warn!(error = %e, "自动生成标题失败");
-                                }
-                            }
+                            });
                         }
                         UiCommand::Approve { id, remember } => {
                             let _ = broker
@@ -351,4 +319,95 @@ pub fn spawn_core(mut agent: Agent) -> CoreHandles {
     }
 
     CoreHandles { cmd_tx, event_rx: ev_rx }
+}
+
+/// 每个会话一把锁：同一会话的任务排队，不同会话并行。
+type SessionLocks = Arc<Mutex<HashMap<SessionId, Arc<tokio::sync::Mutex<()>>>>>;
+
+/// 一次任务执行。
+///
+/// 这是并行化的核心：任务不再依附于某个长期存在的 `Agent`，而是
+/// 现取会话历史 → 跑 → 写回。会话状态以库为准，`Agent` 退化成
+/// 一次性的执行器。
+#[allow(clippy::too_many_arguments)]
+async fn run_task(
+    cfg: AgentConfig,
+    tools: Vec<Arc<dyn zex_core::tool::ErasedTool>>,
+    store: zex_store::Store,
+    session: SessionId,
+    text: String,
+    ev_tx: mpsc::Sender<CoreEvent>,
+    locks: SessionLocks,
+    broker: Arc<ApprovalBroker>,
+) {
+    // 同一会话串行：两条任务同时往一条 history 追加会乱序，
+    // 而且它们看到的上下文也不一致。
+    let lock = {
+        let mut held = locks.lock().expect("会话锁表中毒");
+        held.entry(session.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    };
+    let _guard = lock.lock().await;
+
+    let task_id = zex_core::TaskId::generate().to_string();
+    let _ = store.create_task(&task_id, session.as_str(), &text, "");
+    let _ = store.start_task(&task_id);
+
+    let mut agent = match Agent::resume(cfg, tools, store.clone(), session.clone()) {
+        Ok(agent) => agent.with_shared_approvals(broker),
+        Err(e) => {
+            let _ = store.finish_task(
+                &task_id,
+                zex_store::tasks::TaskStatus::Failed,
+                None,
+                Some(&e.to_string()),
+            );
+            let _ = ev_tx
+                .send(CoreEvent::Fatal {
+                    message: e.to_string(),
+                })
+                .await;
+            return;
+        }
+    };
+
+    let outcome = agent.run_turn(text, Some(&ev_tx)).await;
+
+    match &outcome {
+        Ok(done) => {
+            let summary: String = done.chars().take(120).collect();
+            let _ = store.finish_task(
+                &task_id,
+                zex_store::tasks::TaskStatus::Completed,
+                Some(&summary),
+                None,
+            );
+        }
+        Err(e) => {
+            let _ = store.finish_task(
+                &task_id,
+                zex_store::tasks::TaskStatus::Failed,
+                None,
+                Some(&e.to_string()),
+            );
+        }
+    }
+
+    if let Err(e) = outcome {
+        let _ = ev_tx
+            .send(CoreEvent::Fatal {
+                message: e.to_string(),
+            })
+            .await;
+    }
+
+    if let Ok(Some(title)) = agent.maybe_autotitle().await {
+        let _ = ev_tx
+            .send(CoreEvent::SessionTitled {
+                session: session.to_string(),
+                title,
+            })
+            .await;
+    }
 }

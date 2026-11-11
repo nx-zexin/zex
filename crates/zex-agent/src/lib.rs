@@ -161,6 +161,16 @@ impl Agent {
         Ok(agent)
     }
 
+    /// 换成共享的审批通道。
+    ///
+    /// 并行执行时，每个任务都有自己的 `Agent` 实例；如果各自持有独立
+    /// 的 `ApprovalBroker`，用户在界面上点的「批准」就投递不到真正在等
+    /// 待的那个任务。构造后接上同一个 broker 即可。
+    pub fn with_shared_approvals(mut self, broker: Arc<ApprovalBroker>) -> Self {
+        self.approvals = broker;
+        self
+    }
+
     /// 取一个取消句柄，可跨线程触发当前轮的中断。
     pub fn cancel_flag(&self) -> Arc<AtomicBool> {
         self.cancelled.clone()
@@ -281,6 +291,16 @@ impl Agent {
     /// 审批注册表。UI/CLI 需要 clone 它来回复审批。
     pub fn approvals(&self) -> Arc<ApprovalBroker> {
         self.approvals.clone()
+    }
+
+    /// 内核配置（克隆给任务执行器用）。
+    pub fn config(&self) -> &AgentConfig {
+        &self.cfg
+    }
+
+    /// 工具集。元素是 `Arc`，克隆成本很低。
+    pub fn tools(&self) -> &[Arc<dyn ErasedTool>] {
+        &self.tools
     }
 
     /// 当前会话 id。

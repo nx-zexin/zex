@@ -109,6 +109,9 @@ struct ChatView {
     broker: Arc<ApprovalBroker>,
     sessions: Vec<SessionItem>,
     active_session: String,
+    /// 哪一轮属于哪个会话。并行执行时，别的会话的 token 不该混进
+    /// 当前正在看的这个会话里。
+    turn_sessions: std::collections::HashMap<String, String>,
     cwd: String,
     model: String,
     usage: Usage,
@@ -193,6 +196,7 @@ impl ChatView {
             broker,
             sessions,
             active_session,
+            turn_sessions: std::collections::HashMap::new(),
             cwd,
             model,
             usage: Usage::default(),
@@ -305,8 +309,15 @@ impl ChatView {
         self.status = "思考中…".into();
 
         let tx = self.cmd_tx.clone();
+        let session = self.active_session.clone();
         cx.spawn(async move |_this, _cx| {
-            let _ = tx.send(UiCommand::UserPrompt { text, attachments: vec![] }).await;
+            let _ = tx
+                .send(UiCommand::UserPrompt {
+                    session: zex_core::SessionId::from(session),
+                    text,
+                    attachments: vec![],
+                })
+                .await;
         })
         .detach();
 
@@ -360,15 +371,30 @@ impl ChatView {
         cx.notify();
     }
 
+    /// 这一轮是否属于当前正在看的会话。
+    ///
+    /// 找不到归属时按「是」处理：单会话的正常路径不该被这条规则影响。
+    fn turn_is_active(&self, turn: &zex_core::TurnId) -> bool {
+        match self.turn_sessions.get(&turn.to_string()) {
+            Some(session) => *session == self.active_session,
+            None => true,
+        }
+    }
+
     fn handle_event(&mut self, ev: CoreEvent, cx: &mut Context<Self>) {
         match ev {
-            CoreEvent::TurnStarted { .. } => {
+            CoreEvent::TurnStarted { session, turn } => {
+                self.turn_sessions
+                    .insert(turn.to_string(), session.to_string());
                 self.streaming.get_or_insert_with(String::new);
                 self.status = "思考中…".into();
             }
-            CoreEvent::Token { text, .. } => {
-                self.streaming.get_or_insert_with(String::new).push_str(&text);
-                self.sync_scroller(cx);
+            CoreEvent::Token { turn, text } => {
+                // 别的会话在后台跑，它的输出不往当前视图里塞。
+                if self.turn_is_active(&turn) {
+                    self.streaming.get_or_insert_with(String::new).push_str(&text);
+                    self.sync_scroller(cx);
+                }
             }
             CoreEvent::ToolCallBegin { name, arguments, risk, .. } => {
                 self.flush_streaming(cx);
@@ -405,7 +431,8 @@ impl ChatView {
                     text: format!("上下文已压缩（{strategy}）：{before_tokens} → {after_tokens} tokens"),
                 });
             }
-            CoreEvent::TurnEnded { reason, usage, .. } => {
+            CoreEvent::TurnEnded { reason, usage, turn } => {
+                self.turn_sessions.remove(&turn.to_string());
                 self.flush_streaming(cx);
                 // 取消/失败路径不会有 flush 收尾，这里兜住，避免输入框锁死
                 self.streaming = None;
