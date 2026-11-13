@@ -144,6 +144,11 @@ struct ChatView {
     team: Vec<zex_core::event::SubAgentView>,
     /// 右侧面板：正在看的子智能体。
     subagent_panel: Option<SubAgentPanel>,
+    /// 团队面板是否收起。
+    ///
+    /// 子智能体在跑的时候这块会一直占着对话底部，用户想专心看主线
+    /// 内容时会碍事 —— 收起来只留一行摘要。
+    team_collapsed: bool,
     /// 别的会话发来的授权请求。切到那个会话时再摆出来，
     /// 免得后台任务把当前视图顶掉。
     pending_approvals: Vec<(String, ApprovalRequest)>,
@@ -237,6 +242,7 @@ impl ChatView {
             confirm_close: false,
             team: Vec::new(),
             subagent_panel: None,
+            team_collapsed: false,
             pending_approvals: Vec::new(),
             store,
             cwd,
@@ -1332,34 +1338,56 @@ impl ChatView {
             .bg(rgb(BG_RESULT))
             .overflow_hidden();
 
-        // 标题行
-        panel = panel.child(
-            div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .px_4()
-                .py_2()
-                .border_b_1()
-                .border_color(rgb(BORDER_SOFT))
-                .child(
-                    div()
-                        .text_xs()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(TEXT))
-                        .child("团队"),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(TEXT_MUTED))
-                        .child(if running > 0 {
-                            format!("{} 个执行中 · 共 {} 个", running, self.team.len())
-                        } else {
-                            format!("{} 个", self.team.len())
-                        }),
-                ),
-        );
+        // 标题行：整行可点，展开/收起
+        let arrow = if self.team_collapsed { "▸" } else { "▾" };
+        let mut head = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_4()
+            .py_2()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(TEXT_DIM))
+                    .child(arrow),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(TEXT))
+                    .child("团队"),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(TEXT_MUTED))
+                    .child(if running > 0 {
+                        format!("{} 个执行中 · 共 {} 个", running, self.team.len())
+                    } else {
+                        format!("{} 个", self.team.len())
+                    }),
+            )
+            .child(div().flex_1())
+            .child(
+                Button::new("toggle-team")
+                    .ghost()
+                    .label(if self.team_collapsed { "展开" } else { "收起" })
+                    .on_click(cx.listener(|this, _: &ClickEvent, _w, cx| {
+                        this.team_collapsed = !this.team_collapsed;
+                        cx.notify();
+                    })),
+            );
+        if !self.team_collapsed {
+            head = head.border_b_1().border_color(rgb(BORDER_SOFT));
+        }
+        panel = panel.child(head);
+
+        // 收起来就只留这一行摘要
+        if self.team_collapsed {
+            return panel.into_any_element();
+        }
 
         for a in &self.team {
             let (dot, dot_bg) = match a.status.as_str() {
