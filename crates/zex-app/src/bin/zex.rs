@@ -25,9 +25,9 @@ use zex_core::{ApprovalId, ApprovalRequest, CoreEvent, RememberScope, UiCommand,
 /// `HistoryPrev`/`HistoryNext`：输入框为空时 ↑↓ 回溯指令历史。
 mod keys {
     #![allow(missing_docs)]
-    gpui_kit::actions!(zex, [InterruptTask, HistoryPrev, HistoryNext, HistorySearch]);
+    gpui_kit::actions!(zex, [InterruptTask, HistoryPrev, HistoryNext, HistorySearch, MenuPrev, MenuNext]);
 }
-use keys::{HistoryNext, HistoryPrev, HistorySearch, InterruptTask};
+use keys::{HistoryNext, HistoryPrev, HistorySearch, InterruptTask, MenuNext, MenuPrev};
 
 // ─── 配色（浅色主题）───
 // 取自设计稿：近白背景、极浅灰面板、橙色作为唯一强调色。
@@ -181,6 +181,8 @@ struct ChatView {
     at_open: bool,
     /// Ctrl+R 的历史列表是否展开。
     history_search_open: bool,
+    /// 弹出菜单里当前选中第几项。
+    menu_cursor: usize,
     /// 本轮用哪个模型（`provider/model`）；None 用配置默认。
     selected_model: Option<String>,
     /// 可选的模型清单（来自配置文件的 provider）。
@@ -245,6 +247,8 @@ impl ChatView {
                 let v = this.input.read(cx).value();
                 let v = v.trim_start();
                 this.slash_open = v.starts_with('/') && !v.contains(' ');
+                // 候选集变了，游标回到第一项
+                this.menu_cursor = 0;
                 // @ 提到最后一个 @ 之后的词
                 let at = v.rfind('@').map(|i| &v[i + 1..]);
                 this.at_open = at.map(|t| !t.contains(' ')).unwrap_or(false);
@@ -327,6 +331,7 @@ impl ChatView {
             file_index: None,
             at_open: false,
             history_search_open: false,
+            menu_cursor: 0,
             selected_model: None,
             available_models,
             editing_model: false,
@@ -432,6 +437,153 @@ impl ChatView {
             self.scroller.update(cx, |s, cx| {
                 s.reset(target, cx);
             });
+        }
+    }
+
+    /// 弹出的菜单是否打开。
+    fn menu_is_open(&self) -> bool {
+        self.slash_open || self.at_open || self.history_search_open
+    }
+
+    /// 渲染弹出菜单。
+    ///
+    /// 键盘（↑↓ + Enter）和鼠标（点击）走同一份候选与同一个游标，
+    /// 不会出现"看到 A、执行 B"。
+    fn render_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let items = self.menu_items(cx);
+        if items.is_empty() {
+            return None;
+        }
+        let hint = if self.slash_open {
+            "命令"
+        } else if self.at_open {
+            "引用文件"
+        } else {
+            "历史指令"
+        };
+
+        let mut menu = div()
+            .rounded(px(10.0))
+            .border_1()
+            .border_color(rgb(BORDER))
+            .bg(rgb(BG_MAIN))
+            .p_1()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .text_xs()
+                    .text_color(rgb(TEXT_DIM))
+                    .child(format!("{hint}  ↑↓ 选择 · Enter 确认 · Esc 取消")),
+            );
+
+        for (i, item) in items.iter().enumerate() {
+            let picked = i == self.menu_cursor;
+            let label = if self.slash_open {
+                SLASH_COMMANDS
+                    .iter()
+                    .find(|(n, _)| n == item)
+                    .map(|(n, d)| format!("{n}  —  {d}"))
+                    .unwrap_or_else(|| item.clone())
+            } else {
+                item.clone()
+            };
+            let idx = i;
+            let mut row = div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_2()
+                .py_1()
+                .rounded(px(6.0));
+            if picked {
+                row = row.bg(rgb(BG_HOVER));
+            }
+            menu = menu.child(
+                row
+                    .child(
+                        div()
+                            .text_xs()
+                            .child(if self.slash_open {
+                                "›"
+                            } else if self.at_open {
+                                "📄"
+                            } else {
+                                "↺"
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .text_xs()
+                            .text_color(if picked { rgb(TEXT) } else { rgb(TEXT_MUTED) })
+                            .overflow_hidden()
+                            .child(label),
+                    )
+                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, window, cx| {
+                        this.menu_pick(idx, window, cx);
+                    })),
+            );
+        }
+        Some(menu.into_any_element())
+    }
+
+    /// 选中菜单里第 `i` 项并执行。
+    fn menu_pick(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let items = self.menu_items(cx);
+        let Some(item) = items.get(i).cloned() else {
+            return;
+        };
+        if self.slash_open {
+            self.run_slash(&item, window, cx);
+        } else if self.at_open {
+            self.insert_at_reference(&item, window, cx);
+        } else if self.history_search_open {
+            self.input
+                .update(cx, |st, cx| st.set_value(item, window, cx));
+            self.history_search_open = false;
+            cx.notify();
+        }
+    }
+
+    /// 当前菜单的候选。
+    ///
+    /// 渲染和键盘导航共用这一份：两边各算一次的话，筛选条件一改就会
+    /// 出现「看到的是 A、回车执行的是 B」。
+    fn menu_items(&self, cx: &Context<Self>) -> Vec<String> {
+        if self.slash_open {
+            let typed = self.input.read(cx).value().trim_start().to_string();
+            SLASH_COMMANDS
+                .iter()
+                .filter(|(name, _)| name.starts_with(&typed))
+                .map(|(name, _)| (*name).to_string())
+                .collect()
+        } else if self.at_open {
+            let typed = self.input.read(cx).value().to_string();
+            let q = typed
+                .rfind('@')
+                .map(|i| typed[i + 1..].to_lowercase())
+                .unwrap_or_default();
+            let mut hits: Vec<String> = self
+                .file_index
+                .as_ref()
+                .map(|all| {
+                    all.iter()
+                        .filter(|f| f.to_lowercase().contains(&q))
+                        .take(8)
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
+            hits.sort_by_key(|f| f.len());
+            hits
+        } else if self.history_search_open {
+            self.input_history.iter().rev().take(8).cloned().collect()
+        } else {
+            Vec::new()
         }
     }
 
@@ -682,12 +834,13 @@ impl ChatView {
         cx.notify();
     }
 
-    /// 输入框高度：跟着内容长，一行起步、六行封顶。
+    /// 输入框高度：跟着内容长，三行起步、六行封顶。
     ///
-    /// 固定高度要么挤（一行）要么浪费（六行空着），都不像正经产品。
+    /// 起步三行是刻意的：一句话的指令一行就够，但真正有价值的需求
+    /// 往往要分点写，给足初始空间比让用户先看见一条缝强。
     fn composer_height(&self, cx: &Context<Self>) -> f32 {
         const LINE: f32 = 22.0;
-        const MIN_LINES: usize = 1;
+        const MIN_LINES: usize = 3;
         const MAX_LINES: usize = 6;
         let text = self.input.read(cx).value();
         // 显式换行 + 视觉折行都算；按 60 字估一行，粗一点够用
@@ -698,6 +851,13 @@ impl ChatView {
     }
 
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // 菜单开着的话，回车是"确认选中项"而不是发送
+        if self.menu_is_open() {
+            let cursor = self.menu_cursor;
+            self.menu_pick(cursor, window, cx);
+            return;
+        }
+
         let mut text = self.input.read(cx).value().trim().to_string();
         if (text.is_empty() && self.attachments.is_empty()) || self.streaming.is_some() {
             return;
@@ -2220,55 +2380,14 @@ impl ChatView {
 
         let mut composer = div().flex().flex_col().gap_2();
 
-        // Ctrl+R 历史列表
-        if self.history_search_open && !self.input_history.is_empty() {
-            let mut menu = div()
-                .rounded(px(10.0))
-                .border_1()
-                .border_color(rgb(BORDER))
-                .bg(rgb(BG_MAIN))
-                .p_1()
-                .flex()
-                .flex_col();
-            for (i, h) in self.input_history.iter().rev().take(8).enumerate() {
-                let text = h.clone();
-                menu = menu.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .px_2()
-                        .py_1()
-                        .rounded(px(6.0))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w(px(0.0))
-                                .text_xs()
-                                .text_color(rgb(TEXT_MUTED))
-                                .overflow_hidden()
-                                .child(h.clone()),
-                        )
-                        .child(
-                            Button::new(SharedString::from(format!("hist-{i}")))
-                                .ghost()
-                                .label("填入")
-                                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                                    this.input
-                                        .update(cx, |st, cx| st.set_value(text.clone(), window, cx));
-                                    this.history_search_open = false;
-                                    cx.notify();
-                                })),
-                        ),
-                );
-            }
+        // 弹出菜单（命令 / 文件 / 历史共用一个渲染）
+        if let Some(menu) = self.render_menu(cx) {
             composer = composer.child(menu);
         }
 
-        // 输入框空着时给几个起点：新用户不知道这个助理能干什么，
-        // 比一句"请输入指令"有用得多。
+        // 空输入给几个起点：新用户对着空框不知道这个助理能干什么
         let typing = !self.input.read(cx).value().trim().is_empty();
-        if !typing && self.attachments.is_empty() && !self.slash_open {
+        if !typing && self.attachments.is_empty() && !self.menu_is_open() {
             const TEMPLATES: &[&str] = &[
                 "梳理这个项目的结构",
                 "找出代码里的 TODO 和未实现部分",
@@ -2290,131 +2409,6 @@ impl ChatView {
                 );
             }
             composer = composer.child(row);
-        }
-
-        // 斜杠命令菜单
-        if self.slash_open {
-            let typed = self.input.read(cx).value().trim_start().to_string();
-            const CMDS: &[(&str, &str)] = &[
-                ("/new", "新会话"),
-                ("/clear", "清空当前会话"),
-                ("/model", "切换模型，可跟模型名"),
-                ("/help", "命令说明"),
-            ];
-            let mut menu = div()
-                .rounded(px(10.0))
-                .border_1()
-                .border_color(rgb(BORDER))
-                .bg(rgb(BG_MAIN))
-                .p_1()
-                .flex()
-                .flex_col();
-            for (i, (name, desc)) in CMDS.iter().enumerate() {
-                if !name.starts_with(&typed) {
-                    continue;
-                }
-                let cmd = (*name).to_string();
-                menu = menu.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_3()
-                        .px_2()
-                        .py_1()
-                        .rounded(px(6.0))
-                        .child(
-                            div()
-                                .text_xs()
-                                .font_family(MONO)
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(rgb(BRAND))
-                                .child(cmd.clone()),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(rgb(TEXT_MUTED))
-                                .child(*desc),
-                        )
-                        .child(div().flex_1())
-                        .child(
-                            Button::new(SharedString::from(format!("slash-{i}")))
-                                .ghost()
-                                .label("执行")
-                                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                                    this.run_slash(&cmd, window, cx);
-                                })),
-                        ),
-                );
-            }
-            composer = composer.child(menu);
-        }
-
-        // @ 引用候选
-        if self.at_open {
-            let typed = self.input.read(cx).value().to_string();
-            let q = typed
-                .rfind('@')
-                .map(|i| typed[i + 1..].to_lowercase())
-                .unwrap_or_default();
-            let mut hits: Vec<String> = self
-                .file_index
-                .as_ref()
-                .map(|all| {
-                    all.iter()
-                        .filter(|f| f.to_lowercase().contains(&q))
-                        .take(8)
-                        .cloned()
-                        .collect()
-                })
-                .unwrap_or_default();
-            if !hits.is_empty() {
-                hits.sort_by_key(|f| f.len());
-                let mut menu = div()
-                    .rounded(px(10.0))
-                    .border_1()
-                    .border_color(rgb(BORDER))
-                    .bg(rgb(BG_MAIN))
-                    .p_1()
-                    .flex()
-                    .flex_col();
-                for (i, f) in hits.iter().enumerate() {
-                    let pick = f.clone();
-                    menu = menu.child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .px_2()
-                            .py_1()
-                            .rounded(px(6.0))
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .child("📄"),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w(px(0.0))
-                                    .text_xs()
-                                    .font_family(MONO)
-                                    .text_color(rgb(TEXT))
-                                    .overflow_hidden()
-                                    .child(f.clone()),
-                            )
-                            .child(
-                                Button::new(SharedString::from(format!("at-{i}")))
-                                    .ghost()
-                                    .label("引用")
-                                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                                        this.insert_at_reference(&pick, window, cx);
-                                    })),
-                            ),
-                    );
-                }
-                composer = composer.child(menu);
-            }
         }
 
         if !self.attachments.is_empty() {
@@ -2711,12 +2705,23 @@ impl Render for ChatView {
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _window, cx| {
                 this.add_attachments(paths.paths(), cx);
             }))
-            .key_context(if self.input.read(cx).value().trim().is_empty() {
+            .key_context(if self.menu_is_open() {
+                // 菜单优先：上下键在候选里走
+                "Zex ZexMenu"
+            } else if self.input.read(cx).value().trim().is_empty() {
                 "Zex ZexEmpty"
             } else {
                 "Zex"
             })
             .on_action(cx.listener(|this, _: &InterruptTask, _window, cx| {
+                // 菜单开着时 Esc 先关菜单，不打断任务
+                if this.menu_is_open() {
+                    this.slash_open = false;
+                    this.at_open = false;
+                    this.history_search_open = false;
+                    cx.notify();
+                    return;
+                }
                 if this.streaming.is_some() {
                     this.cancel(cx);
                 } else if this.subagent_panel.is_some() {
@@ -2729,6 +2734,20 @@ impl Render for ChatView {
             }))
             .on_action(cx.listener(|this, _: &HistoryNext, window, cx| {
                 this.recall_history(false, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &MenuPrev, _window, cx| {
+                if this.menu_cursor > 0 {
+                    this.menu_cursor -= 1;
+                }
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &MenuNext, window, cx| {
+                let n = this.menu_items(cx).len();
+                if this.menu_cursor + 1 < n {
+                    this.menu_cursor += 1;
+                }
+                let _ = window;
+                cx.notify();
             }))
             .on_action(cx.listener(|this, _: &HistorySearch, _window, cx| {
                 this.history_search_open = !this.history_search_open;
@@ -2783,6 +2802,14 @@ impl Render for ChatView {
     }
 
 }
+
+/// 斜杠命令表。菜单渲染和键盘导航都用它。
+const SLASH_COMMANDS: &[(&str, &str)] = &[
+    ("/new", "新会话"),
+    ("/clear", "清空当前会话"),
+    ("/model", "切换模型，可跟模型名"),
+    ("/help", "命令说明"),
+];
 
 /// 粗略估算 token 数。
 ///
@@ -3070,6 +3097,9 @@ fn main() {
                     KeyBinding::new("up", HistoryPrev, Some("ZexEmpty")),
                     KeyBinding::new("down", HistoryNext, Some("ZexEmpty")),
                     KeyBinding::new("ctrl-r", HistorySearch, Some("Zex")),
+                    // 菜单打开时上下键在候选里走，不是回溯历史
+                    KeyBinding::new("up", MenuPrev, Some("ZexMenu")),
+                    KeyBinding::new("down", MenuNext, Some("ZexMenu")),
                 ]);
 
                 let tx = cmd_tx.clone();
