@@ -289,6 +289,13 @@ pub async fn stream_chat(
     }
 }
 
+/// 流式响应两次数据之间的最长空闲时间。
+///
+/// `reqwest` 的 `read_timeout` 靠不住：服务端把连接一直挂着、就是不发
+/// 数据时它不会触发（实测卡过 7 分钟）。这里在流上再设一道 —— 超过这个
+/// 时间没有任何 chunk 到达，就判定这条流死了。
+pub const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+
 /// 建一个配置好超时的 HTTP 客户端。
 ///
 /// 超时策略：连接 10s、整体不设上限（流式对话可能很久），
@@ -313,6 +320,13 @@ mod tests {
             api_key_env: None,
             headers: Default::default(),
         }
+    }
+
+    #[test]
+    fn stream_idle_timeout_is_bounded() {
+        // 太长会让用户干等，太短会误杀慢速生成长文本的模型
+        assert!(STREAM_IDLE_TIMEOUT >= Duration::from_secs(30));
+        assert!(STREAM_IDLE_TIMEOUT <= Duration::from_secs(300));
     }
 
     #[test]

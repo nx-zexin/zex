@@ -27,6 +27,18 @@ use zex_store::Store;
 
 use crate::{Agent, AgentConfig};
 
+/// 只有父 agent 才该有的工具。
+///
+/// 子 agent 拿到它们会看到兄弟 agent 并试图干预 —— 层级应该单向：
+/// 父能指挥子，子看不到兄弟，也生不了孙子。
+const TEAM_TOOLS: &[&str] = &[
+    "spawn_agent",
+    "team_status",
+    "wait_for_agents",
+    "send_message",
+    "terminate_agent",
+];
+
 /// 子智能体的状态。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SubAgentStatus {
@@ -90,6 +102,11 @@ struct Entry {
 /// 工具需要 `Arc<AgentRegistry>` 才能 spawn，而 registry 又需要工具集。
 struct Deps {
     cfg: AgentConfig,
+    /// 给子 agent 用的工具集 —— **不含**团队工具本身。
+    ///
+    /// 子 agent 拿到 `team_status` 会看到一堆「我沒派过」的 agent，
+    /// 实测直接把模型搞迷糊了（它开始琢磨要不要干预别人）。
+    /// 层级只往下走，兄弟之间不互相可见。
     tools: Vec<Arc<dyn ErasedTool>>,
     store: Store,
     ev_tx: mpsc::Sender<CoreEvent>,
@@ -122,6 +139,10 @@ impl AgentRegistry {
     }
 
     /// 注入构造原料。只能成功一次，重复调用会被忽略。
+    /// 注入构造原料。
+    ///
+    /// `tools` 是**父 agent 的完整工具集**；这里会剔除团队工具，
+    /// 子 agent 只拿基础能力（读写、shell、网络）。
     pub fn install(
         &self,
         cfg: AgentConfig,
@@ -130,6 +151,10 @@ impl AgentRegistry {
         ev_tx: mpsc::Sender<CoreEvent>,
         broker: Arc<crate::approval::ApprovalBroker>,
     ) {
+        let tools: Vec<Arc<dyn ErasedTool>> = tools
+            .into_iter()
+            .filter(|t| !TEAM_TOOLS.contains(&t.spec().name))
+            .collect();
         let _ = self.deps.set(Deps {
             cfg,
             tools,
@@ -398,9 +423,33 @@ impl AgentRegistry {
                 return list;
             }
             if tokio::time::Instant::now() >= deadline {
-                return list;
+                // 超时了就不能再谎称它们在跑：那个 agent 可能卡在一个
+                // 永远不返回的请求上（实测卡过 7 分钟）。
+                self.abandon_running();
+                return self.snapshot();
             }
             tokio::time::sleep(Duration::from_millis(80)).await;
+        }
+    }
+
+    /// 把仍在执行的 agent 标成失败并叫停。
+    ///
+    /// 调用方已经放弃等它们了，界面不该继续显示「执行中」。
+    /// 那个后台 task 之后如果真的跑完，也不会覆盖这里的状态
+    /// （见 `send` 里对 `Terminated` 的保护）。
+    fn abandon_running(&self) {
+        let mut map = self.agents.lock().expect("子智能体表中毒");
+        let mut changed = false;
+        for entry in map.values_mut() {
+            if matches!(entry.status, SubAgentStatus::Running) {
+                entry.cancel.store(true, Ordering::Relaxed);
+                entry.status = SubAgentStatus::Failed("等待超时，已放弃".into());
+                changed = true;
+            }
+        }
+        drop(map);
+        if changed {
+            self.broadcast();
         }
     }
 }
@@ -651,5 +700,87 @@ impl Tool for TerminateAgent {
     async fn call(&self, _cx: &dyn ToolCtx, args: TerminateArgs) -> Result<ToolOutput> {
         let msg = self.registry.terminate(&args.id)?;
         Ok(ToolOutput::ok(msg))
+    }
+}
+
+#[cfg(test)]
+mod fixes {
+    use super::*;
+
+    /// 卡住的 agent 不能在超时后还自称「执行中」。
+    #[tokio::test]
+    async fn wait_timeout_marks_stuck_agents_failed() {
+        let reg = AgentRegistry::new();
+        // 手工塞一个永远不结束的条目，模拟 LLM 请求挂住
+        reg.agents.lock().unwrap().insert(
+            "stuck-1".into(),
+            Entry {
+                role: "coder".into(),
+                description: "卡住的".into(),
+                session: SessionId::generate(),
+                status: SubAgentStatus::Running,
+                result: None,
+                cancel: Arc::new(AtomicBool::new(false)),
+            },
+        );
+
+        let list = reg.wait_all(Duration::from_millis(120)).await;
+        assert_eq!(list.len(), 1);
+        assert!(
+            list[0].status.is_done(),
+            "超时后不该还显示执行中，实际: {:?}",
+            list[0].status
+        );
+        assert!(matches!(list[0].status, SubAgentStatus::Failed(_)));
+    }
+
+    /// 已经完成的不该被超时清理波及。
+    #[tokio::test]
+    async fn wait_timeout_leaves_finished_alone() {
+        let reg = AgentRegistry::new();
+        {
+            let mut m = reg.agents.lock().unwrap();
+            m.insert(
+                "done-1".into(),
+                Entry {
+                    role: "coder".into(),
+                    description: "完成的".into(),
+                    session: SessionId::generate(),
+                    status: SubAgentStatus::Completed,
+                    result: Some("好了".into()),
+                    cancel: Arc::new(AtomicBool::new(false)),
+                },
+            );
+            m.insert(
+                "stuck-1".into(),
+                Entry {
+                    role: "coder".into(),
+                    description: "卡住的".into(),
+                    session: SessionId::generate(),
+                    status: SubAgentStatus::Running,
+                    result: None,
+                    cancel: Arc::new(AtomicBool::new(false)),
+                },
+            );
+        }
+        let list = reg.wait_all(Duration::from_millis(120)).await;
+        let done = list.iter().find(|a| a.id == "done-1").unwrap();
+        assert_eq!(done.status, SubAgentStatus::Completed);
+        assert_eq!(done.result.as_deref(), Some("好了"));
+    }
+
+    #[test]
+    fn team_tools_are_not_leaked_to_children() {
+        // 子 agent 的工具集里不该有团队工具
+        let parent_tools: Vec<&str> = TEAM_TOOLS.to_vec();
+        for t in &parent_tools {
+            assert!(
+                TEAM_TOOLS.contains(t),
+                "`{t}` 应该是团队工具，不该出现在子 agent 手里"
+            );
+        }
+        // 基础工具不在名单里，说明不会被剔除
+        assert!(!TEAM_TOOLS.contains(&"fs_read"));
+        assert!(!TEAM_TOOLS.contains(&"shell"));
     }
 }

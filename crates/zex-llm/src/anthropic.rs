@@ -296,7 +296,29 @@ pub async fn stream_chat(
         let mut stream = resp.bytes_stream();
         let mut saw_done = false;
 
-        while let Some(chunk) = stream.next().await {
+        loop {
+            // 空闲超时：服务端挂住连接不发数据时，光靠 read_timeout 兜不住
+            let next = match tokio::time::timeout(
+                crate::STREAM_IDLE_TIMEOUT,
+                stream.next(),
+            )
+            .await
+            {
+                Ok(v) => v,
+                Err(_) => {
+                    let _ = tx
+                        .send(Err(Error::llm_retryable(
+                            format!(
+                                "服务端 {:?} 没有任何响应",
+                                crate::STREAM_IDLE_TIMEOUT
+                            ),
+                            None,
+                        )))
+                        .await;
+                    return;
+                }
+            };
+            let Some(chunk) = next else { break };
             let chunk = match chunk {
                 Ok(c) => c,
                 Err(e) => {
