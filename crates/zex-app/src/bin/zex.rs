@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerState};
 use gpui_kit::component::text::markdown;
@@ -18,6 +18,16 @@ use gpui_kit::*;
 use tokio::sync::mpsc;
 use zex_agent::ApprovalBroker;
 use zex_core::{ApprovalId, ApprovalRequest, CoreEvent, RememberScope, UiCommand, Usage};
+
+/// 界面快捷键动作。
+///
+/// `InterruptTask`：Esc 中断当前任务。
+/// `HistoryPrev`/`HistoryNext`：输入框为空时 ↑↓ 回溯指令历史。
+mod keys {
+    #![allow(missing_docs)]
+    gpui_kit::actions!(zex, [InterruptTask, HistoryPrev, HistoryNext]);
+}
+use keys::{HistoryNext, HistoryPrev, InterruptTask};
 
 // ─── 配色（浅色主题）───
 // 取自设计稿：近白背景、极浅灰面板、橙色作为唯一强调色。
@@ -85,6 +95,22 @@ struct SubAgentPanel {
     streaming: Option<String>,
 }
 
+/// 待发送的附件。
+///
+/// 图片走 `Part::Image`（provider 会转成 base64 data URL），
+/// 其它文件以路径形式进上下文 —— 模型用 fs_read 自己读。
+#[derive(Clone)]
+struct Attachment {
+    /// 绝对路径。
+    path: std::path::PathBuf,
+    /// 显示名（文件名）。
+    name: String,
+    /// 图片则已读成 base64，否则为 None。
+    image_b64: Option<String>,
+    /// 图片的 MIME 类型。
+    media_type: String,
+}
+
 #[derive(Clone)]
 struct MsgItem {
     kind: MsgKind,
@@ -109,7 +135,8 @@ struct SessionItem {
 
 /// 主视图。
 struct ChatView {
-    input: Entity<InputState>,
+    /// 多行输入。真实任务描述经常是分点的，单行框里滚动查看太难受。
+    input: Entity<TextareaState>,
     messages: Vec<MsgItem>,
     streaming: Option<String>,
     /// 任务快照（工作台展示用）。
@@ -144,6 +171,14 @@ struct ChatView {
     team: Vec<zex_core::event::SubAgentView>,
     /// 右侧面板：正在看的子智能体。
     subagent_panel: Option<SubAgentPanel>,
+    /// 待发送的附件。
+    attachments: Vec<Attachment>,
+    /// 本会话发过的指令，↑ 回溯用。
+    input_history: Vec<String>,
+    /// 当前回溯到第几条（None = 正在编辑新内容）。
+    history_cursor: Option<usize>,
+    /// 开始回溯前的草稿，回溯回来要还原。
+    history_draft: String,
     /// 团队面板是否收起。
     ///
     /// 子智能体在跑的时候这块会一直占着对话底部，用户想专心看主线
@@ -173,7 +208,9 @@ impl ChatView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let input = cx.new(|cx| InputState::new(window, cx).placeholder("请输入您的指令，或选择一个快捷操作…"));
+        let input = cx.new(|cx| {
+            TextareaState::new(window, cx).placeholder("请输入您的指令，或选择一个快捷操作…")
+        });
         let rename_input = cx.new(|cx| InputState::new(window, cx).placeholder("会话标题"));
 
         // Enter 发送，Shift+Enter 换行。输入框自己无法区分这两者的语义，
@@ -242,6 +279,10 @@ impl ChatView {
             confirm_close: false,
             team: Vec::new(),
             subagent_panel: None,
+            attachments: Vec::new(),
+            input_history: Vec::new(),
+            history_cursor: None,
+            history_draft: String::new(),
             team_collapsed: false,
             pending_approvals: Vec::new(),
             store,
@@ -343,11 +384,144 @@ impl ChatView {
         }
     }
 
-    fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let text = self.input.read(cx).value().trim().to_string();
-        if text.is_empty() || self.streaming.is_some() {
+    /// 把拖进来的文件收成附件。
+    ///
+    /// 图片读成 base64（模型能直接看），其它类型只记路径 ——
+    /// 让模型按需用 fs_read 读，比一股脑塞进上下文省 token。
+    fn add_attachments(&mut self, paths: &[std::path::PathBuf], cx: &mut Context<Self>) {
+        for p in paths {
+            let name = p
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| p.display().to_string());
+
+            let ext = p
+                .extension()
+                .map(|e| e.to_string_lossy().to_lowercase())
+                .unwrap_or_default();
+            let media_type = match ext.as_str() {
+                "png" => "image/png",
+                "jpg" | "jpeg" => "image/jpeg",
+                "gif" => "image/gif",
+                "webp" => "image/webp",
+                _ => "",
+            };
+
+            let image_b64 = if media_type.is_empty() {
+                None
+            } else {
+                match std::fs::read(p) {
+                    Ok(bytes) => Some(base64_encode(&bytes)),
+                    Err(e) => {
+                        tracing::warn!(path = %p.display(), error = %e, "读图片失败");
+                        None
+                    }
+                }
+            };
+
+            // 同一个文件别重复加
+            if self.attachments.iter().any(|a| a.path == *p) {
+                continue;
+            }
+            self.attachments.push(Attachment {
+                path: p.clone(),
+                name,
+                image_b64,
+                media_type: media_type.to_string(),
+            });
+        }
+        cx.notify();
+    }
+
+    /// ↑↓ 在历史里走。
+    ///
+    /// 只在输入框为空时触发（见根元素的 `ZexEmpty` context），
+    /// 所以不会抢掉多行编辑里的光标上下移动。
+    fn recall_history(&mut self, prev: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.input_history.is_empty() {
             return;
         }
+
+        if prev {
+            let next = match self.history_cursor {
+                None => {
+                    // 第一次回溯：先记住正在打的内容，回来时还原
+                    self.history_draft = self.input.read(cx).value().to_string();
+                    self.input_history.len() - 1
+                }
+                Some(0) => 0, // 已经在最旧的一条
+                Some(i) => i - 1,
+            };
+            self.history_cursor = Some(next);
+            let text = self.input_history[next].clone();
+            self.input
+                .update(cx, |st, cx| st.set_value(text, window, cx));
+        } else {
+            match self.history_cursor {
+                None => return,
+                Some(i) if i + 1 < self.input_history.len() => {
+                    self.history_cursor = Some(i + 1);
+                    let text = self.input_history[i + 1].clone();
+                    self.input
+                        .update(cx, |st, cx| st.set_value(text, window, cx));
+                }
+                Some(_) => {
+                    // 走到最新一条之后再按 ↓ 就回到草稿
+                    self.history_cursor = None;
+                    let draft = std::mem::take(&mut self.history_draft);
+                    self.input
+                        .update(cx, |st, cx| st.set_value(draft, window, cx));
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// 输入框高度：跟着内容长，一行起步、六行封顶。
+    ///
+    /// 固定高度要么挤（一行）要么浪费（六行空着），都不像正经产品。
+    fn composer_height(&self, cx: &Context<Self>) -> f32 {
+        const LINE: f32 = 22.0;
+        const MIN_LINES: usize = 1;
+        const MAX_LINES: usize = 6;
+        let text = self.input.read(cx).value();
+        // 显式换行 + 视觉折行都算；按 60 字估一行，粗一点够用
+        let explicit = text.split('\n').count();
+        let wrapped = text.chars().count() / 60 + 1;
+        let lines = explicit.max(wrapped).clamp(MIN_LINES, MAX_LINES);
+        LINE * lines as f32 + 8.0
+    }
+
+    fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let mut text = self.input.read(cx).value().trim().to_string();
+        if (text.is_empty() && self.attachments.is_empty()) || self.streaming.is_some() {
+            return;
+        }
+
+        // 图片走多模态通道，其它文件只在正文里留个路径让模型自己读
+        let mut images = Vec::new();
+        for a in &self.attachments {
+            match &a.image_b64 {
+                Some(b64) => images.push(zex_core::message::ImageRef {
+                    media_type: a.media_type.clone(),
+                    blob_id: b64.clone(),
+                }),
+                None => {
+                    text.push_str(&format!("\n\n[附带文件] {}", a.path.display()));
+                }
+            }
+        }
+        if text.trim().is_empty() {
+            text = "请查看附件。".to_string();
+        }
+
+        // 记历史：重复的相邻指令不重复记
+        if self.input_history.last() != Some(&text) {
+            self.input_history.push(text.clone());
+        }
+        self.history_cursor = None;
+        self.history_draft.clear();
+        self.attachments.clear();
 
         self.input.update(cx, |state, cx| state.set_value("", window, cx));
         // 派了活就要看到它跑：从工作台自动进入对话视图
@@ -363,7 +537,7 @@ impl ChatView {
                 .send(UiCommand::UserPrompt {
                     session: zex_core::SessionId::from(session),
                     text,
-                    attachments: vec![],
+                    attachments: images,
                 })
                 .await;
         })
@@ -1788,10 +1962,54 @@ impl ChatView {
     }
 
     fn render_composer(&self, cx: &mut Context<Self>) -> AnyElement {
-        div()
-            .flex()
-            .flex_col()
-            .gap_2()
+        // 附件条：有东西才占位
+        let mut attach_row = div().flex().items_center().gap_2().flex_wrap();
+        for (i, a) in self.attachments.iter().enumerate() {
+            let is_img = a.image_b64.is_some();
+            attach_row = attach_row.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .py_1()
+                    .rounded(px(8.0))
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .bg(rgb(BG_TOOL))
+                    .child(
+                        div()
+                            .text_xs()
+                            .child(if is_img { "🖼" } else { "📄" }),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(TEXT_MUTED))
+                            .child(if a.name.chars().count() > 24 {
+                                let n: String = a.name.chars().take(24).collect();
+                                format!("{n}…")
+                            } else {
+                                a.name.clone()
+                            }),
+                    )
+                    .child(
+                        Button::new(SharedString::from(format!("drop-attach-{i}")))
+                            .ghost()
+                            .label("✕")
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _w, cx| {
+                                this.attachments.remove(i);
+                                cx.notify();
+                            })),
+                    ),
+            );
+        }
+
+        let mut composer = div().flex().flex_col().gap_2();
+        if !self.attachments.is_empty() {
+            composer = composer.child(attach_row);
+        }
+        composer
             .child(
                 div()
                     .flex()
@@ -1800,13 +2018,19 @@ impl ChatView {
                     .child(
                         div()
                             .flex_1()
-                            .rounded(px(24.0))
+                            .rounded(px(14.0))
                             .border_1()
                             .border_color(rgb(BORDER))
                             .bg(rgb(BG_INPUT))
                             .px_4()
                             .py_2()
-                            .child(Input::new(&self.input)),
+                            // 高度跟着内容长：一行起步，最多六行后内部滚动
+                            .child(
+                                Textarea::new(&self.input)
+                                    .appearance(false)
+                                    .bordered(false)
+                                    .h(px(self.composer_height(cx))),
+                            ),
                     )
                     .child(match self.streaming.is_some() {
                         // 正在跑就换成停止键：否则用户只能干等长任务跑完
@@ -2042,6 +2266,29 @@ impl Render for ChatView {
         let mut root = div()
             .size_full()
             .relative()
+            // 拖文件进来：图片进上下文，其它按路径引用
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, _window, cx| {
+                this.add_attachments(paths.paths(), cx);
+            }))
+            .key_context(if self.input.read(cx).value().trim().is_empty() {
+                "Zex ZexEmpty"
+            } else {
+                "Zex"
+            })
+            .on_action(cx.listener(|this, _: &InterruptTask, _window, cx| {
+                if this.streaming.is_some() {
+                    this.cancel(cx);
+                } else if this.subagent_panel.is_some() {
+                    this.subagent_panel = None;
+                    cx.notify();
+                }
+            }))
+            .on_action(cx.listener(|this, _: &HistoryPrev, window, cx| {
+                this.recall_history(true, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &HistoryNext, window, cx| {
+                this.recall_history(false, window, cx);
+            }))
             .flex()
             .bg(rgb(BG_MAIN))
             .text_color(rgb(TEXT))
@@ -2090,6 +2337,27 @@ impl Render for ChatView {
         root
     }
 
+}
+
+/// 标准 base64 编码（带 = 填充）。
+///
+/// 只为了把图片塞进 data URL，不需要 URL-safe 变体。
+fn base64_encode(bytes: &[u8]) -> String {
+    const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        out.push(T[(n >> 18) as usize & 63] as char);
+        out.push(T[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 2 { T[n as usize & 63] as char } else { '=' });
+    }
+    out
 }
 
 /// 把 JSON 参数压成一行短摘要。
@@ -2321,6 +2589,16 @@ fn main() {
                 // niri/sway 这类平铺器会忽略 WindowOptions 里的初始尺寸，
                 // 这里再显式要一次；被忽略也无害（浮动窗口自行决定）。
                 window.resize(size(px(1280.0), px(820.0)));
+
+                // Esc 中断当前任务。用户等长任务时手在键盘上，
+                // 去够鼠标点 ■ 那一下很别扭。
+                cx.bind_keys([
+                    KeyBinding::new("escape", InterruptTask, Some("Zex")),
+                    // ↑↓ 只在输入框为空时回溯历史，否则会抢掉多行编辑里
+                    // 的光标移动
+                    KeyBinding::new("up", HistoryPrev, Some("ZexEmpty")),
+                    KeyBinding::new("down", HistoryNext, Some("ZexEmpty")),
+                ]);
 
                 let tx = cmd_tx.clone();
                 let broker = broker.clone();

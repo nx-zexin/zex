@@ -216,6 +216,9 @@ impl Agent {
         Ok(Some(title))
     }
 
+    /// 用模型给会话起个更好的标题。
+    ///
+    /// 只替换「首句截断」那个占位；用户手动改过的不动。
     pub async fn maybe_autotitle(&self) -> Result<Option<String>> {
         // 只给"刚开始"的会话起名。历史一长，第一条往往是「你好」，
         // 拿它当标题既不贴切也没意义 —— 那种情况留给用户手动改。
@@ -393,6 +396,19 @@ impl Agent {
         input: impl Into<String>,
         events: Option<&mpsc::Sender<CoreEvent>>,
     ) -> Result<String> {
+        self.run_turn_with_images(input, Vec::new(), events).await
+    }
+
+    /// 带图片的一轮。
+    ///
+    /// 图片以 `Part::Image` 混进用户消息，provider 侧会转成 base64
+    /// data URL —— 模型能直接看到截图，不用先落盘再让它 fs_read。
+    pub async fn run_turn_with_images(
+        &mut self,
+        input: impl Into<String>,
+        images: Vec<zex_core::message::ImageRef>,
+        events: Option<&mpsc::Sender<CoreEvent>>,
+    ) -> Result<String> {
         let turn = TurnId::generate();
         // 新一轮开始，清掉上一轮遗留的中断请求
         self.cancelled.store(false, Ordering::SeqCst);
@@ -404,7 +420,11 @@ impl Agent {
             events,
         );
 
-        let user_msg = Message::user(input);
+        let mut content = vec![zex_core::message::Part::text(input)];
+        for img in images {
+            content.push(zex_core::message::Part::Image(img));
+        }
+        let user_msg = Message::User { content };
         self.record(&user_msg)?;
         self.history.push(user_msg);
 

@@ -232,7 +232,7 @@ pub fn spawn_core(mut agent: Agent) -> CoreHandles {
             rt.block_on(async move {
                 while let Some(cmd) = cmd_rx.recv().await {
                     match cmd {
-                        UiCommand::UserPrompt { session, text, .. } => {
+                        UiCommand::UserPrompt { session, text, attachments } => {
                             // 派到后台执行，主循环立刻回去收下一条命令 ——
                             // 否则一个慢任务会把「切会话」「审批」全堵在队列里。
                             // 同一会话内部仍串行（run_task 里的会话锁），
@@ -246,8 +246,11 @@ pub fn spawn_core(mut agent: Agent) -> CoreHandles {
                                 broker.clone(),
                             );
                             tokio::spawn(async move {
-                                run_task(cfg, tools, store, session, text, ev, locks, broker)
-                                    .await;
+                                run_task(
+                                    cfg, tools, store, session, text, attachments, ev, locks,
+                                    broker,
+                                )
+                                .await;
                             });
                         }
                         UiCommand::Approve { id, remember } => {
@@ -421,6 +424,7 @@ async fn run_task(
     store: zex_store::Store,
     session: SessionId,
     text: String,
+    attachments: Vec<zex_core::message::ImageRef>,
     ev_tx: mpsc::Sender<CoreEvent>,
     locks: SessionLocks,
     broker: Arc<ApprovalBroker>,
@@ -475,7 +479,9 @@ async fn run_task(
             .await;
     }
 
-    let outcome = agent.run_turn(text, Some(&ev_tx)).await;
+    let outcome = agent
+        .run_turn_with_images(text, attachments, Some(&ev_tx))
+        .await;
 
     match &outcome {
         Ok(done) => {
