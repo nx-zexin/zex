@@ -25,9 +25,9 @@ use zex_core::{ApprovalId, ApprovalRequest, CoreEvent, RememberScope, UiCommand,
 /// `HistoryPrev`/`HistoryNext`：输入框为空时 ↑↓ 回溯指令历史。
 mod keys {
     #![allow(missing_docs)]
-    gpui_kit::actions!(zex, [InterruptTask, HistoryPrev, HistoryNext]);
+    gpui_kit::actions!(zex, [InterruptTask, HistoryPrev, HistoryNext, HistorySearch]);
 }
-use keys::{HistoryNext, HistoryPrev, InterruptTask};
+use keys::{HistoryNext, HistoryPrev, HistorySearch, InterruptTask};
 
 // ─── 配色（浅色主题）───
 // 取自设计稿：近白背景、极浅灰面板、橙色作为唯一强调色。
@@ -179,6 +179,8 @@ struct ChatView {
     file_index: Option<Vec<String>>,
     /// `@` 菜单是否展开。
     at_open: bool,
+    /// Ctrl+R 的历史列表是否展开。
+    history_search_open: bool,
     /// 本轮用哪个模型（`provider/model`）；None 用配置默认。
     selected_model: Option<String>,
     /// 可选的模型清单（来自配置文件的 provider）。
@@ -324,6 +326,7 @@ impl ChatView {
             slash_open: false,
             file_index: None,
             at_open: false,
+            history_search_open: false,
             selected_model: None,
             available_models,
             editing_model: false,
@@ -2217,6 +2220,78 @@ impl ChatView {
 
         let mut composer = div().flex().flex_col().gap_2();
 
+        // Ctrl+R 历史列表
+        if self.history_search_open && !self.input_history.is_empty() {
+            let mut menu = div()
+                .rounded(px(10.0))
+                .border_1()
+                .border_color(rgb(BORDER))
+                .bg(rgb(BG_MAIN))
+                .p_1()
+                .flex()
+                .flex_col();
+            for (i, h) in self.input_history.iter().rev().take(8).enumerate() {
+                let text = h.clone();
+                menu = menu.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .px_2()
+                        .py_1()
+                        .rounded(px(6.0))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .text_xs()
+                                .text_color(rgb(TEXT_MUTED))
+                                .overflow_hidden()
+                                .child(h.clone()),
+                        )
+                        .child(
+                            Button::new(SharedString::from(format!("hist-{i}")))
+                                .ghost()
+                                .label("填入")
+                                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                    this.input
+                                        .update(cx, |st, cx| st.set_value(text.clone(), window, cx));
+                                    this.history_search_open = false;
+                                    cx.notify();
+                                })),
+                        ),
+                );
+            }
+            composer = composer.child(menu);
+        }
+
+        // 输入框空着时给几个起点：新用户不知道这个助理能干什么，
+        // 比一句"请输入指令"有用得多。
+        let typing = !self.input.read(cx).value().trim().is_empty();
+        if !typing && self.attachments.is_empty() && !self.slash_open {
+            const TEMPLATES: &[&str] = &[
+                "梳理这个项目的结构",
+                "找出代码里的 TODO 和未实现部分",
+                "把最近的 git 提交整理成周报",
+                "检查依赖有没有安全风险",
+            ];
+            let mut row = div().flex().items_center().gap_2().flex_wrap();
+            for (i, t) in TEMPLATES.iter().enumerate() {
+                let text = (*t).to_string();
+                row = row.child(
+                    Button::new(SharedString::from(format!("tpl-{i}")))
+                        .ghost()
+                        .label(*t)
+                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                            this.input
+                                .update(cx, |st, cx| st.set_value(text.clone(), window, cx));
+                            cx.notify();
+                        })),
+                );
+            }
+            composer = composer.child(row);
+        }
+
         // 斜杠命令菜单
         if self.slash_open {
             let typed = self.input.read(cx).value().trim_start().to_string();
@@ -2655,6 +2730,10 @@ impl Render for ChatView {
             .on_action(cx.listener(|this, _: &HistoryNext, window, cx| {
                 this.recall_history(false, window, cx);
             }))
+            .on_action(cx.listener(|this, _: &HistorySearch, _window, cx| {
+                this.history_search_open = !this.history_search_open;
+                cx.notify();
+            }))
             .flex()
             .bg(rgb(BG_MAIN))
             .text_color(rgb(TEXT))
@@ -2990,6 +3069,7 @@ fn main() {
                     // 的光标移动
                     KeyBinding::new("up", HistoryPrev, Some("ZexEmpty")),
                     KeyBinding::new("down", HistoryNext, Some("ZexEmpty")),
+                    KeyBinding::new("ctrl-r", HistorySearch, Some("Zex")),
                 ]);
 
                 let tx = cmd_tx.clone();
