@@ -66,6 +66,25 @@ enum MsgKind {
     },
 }
 
+/// 右侧面板正在看哪个子智能体。
+///
+/// 单独一块而不是切主会话：用户想「看一眼它在干什么」，
+/// 不是「离开当前对话」。
+struct SubAgentPanel {
+    /// agent 标识。
+    id: String,
+    /// 它占的会话 id。
+    session: String,
+    /// 职责描述，显示在面板标题下方。
+    description: String,
+    /// 状态标签。
+    status: String,
+    /// 已经发生的消息。
+    messages: Vec<MsgItem>,
+    /// 正在流式输出的文本。
+    streaming: Option<String>,
+}
+
 #[derive(Clone)]
 struct MsgItem {
     kind: MsgKind,
@@ -123,6 +142,8 @@ struct ChatView {
     confirm_close: bool,
     /// 子智能体团队。非空时在对话里显示一块团队面板。
     team: Vec<zex_core::event::SubAgentView>,
+    /// 右侧面板：正在看的子智能体。
+    subagent_panel: Option<SubAgentPanel>,
     /// 别的会话发来的授权请求。切到那个会话时再摆出来，
     /// 免得后台任务把当前视图顶掉。
     pending_approvals: Vec<(String, ApprovalRequest)>,
@@ -215,6 +236,7 @@ impl ChatView {
             active_session,
             confirm_close: false,
             team: Vec::new(),
+            subagent_panel: None,
             pending_approvals: Vec::new(),
             store,
             cwd,
@@ -359,6 +381,45 @@ impl ChatView {
         cx.notify();
     }
 
+    /// 打开右侧面板，看某个子智能体在干什么。
+    ///
+    /// 从库里读一份快照 —— 切会话那套会丢掉当前对话，而用户这里
+    /// 只是想「瞄一眼」。
+    fn open_subagent_panel(&mut self, id: &str, cx: &mut Context<Self>) {
+        let info = self.team.iter().find(|a| a.id == id).cloned();
+        let (session, description, status, id) = match info {
+            Some(a) => (a.session, a.description, a.status, a.id),
+            None => {
+                // 团队快照里没有（可能被 try_send 丢了），查库
+                match self
+                    .store
+                    .list_sub_agents()
+                    .ok()
+                    .and_then(|list| list.into_iter().find(|r| r.id == id))
+                {
+                    Some(r) => (
+                        r.session_id,
+                        r.description,
+                        format!("{:?}", r.status),
+                        r.id,
+                    ),
+                    None => return,
+                }
+            }
+        };
+
+        let messages = load_session_items(&self.store, &session);
+        self.subagent_panel = Some(SubAgentPanel {
+            id,
+            session,
+            description,
+            status,
+            messages,
+            streaming: None,
+        });
+        cx.notify();
+    }
+
     /// 从队列里挑一个审批摆出来。
     ///
     /// 优先当前会话 —— 用户正看着这个，替他串行处理最符合直觉。
@@ -427,9 +488,106 @@ impl ChatView {
         session.as_str() == self.active_session
     }
 
+    /// 把事件镜像到右侧面板。
+    ///
+    /// 返回 true 表示这个事件属于面板正在看的那个子智能体，已经消费掉，
+    /// 不该再走主对话的逻辑。
+    fn mirror_to_panel(&mut self, ev: &CoreEvent) -> bool {
+        let Some(panel) = &mut self.subagent_panel else {
+            return false;
+        };
+        let session = match ev {
+            CoreEvent::TurnStarted { session, .. }
+            | CoreEvent::Token { session, .. }
+            | CoreEvent::Thinking { session, .. }
+            | CoreEvent::ToolCallBegin { session, .. }
+            | CoreEvent::ToolCallEnd { session, .. }
+            | CoreEvent::TurnEnded { session, .. }
+            | CoreEvent::ContextCompacted { session, .. } => session,
+            _ => return false,
+        };
+        if session.as_str() != panel.session {
+            return false;
+        }
+
+        match ev {
+            CoreEvent::TurnStarted { .. } => {
+                panel.streaming.get_or_insert_with(String::new);
+                panel.status = "执行中".into();
+            }
+            CoreEvent::Token { text, .. } => {
+                panel.streaming.get_or_insert_with(String::new).push_str(text);
+            }
+            CoreEvent::ToolCallBegin { name, arguments, risk, .. } => {
+                // 先把攒着的文本落成一条消息，保持顺序
+                if let Some(buf) = panel.streaming.take() {
+                    if !buf.trim().is_empty() {
+                        panel.messages.push(MsgItem {
+                            kind: MsgKind::Assistant,
+                            text: buf,
+                        });
+                    }
+                }
+                panel.messages.push(MsgItem {
+                    kind: MsgKind::ToolCall {
+                        name: name.clone(),
+                        args: compact_args(arguments),
+                        risk: risk.label().to_string(),
+                    },
+                    text: String::new(),
+                });
+            }
+            CoreEvent::ToolCallEnd { ok, brief, .. } => {
+                // 工具名靠前一条 ToolCall 记录，这里不重复
+                let name = panel.messages.iter().rev().find_map(|m| match &m.kind {
+                    MsgKind::ToolCall { name, .. } => Some(name.clone()),
+                    _ => None,
+                });
+                panel.messages.push(MsgItem {
+                    kind: MsgKind::ToolResult {
+                        ok: *ok,
+                        output: brief.clone(),
+                        name,
+                    },
+                    text: String::new(),
+                });
+            }
+            CoreEvent::TurnEnded { reason, .. } => {
+                if let Some(buf) = panel.streaming.take() {
+                    if !buf.trim().is_empty() {
+                        panel.messages.push(MsgItem {
+                            kind: MsgKind::Assistant,
+                            text: buf,
+                        });
+                    }
+                }
+                panel.status = if matches!(reason, zex_core::EndReason::Completed) {
+                    "已完成".into()
+                } else {
+                    "已结束".into()
+                };
+            }
+            _ => {}
+        }
+        true
+    }
+
     fn handle_event(&mut self, ev: CoreEvent, cx: &mut Context<Self>) {
+        // 面板正在看的那个子智能体，它的事件直接喂给面板
+        if self.mirror_to_panel(&ev) {
+            cx.notify();
+            return;
+        }
         match ev {
             CoreEvent::TeamUpdated { agents } => {
+                // 面板显示的那个 agent 状态要跟着团队一起变，
+                // 否则会出现「面板说已完成、团队说执行中」这种自相矛盾。
+                if let Some(panel) = &mut self.subagent_panel {
+                    if let Some(a) = agents.iter().find(|a| a.id == panel.id) {
+                        panel.status = a.status.clone();
+                        panel.description = a.description.clone();
+                    }
+                }
                 self.team = agents;
                 self.tasks = load_tasks(&self.store);
                 cx.notify();
@@ -1056,7 +1214,112 @@ impl ChatView {
     ///
     /// 放在对话下方而不是侧栏，是因为它属于「这一轮正在发生的事」；
     /// 侧栏留给会话，两者是不同的层级。
-    fn render_team(&self, _cx: &mut Context<Self>) -> AnyElement {
+    /// 右侧面板：子智能体的完整过程。
+    ///
+    /// 独立于主对话：用户想「看一眼它在干什么」，不是「离开当前对话」。
+    fn render_subagent_panel(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(panel) = &self.subagent_panel else {
+            return div().into_any_element();
+        };
+
+        let (dot, dot_bg) = match panel.status.as_str() {
+            "执行中" => (BRAND, BRAND_SOFT),
+            "已完成" => (OK, OK_SOFT),
+            "失败" => (DANGER, DANGER_SOFT),
+            _ => (TEXT_DIM, BG_HOVER),
+        };
+
+        let header = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_4()
+            .py_3()
+            .border_b_1()
+            .border_color(rgb(BORDER_SOFT))
+            .child(div().size(px(6.0)).rounded_full().bg(rgb(dot)))
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(TEXT))
+                    .child(panel.id.clone()),
+            )
+            .child(
+                div()
+                    .px_1p5()
+                    .rounded_sm()
+                    .bg(rgb(dot_bg))
+                    .text_color(rgb(dot))
+                    .text_xs()
+                    .child(panel.status.clone()),
+            )
+            .child(div().flex_1())
+            .child(
+                Button::new("panel-close")
+                    .ghost()
+                    .label("✕")
+                    .on_click(cx.listener(|this, _: &ClickEvent, _w, cx| {
+                        this.subagent_panel = None;
+                        cx.notify();
+                    })),
+            );
+
+        let mut body = div()
+            .id("subagent-panel-scroll")
+            .flex_1()
+            .min_h(px(0.0))
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .p_4();
+
+        for (i, m) in panel.messages.iter().enumerate() {
+            body = body.child(self.render_message(m, i + 10_000, cx));
+        }
+        // 流式中的文本：单独一块，带光标感
+        if let Some(buf) = &panel.streaming {
+            if !buf.trim().is_empty() {
+                body = body.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(role_label("THINKING"))
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(rgb(TEXT_MUTED))
+                                .child(buf.clone()),
+                        ),
+                );
+            }
+        }
+
+        div()
+            .w(px(420.0))
+            .flex_none()
+            .h_full()
+            .flex()
+            .flex_col()
+            .bg(rgb(BG_SIDEBAR))
+            .border_l_1()
+            .border_color(rgb(BORDER))
+            .child(header)
+            .child(
+                div()
+                    .px_4()
+                    .py_2()
+                    .text_xs()
+                    .text_color(rgb(TEXT_MUTED))
+                    .child(panel.description.clone()),
+            )
+            .child(body)
+            .into_any_element()
+    }
+
+    fn render_team(&self, cx: &mut Context<Self>) -> AnyElement {
         let running = self.team.iter().filter(|a| a.status == "执行中").count();
 
         let mut panel = div()
@@ -1141,23 +1404,16 @@ impl ChatView {
                         .child(a.description.clone()),
                 );
 
-            // 有结果就给一个能点进去看的会话
-            if !a.session.is_empty() {
-                let session = a.session.clone();
-                let tx = self.cmd_tx.clone();
-                row = row.child(
-                    Button::new(SharedString::from(format!("team-open-{}", a.id)))
-                        .ghost()
-                        .label("查看")
-                        .on_click(move |_, _, _| {
-                            // 直接投递即可：切换会话是内核侧的即时动作，
-                            // 不需要在这里等一个往返。
-                            let _ = tx.try_send(UiCommand::SwitchSession {
-                                session: zex_core::SessionId::from(session.clone()),
-                            });
-                        }),
-                );
-            }
+            // 「查看」开右侧面板，不切走当前对话
+            let agent_id = a.id.clone();
+            row = row.child(
+                Button::new(SharedString::from(format!("team-open-{}", a.id)))
+                    .ghost()
+                    .label("查看")
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _w, cx| {
+                        this.open_subagent_panel(&agent_id, cx);
+                    })),
+            );
 
             panel = panel.child(row);
         }
@@ -1794,6 +2050,11 @@ impl Render for ChatView {
                 main
             });
 
+        // 右侧面板：看子智能体的过程
+        if self.subagent_panel.is_some() {
+            root = root.child(self.render_subagent_panel(cx));
+        }
+
         // 关窗确认：压在整界面之上，挡住所有交互
         if self.confirm_close {
             root = root.child(self.render_close_confirm(cx));
@@ -1937,6 +2198,17 @@ fn load_tasks(store: &zex_store::Store) -> Vec<zex_store::tasks::TaskRecord> {
     all
 }
 
+/// 读某个会话的历史，转成可渲染的条目。
+///
+/// 和主对话用的是同一套 `history_to_items`，保证子智能体的面板里
+/// 工具卡片、结果卡片长得和主对话一致。
+fn load_session_items(store: &zex_store::Store, session: &str) -> Vec<MsgItem> {
+    let sid = zex_core::SessionId::from(session);
+    let stored = store.load_messages(&sid).unwrap_or_default();
+    let msgs: Vec<zex_core::Message> = stored.into_iter().map(|s| s.message).collect();
+    history_to_items(&msgs)
+}
+
 fn load_sessions(store: &zex_store::Store) -> Vec<SessionItem> {
     store
         .list_visible_sessions(20)
@@ -2065,6 +2337,33 @@ fn main() {
                         // 先不关：等用户在确认层里做决定
                         false
                     });
+                }
+
+                // 测试钩子：ZEX_AUTO_PANEL=1 时，等团队出现后自动打开
+                // 第一个子智能体的右侧面板 —— Wayland 下没法模拟点击。
+                if std::env::var("ZEX_AUTO_PANEL").is_ok() {
+                    let weak = view.downgrade();
+                    cx.spawn(async move |cx| {
+                        for _ in 0..40 {
+                            cx.background_executor()
+                                .timer(std::time::Duration::from_secs(2))
+                                .await;
+                            let done = weak
+                                .update(cx, |this, cx| {
+                                    if let Some(a) = this.team.first().cloned() {
+                                        this.open_subagent_panel(&a.id, cx);
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                })
+                                .unwrap_or(true);
+                            if done {
+                                break;
+                            }
+                        }
+                    })
+                    .detach();
                 }
 
                 // 测试钩子：设了 ZEX_AUTO_PROMPT 就自动提交一条任务。
