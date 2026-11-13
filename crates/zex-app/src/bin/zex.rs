@@ -173,6 +173,19 @@ struct ChatView {
     subagent_panel: Option<SubAgentPanel>,
     /// 待发送的附件。
     attachments: Vec<Attachment>,
+    /// 斜杠命令菜单是否展开。
+    slash_open: bool,
+    /// `@` 引用的候选文件（懒加载，只扫一次）。
+    file_index: Option<Vec<String>>,
+    /// `@` 菜单是否展开。
+    at_open: bool,
+    /// 本轮用哪个模型（`provider/model`）；None 用配置默认。
+    selected_model: Option<String>,
+    /// 可选的模型清单（来自配置文件的 provider）。
+    available_models: Vec<String>,
+    /// 正在编辑模型名。
+    editing_model: bool,
+    model_input: Entity<InputState>,
     /// 本会话发过的指令，↑ 回溯用。
     input_history: Vec<String>,
     /// 当前回溯到第几条（None = 正在编辑新内容）。
@@ -202,6 +215,7 @@ impl ChatView {
         active_session: String,
         cwd: String,
         model: String,
+        available_models: Vec<String>,
         history: Vec<MsgItem>,
         tasks: Vec<zex_store::tasks::TaskRecord>,
         store: Arc<zex_store::Store>,
@@ -212,6 +226,9 @@ impl ChatView {
             TextareaState::new(window, cx).placeholder("请输入您的指令，或选择一个快捷操作…")
         });
         let rename_input = cx.new(|cx| InputState::new(window, cx).placeholder("会话标题"));
+        let model_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("provider/model，例如 deepseek/deepseek-flash")
+        });
 
         // Enter 发送，Shift+Enter 换行。输入框自己无法区分这两者的语义，
         // 由外层决定"按下回车意味着提交"。
@@ -221,7 +238,31 @@ impl ChatView {
                     this.submit(window, cx);
                 }
             }
+            // 以 / 开头就亮出命令菜单
+            if let InputEvent::Change = ev {
+                let v = this.input.read(cx).value();
+                let v = v.trim_start();
+                this.slash_open = v.starts_with('/') && !v.contains(' ');
+                // @ 提到最后一个 @ 之后的词
+                let at = v.rfind('@').map(|i| &v[i + 1..]);
+                this.at_open = at.map(|t| !t.contains(' ')).unwrap_or(false);
+                if this.at_open {
+                    this.ensure_file_index();
+                }
+            }
         })
+        .detach();
+
+        // 模型输入框：回车确认，Esc 取消
+        cx.subscribe_in(
+            &model_input,
+            window,
+            |this, _input, ev: &InputEvent, window, cx| {
+                if let InputEvent::PressEnter { .. } = ev {
+                    this.commit_model_edit(window, cx);
+                }
+            },
+        )
         .detach();
 
         // 重命名输入框里按回车等于点"确定"
@@ -280,6 +321,13 @@ impl ChatView {
             team: Vec::new(),
             subagent_panel: None,
             attachments: Vec::new(),
+            slash_open: false,
+            file_index: None,
+            at_open: false,
+            selected_model: None,
+            available_models,
+            editing_model: false,
+            model_input,
             input_history: Vec::new(),
             history_cursor: None,
             history_draft: String::new(),
@@ -382,6 +430,160 @@ impl ChatView {
                 s.reset(target, cx);
             });
         }
+    }
+
+    /// 扫一遍工作目录，给 `@` 引用用。
+    ///
+    /// 只在第一次用到时扫，跳过大目录 —— 用户等不了几百毫秒的索引。
+    fn ensure_file_index(&mut self) {
+        if self.file_index.is_some() {
+            return;
+        }
+        const SKIP: &[&str] = &[
+            ".git", "target", "node_modules", "dist", "build", ".venv", "__pycache__",
+            ".next", ".cache", "vendor",
+        ];
+        const MAX: usize = 4000;
+        let mut out = Vec::new();
+        let root = std::path::PathBuf::from(&self.cwd);
+        let mut stack = vec![(root.clone(), 0usize)];
+        while let Some((dir, depth)) = stack.pop() {
+            if depth > 4 || out.len() >= MAX {
+                continue;
+            }
+            let Ok(rd) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in rd.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with('.') || SKIP.contains(&name.as_str()) {
+                    continue;
+                }
+                let path = entry.path();
+                if let Ok(ft) = entry.file_type() {
+                    if ft.is_dir() {
+                        stack.push((path, depth + 1));
+                    } else if let Ok(rel) = path.strip_prefix(&root) {
+                        out.push(rel.display().to_string());
+                    }
+                }
+            }
+        }
+        out.sort();
+        self.file_index = Some(out);
+    }
+
+    /// 把 `@片段` 换成 `@完整路径`。
+    fn insert_at_reference(&mut self, path: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let v = self.input.read(cx).value().to_string();
+        let new = match v.rfind('@') {
+            Some(i) => format!("{}@{} ", &v[..i], path),
+            None => format!("{v}@{path} "),
+        };
+        self.input
+            .update(cx, |st, cx| st.set_value(new, window, cx));
+        self.at_open = false;
+        cx.notify();
+    }
+
+    /// 执行一条斜杠命令。
+    ///
+    /// 返回 true 表示这次输入被当作命令消费掉了，不该发给模型。
+    fn run_slash(&mut self, cmd: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let cmd = cmd.trim();
+        let (name, rest) = match cmd.split_once(' ') {
+            Some((n, r)) => (n, r.trim()),
+            None => (cmd, ""),
+        };
+        match name {
+            "/new" => {
+                let tx = self.cmd_tx.clone();
+                cx.spawn(async move |_this, _cx| {
+                    let _ = tx.send(UiCommand::NewSession).await;
+                })
+                .detach();
+            }
+            "/clear" => {
+                let tx = self.cmd_tx.clone();
+                let session = self.active_session.clone();
+                cx.spawn(async move |_this, _cx| {
+                    let _ = tx
+                        .send(UiCommand::ClearSession {
+                            session: zex_core::SessionId::from(session),
+                        })
+                        .await;
+                })
+                .detach();
+                self.messages.clear();
+            }
+            "/model" => {
+                if rest.is_empty() {
+                    self.begin_model_edit(window, cx);
+                } else {
+                    self.model_input
+                        .update(cx, |st, cx| st.set_value(rest, window, cx));
+                    self.commit_model_edit(window, cx);
+                }
+            }
+            "/help" | "/?" => {
+                self.messages.push(MsgItem {
+                    kind: MsgKind::System,
+                    text: "/new 新会话　/clear 清空当前会话　/model [名称] 切换模型　/help 帮助"
+                        .into(),
+                });
+            }
+            _ => {
+                self.messages.push(MsgItem {
+                    kind: MsgKind::System,
+                    text: format!("没有 `{name}` 这个命令。试试 /help"),
+                });
+            }
+        }
+        self.input.update(cx, |st, cx| st.set_value("", window, cx));
+        self.slash_open = false;
+        cx.notify();
+        true
+    }
+
+    /// 点模型名进入编辑：预填当前值，回车生效。
+    ///
+    /// 做成可编辑而不是固定下拉：配置里的 provider 组合是用户自己写的，
+    /// 界面猜不准他想配哪个模型名。
+    fn begin_model_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let cur = self
+            .selected_model
+            .clone()
+            .unwrap_or_else(|| self.model.clone());
+        self.model_input
+            .update(cx, |st, cx| st.set_value(cur, window, cx));
+        self.editing_model = true;
+        cx.notify();
+    }
+
+    /// 提交模型编辑。空输入等于取消。
+    fn commit_model_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let v = self.model_input.read(cx).value().trim().to_string();
+        self.editing_model = false;
+        if v.is_empty() {
+            cx.notify();
+            return;
+        }
+        // 只接受配置里声明过的 provider，否则那一轮会静默用默认模型
+        let ok = self.available_models.iter().any(|m| *m == v)
+            || self
+                .available_models
+                .iter()
+                .any(|m| m.split('/').next() == v.split('/').next());
+        if ok {
+            self.selected_model = if v == self.model { None } else { Some(v) };
+        } else {
+            self.messages.push(MsgItem {
+                kind: MsgKind::System,
+                text: format!("模型 `{v}` 不在配置里，仍用 {}", self.model),
+            });
+        }
+        let _ = window;
+        cx.notify();
     }
 
     /// 把拖进来的文件收成附件。
@@ -498,6 +700,12 @@ impl ChatView {
             return;
         }
 
+        // 斜杠命令不发给模型
+        if text.starts_with('/') {
+            self.run_slash(&text, window, cx);
+            return;
+        }
+
         // 图片走多模态通道，其它文件只在正文里留个路径让模型自己读
         let mut images = Vec::new();
         for a in &self.attachments {
@@ -532,12 +740,14 @@ impl ChatView {
 
         let tx = self.cmd_tx.clone();
         let session = self.active_session.clone();
+        let selected_model = self.selected_model.clone();
         cx.spawn(async move |_this, _cx| {
             let _ = tx
                 .send(UiCommand::UserPrompt {
                     session: zex_core::SessionId::from(session),
                     text,
                     attachments: images,
+                    model: selected_model,
                 })
                 .await;
         })
@@ -2006,6 +2216,132 @@ impl ChatView {
         }
 
         let mut composer = div().flex().flex_col().gap_2();
+
+        // 斜杠命令菜单
+        if self.slash_open {
+            let typed = self.input.read(cx).value().trim_start().to_string();
+            const CMDS: &[(&str, &str)] = &[
+                ("/new", "新会话"),
+                ("/clear", "清空当前会话"),
+                ("/model", "切换模型，可跟模型名"),
+                ("/help", "命令说明"),
+            ];
+            let mut menu = div()
+                .rounded(px(10.0))
+                .border_1()
+                .border_color(rgb(BORDER))
+                .bg(rgb(BG_MAIN))
+                .p_1()
+                .flex()
+                .flex_col();
+            for (i, (name, desc)) in CMDS.iter().enumerate() {
+                if !name.starts_with(&typed) {
+                    continue;
+                }
+                let cmd = (*name).to_string();
+                menu = menu.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .px_2()
+                        .py_1()
+                        .rounded(px(6.0))
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_family(MONO)
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(rgb(BRAND))
+                                .child(cmd.clone()),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(TEXT_MUTED))
+                                .child(*desc),
+                        )
+                        .child(div().flex_1())
+                        .child(
+                            Button::new(SharedString::from(format!("slash-{i}")))
+                                .ghost()
+                                .label("执行")
+                                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                    this.run_slash(&cmd, window, cx);
+                                })),
+                        ),
+                );
+            }
+            composer = composer.child(menu);
+        }
+
+        // @ 引用候选
+        if self.at_open {
+            let typed = self.input.read(cx).value().to_string();
+            let q = typed
+                .rfind('@')
+                .map(|i| typed[i + 1..].to_lowercase())
+                .unwrap_or_default();
+            let mut hits: Vec<String> = self
+                .file_index
+                .as_ref()
+                .map(|all| {
+                    all.iter()
+                        .filter(|f| f.to_lowercase().contains(&q))
+                        .take(8)
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !hits.is_empty() {
+                hits.sort_by_key(|f| f.len());
+                let mut menu = div()
+                    .rounded(px(10.0))
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .bg(rgb(BG_MAIN))
+                    .p_1()
+                    .flex()
+                    .flex_col();
+                for (i, f) in hits.iter().enumerate() {
+                    let pick = f.clone();
+                    menu = menu.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .px_2()
+                            .py_1()
+                            .rounded(px(6.0))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .child("📄"),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .text_xs()
+                                    .font_family(MONO)
+                                    .text_color(rgb(TEXT))
+                                    .overflow_hidden()
+                                    .child(f.clone()),
+                            )
+                            .child(
+                                Button::new(SharedString::from(format!("at-{i}")))
+                                    .ghost()
+                                    .label("引用")
+                                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                        this.insert_at_reference(&pick, window, cx);
+                                    })),
+                            ),
+                    );
+                }
+                composer = composer.child(menu);
+            }
+        }
+
         if !self.attachments.is_empty() {
             composer = composer.child(attach_row);
         }
@@ -2056,21 +2392,51 @@ impl ChatView {
                     .items_center()
                     .justify_between()
                     .px_1()
-                    .child(
+                    .child({
+                        if self.editing_model {
+                            div()
+                                .w(px(260.0))
+                                .rounded(px(6.0))
+                                .border_1()
+                                .border_color(rgb(BRAND))
+                                .px_2()
+                                .py_1()
+                                .child(Input::new(&self.model_input))
+                                .into_any_element()
+                        } else {
+                            Button::new("switch-model")
+                                .ghost()
+                                .label(format!(
+                                    "{} ⌄",
+                                    self.selected_model.as_deref().unwrap_or(&self.model)
+                                ))
+                                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                    this.begin_model_edit(window, cx);
+                                }))
+                                .into_any_element()
+                        }
+                    })
+                    .child({
+                        // 输入预估 + 已消耗，两件事分开显示
+                        let typed = estimate_tokens(&self.input.read(cx).value());
+                        let used = self.usage.input_tokens + self.usage.output_tokens;
+                        let mut label = String::new();
+                        if typed > 0 {
+                            label.push_str(&format!("输入约 {typed} · "));
+                        }
+                        label.push_str(&format!(
+                            "已用 {}",
+                            if used >= 1000 {
+                                format!("{:.1}k", used as f64 / 1000.0)
+                            } else {
+                                format!("{used}")
+                            }
+                        ));
                         div()
                             .text_xs()
-                            .text_color(rgb(TEXT_DIM))
-                            .child(format!("{} ⌄", self.model)),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(TEXT_DIM))
-                            .child(format!(
-                                "{} / {} tokens",
-                                self.usage.input_tokens, self.usage.output_tokens
-                            )),
-                    ),
+                            .text_color(if typed > 2000 { rgb(DANGER) } else { rgb(TEXT_DIM) })
+                            .child(label)
+                    }),
             )
             .into_any_element()
     }
@@ -2339,6 +2705,24 @@ impl Render for ChatView {
 
 }
 
+/// 粗略估算 token 数。
+///
+/// 不引 tiktoken 那种大依赖：这里只需要让用户知道"这一大段贴进去
+/// 大概什么量级"。CJK 按 1 字 1 token，拉丁按 4 字符 1 token，
+/// 误差 ±20% 不影响判断。
+fn estimate_tokens(text: &str) -> usize {
+    let mut cjk = 0usize;
+    let mut ascii = 0usize;
+    for c in text.chars() {
+        if c.is_ascii() {
+            ascii += 1;
+        } else {
+            cjk += 1;
+        }
+    }
+    cjk + ascii.div_ceil(4)
+}
+
 /// 标准 base64 编码（带 = 填充）。
 ///
 /// 只为了把图片塞进 data URL，不需要 URL-safe 变体。
@@ -2553,11 +2937,19 @@ fn main() {
     let active_session = agent.session_id().as_str().to_string();
     let sessions = load_sessions(agent.store());
     let model = cfg.model.clone();
+    // 模型菜单：每个 provider 配当前模型名的后缀。配置里没写模型清单，
+    // 用「provider/当前模型」的组合列出最务实 —— 切 provider 时
+    // 模型名不变，用户可以在 config.json 里改。
+    let available_models: Vec<String> = cfg
+        .all_providers
+        .keys()
+        .map(|p| format!("{p}/{model}"))
+        .collect();
     let cwd_str = cwd.display().to_string();
     let history = history_to_items(agent.history());
     let tasks = load_tasks(agent.store());
     let store = Arc::new(agent.store().clone());
-    let handles = zex_app::spawn_core(agent);
+    let handles = zex_app::spawn_core(agent, cfg.all_providers.clone());
     let cmd_tx = handles.cmd_tx.clone();
     let mut event_rx = handles.event_rx;
 
@@ -2617,6 +3009,7 @@ fn main() {
                         active,
                         cwd,
                         model,
+                        available_models,
                         history,
                         tasks,
                         store_for_view,
@@ -2684,6 +3077,7 @@ fn main() {
                                 session: zex_core::SessionId::from(session),
                                 text: prompt,
                                 attachments: vec![],
+                                model: None,
                             });
                         }
                     }

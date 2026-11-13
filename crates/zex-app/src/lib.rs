@@ -178,7 +178,10 @@ fn session_summaries(agent: &Agent) -> Vec<zex_core::event::SessionSummary> {
 }
 
 /// 内核在 tokio 世界里跑，两者用 channel 通信（内存 channel，零序列化）。
-pub fn spawn_core(mut agent: Agent) -> CoreHandles {
+pub fn spawn_core(
+    mut agent: Agent,
+    providers: std::collections::BTreeMap<String, zex_llm::ProviderConfig>,
+) -> CoreHandles {
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<UiCommand>(64);
     let (ev_tx, ev_rx) = mpsc::channel::<CoreEvent>(256);
     let broker = agent.approvals();
@@ -232,23 +235,34 @@ pub fn spawn_core(mut agent: Agent) -> CoreHandles {
             rt.block_on(async move {
                 while let Some(cmd) = cmd_rx.recv().await {
                     match cmd {
-                        UiCommand::UserPrompt { session, text, attachments } => {
+                        UiCommand::UserPrompt { session, text, attachments, model } => {
                             // 派到后台执行，主循环立刻回去收下一条命令 ——
                             // 否则一个慢任务会把「切会话」「审批」全堵在队列里。
                             // 同一会话内部仍串行（run_task 里的会话锁），
                             // 避免两个任务同时往同一条 history 追加。
-                            let (cfg, tools, store, ev, locks, broker) = (
+                            let (cfg, tools, store, ev, locks, broker, providers) = (
                                 cfg.clone(),
                                 tools.clone(),
                                 store.clone(),
                                 ev_tx.clone(),
                                 session_locks.clone(),
                                 broker.clone(),
+                                providers.clone(),
                             );
                             tokio::spawn(async move {
+                                // 请求级模型覆盖：换了模型不必重启内核
+                                let mut task_cfg = cfg.clone();
+                                if let Some(m) = model.as_deref() {
+                                    if let Some((p, rest)) = m.split_once('/') {
+                                        if let Some(pc) = providers.get(p) {
+                                            task_cfg.provider = pc.clone();
+                                            task_cfg.model = rest.to_string();
+                                        }
+                                    }
+                                }
                                 run_task(
-                                    cfg, tools, store, session, text, attachments, ev, locks,
-                                    broker,
+                                    task_cfg, tools, store, session, text, attachments, ev,
+                                    locks, broker,
                                 )
                                 .await;
                             });

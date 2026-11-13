@@ -205,6 +205,11 @@ pub enum UiCommand {
         /// 目标会话。带上它，不同会话的任务才能并行 ——
         /// 内核不再假设"当前会话"就是唯一在执行的那个。
         session: SessionId,
+        /// 覆盖本轮的模型（`provider/model`）。`None` 用内核默认。
+        ///
+        /// 放请求里而不是改内核状态：切模型不必重启，也不必影响
+        /// 正在跑的其它会话。
+        model: Option<String>,
         /// 文本。
         text: String,
         /// 附件（图片等）。

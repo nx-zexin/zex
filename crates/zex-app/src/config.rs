@@ -48,6 +48,10 @@ pub struct ResolvedConfig {
     pub provider: ProviderConfig,
     /// 模型名。
     pub model: String,
+    /// 配置文件里声明的全部 provider（按名字索引）。
+    ///
+    /// 界面上的模型切换要能列出可选项，光有默认那一个不够。
+    pub all_providers: BTreeMap<String, ProviderConfig>,
 }
 
 /// Zex 的配置目录 `~/.zex`。
@@ -82,14 +86,18 @@ pub fn load() -> Result<ResolvedConfig> {
                 "通过环境变量配置时，还需要 ZEX_MODEL（例如 ZEX_MODEL=claude-sonnet-4-6）".into(),
             )
         })?;
+        let provider = ProviderConfig {
+            kind,
+            base_url,
+            api_key_env,
+            headers: BTreeMap::new(),
+        };
+        let mut all = BTreeMap::new();
+        all.insert(kind_str, provider.clone());
         return Ok(ResolvedConfig {
-            provider: ProviderConfig {
-                kind,
-                base_url,
-                api_key_env,
-                headers: BTreeMap::new(),
-            },
+            provider,
             model,
+            all_providers: all,
         });
     }
 
@@ -133,6 +141,22 @@ pub fn load() -> Result<ResolvedConfig> {
     })?;
 
     let kind = parse_kind(&entry.kind)?;
+    // 收集全部 provider 供界面列出
+    let mut all_providers = BTreeMap::new();
+    for (name, e) in &file.providers {
+        if let Ok(k) = parse_kind(&e.kind) {
+            all_providers.insert(
+                name.clone(),
+                ProviderConfig {
+                    kind: k,
+                    base_url: e.base_url.clone(),
+                    api_key_env: e.api_key_env.clone(),
+                    headers: e.headers.clone(),
+                },
+            );
+        }
+    }
+
     Ok(ResolvedConfig {
         provider: ProviderConfig {
             kind,
@@ -141,6 +165,7 @@ pub fn load() -> Result<ResolvedConfig> {
             headers: entry.headers.clone(),
         },
         model,
+        all_providers,
     })
 }
 
