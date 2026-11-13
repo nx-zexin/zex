@@ -25,9 +25,9 @@ use zex_core::{ApprovalId, ApprovalRequest, CoreEvent, RememberScope, UiCommand,
 /// `HistoryPrev`/`HistoryNext`：输入框为空时 ↑↓ 回溯指令历史。
 mod keys {
     #![allow(missing_docs)]
-    gpui_kit::actions!(zex, [InterruptTask, HistoryPrev, HistoryNext, HistorySearch, MenuPrev, MenuNext]);
+    gpui_kit::actions!(zex, [InterruptTask, HistorySearch]);
 }
-use keys::{HistoryNext, HistoryPrev, HistorySearch, InterruptTask, MenuNext, MenuPrev};
+use keys::{HistorySearch, InterruptTask};
 
 // ─── 配色（浅色主题）───
 // 取自设计稿：近白背景、极浅灰面板、橙色作为唯一强调色。
@@ -2701,6 +2701,35 @@ impl Render for ChatView {
         let mut root = div()
             .size_full()
             .relative()
+            // ↑↓ 必须在捕获阶段拦：输入框自己绑了 up/down（移动光标），
+            // 且它在焦点链上更近，普通 keybinding 抢不过它。
+            .capture_key_down(cx.listener(
+                |this, event: &KeyDownEvent, window, cx| {
+                    let key = event.keystroke.key.as_str();
+                    if key != "up" && key != "down" {
+                        return;
+                    }
+                    let is_up = key == "up";
+
+                    if this.menu_is_open() {
+                        let n = this.menu_items(cx).len();
+                        if is_up {
+                            this.menu_cursor = this.menu_cursor.saturating_sub(1);
+                        } else if this.menu_cursor + 1 < n {
+                            this.menu_cursor += 1;
+                        }
+                        cx.stop_propagation();
+                        cx.notify();
+                        return;
+                    }
+
+                    // 空输入时回溯历史；有内容就放行给输入框移动光标
+                    if this.input.read(cx).value().trim().is_empty() {
+                        this.recall_history(is_up, window, cx);
+                        cx.stop_propagation();
+                    }
+                },
+            ))
             // 拖文件进来：图片进上下文，其它按路径引用
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _window, cx| {
                 this.add_attachments(paths.paths(), cx);
@@ -2728,26 +2757,6 @@ impl Render for ChatView {
                     this.subagent_panel = None;
                     cx.notify();
                 }
-            }))
-            .on_action(cx.listener(|this, _: &HistoryPrev, window, cx| {
-                this.recall_history(true, window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &HistoryNext, window, cx| {
-                this.recall_history(false, window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &MenuPrev, _window, cx| {
-                if this.menu_cursor > 0 {
-                    this.menu_cursor -= 1;
-                }
-                cx.notify();
-            }))
-            .on_action(cx.listener(|this, _: &MenuNext, window, cx| {
-                let n = this.menu_items(cx).len();
-                if this.menu_cursor + 1 < n {
-                    this.menu_cursor += 1;
-                }
-                let _ = window;
-                cx.notify();
             }))
             .on_action(cx.listener(|this, _: &HistorySearch, _window, cx| {
                 this.history_search_open = !this.history_search_open;
@@ -3092,14 +3101,7 @@ fn main() {
                 // 去够鼠标点 ■ 那一下很别扭。
                 cx.bind_keys([
                     KeyBinding::new("escape", InterruptTask, Some("Zex")),
-                    // ↑↓ 只在输入框为空时回溯历史，否则会抢掉多行编辑里
-                    // 的光标移动
-                    KeyBinding::new("up", HistoryPrev, Some("ZexEmpty")),
-                    KeyBinding::new("down", HistoryNext, Some("ZexEmpty")),
                     KeyBinding::new("ctrl-r", HistorySearch, Some("Zex")),
-                    // 菜单打开时上下键在候选里走，不是回溯历史
-                    KeyBinding::new("up", MenuPrev, Some("ZexMenu")),
-                    KeyBinding::new("down", MenuNext, Some("ZexMenu")),
                 ]);
 
                 let tx = cmd_tx.clone();
