@@ -97,6 +97,43 @@ impl Store {
         })
     }
 
+    /// 列会话，但排除子智能体的会话。
+    ///
+    /// 子 agent 各自占一个会话（那样能追查它读了什么、跑了什么），
+    /// 但那是**实现细节**，不该出现在用户的会话列表里 —— 用户的侧栏
+    /// 是他自己的对话，不是内部调度日志。
+    ///
+    /// 排除依据是 `sub_agents` 表里登记的 session_id，不靠标题前缀猜。
+    pub fn list_visible_sessions(&self, limit: usize) -> Result<Vec<Session>> {
+        self.with_conn(|c| {
+            let mut stmt = c
+                .prepare(
+                    "SELECT id, title, model, cwd, created_at, updated_at
+                     FROM sessions
+                     WHERE id NOT IN (SELECT session_id FROM sub_agents)
+                     ORDER BY updated_at DESC LIMIT ?1",
+                )
+                .map_err(|e| Error::Store(e.to_string()))?;
+            let rows = stmt
+                .query_map(params![limit as i64], |r| {
+                    Ok(Session {
+                        id: SessionId::new(r.get::<_, String>(0)?),
+                        title: r.get(1)?,
+                        model: r.get(2)?,
+                        cwd: r.get(3)?,
+                        created_at: r.get(4)?,
+                        updated_at: r.get(5)?,
+                    })
+                })
+                .map_err(|e| Error::Store(e.to_string()))?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.map_err(|e| Error::Store(e.to_string()))?);
+            }
+            Ok(out)
+        })
+    }
+
     /// 改标题。
     pub fn rename_session(&self, id: &SessionId, title: &str) -> Result<()> {
         self.with_conn(|c| {
@@ -142,6 +179,30 @@ mod tests {
         let got = s.get_session(&ses.id).unwrap().unwrap();
         assert_eq!(got.title, "测试");
         assert_eq!(got.model, "deepseek-chat");
+    }
+
+    /// 子智能体占的会话不该出现在用户的会话列表里。
+    #[test]
+    fn visible_sessions_hide_subagent_sessions() {
+        let s = Store::in_memory().unwrap();
+        let mine = s.create_session("我的对话", "m", "/tmp").unwrap();
+        let child = s.create_session("子智能体 · coder-1", "m", "/tmp").unwrap();
+        s.upsert_sub_agent(
+            "coder-1",
+            "coder",
+            "干活",
+            child.id.as_str(),
+            crate::subagents::SubAgentState::Running,
+            None,
+        )
+        .unwrap();
+
+        let all = s.list_sessions(20).unwrap();
+        assert_eq!(all.len(), 2, "底层还是要能查到全部");
+
+        let visible = s.list_visible_sessions(20).unwrap();
+        assert_eq!(visible.len(), 1, "侧栏只该看到自己的会话");
+        assert_eq!(visible[0].id, mine.id);
     }
 
     #[test]

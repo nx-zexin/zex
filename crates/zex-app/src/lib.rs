@@ -57,7 +57,7 @@ pub fn build_agent_resuming(cfg: &ResolvedConfig, cwd: PathBuf) -> zex_core::Res
     // 跳过空会话：每次启动都会留下一个没说话的会话壳，
     // 直接恢复它会让用户以为历史丢了。
     let latest = store
-        .list_sessions(8)?
+        .list_visible_sessions(8)?
         .into_iter()
         .find(|s| !store.load_messages(&s.id).map(|m| m.is_empty()).unwrap_or(true));
 
@@ -166,7 +166,7 @@ pub struct CoreHandles {
 fn session_summaries(agent: &Agent) -> Vec<zex_core::event::SessionSummary> {
     agent
         .store()
-        .list_sessions(20)
+        .list_visible_sessions(20)
         .unwrap_or_default()
         .into_iter()
         .map(|s| zex_core::event::SessionSummary {
@@ -321,7 +321,7 @@ pub fn spawn_core(mut agent: Agent) -> CoreHandles {
                                     // 删掉的正是当前会话：换个地方落脚，
                                     // 否则 UI 会停在一个已经不存在的会话上
                                     if was_active {
-                                        match agent.store().list_sessions(1) {
+                                        match agent.store().list_visible_sessions(1) {
                                             Ok(list) if !list.is_empty() => {
                                                 let _ = agent.switch_session(list[0].id.clone());
                                             }

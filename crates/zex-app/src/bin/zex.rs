@@ -1939,7 +1939,7 @@ fn load_tasks(store: &zex_store::Store) -> Vec<zex_store::tasks::TaskRecord> {
 
 fn load_sessions(store: &zex_store::Store) -> Vec<SessionItem> {
     store
-        .list_sessions(20)
+        .list_visible_sessions(20)
         .unwrap_or_default()
         .into_iter()
         .map(|s| {
