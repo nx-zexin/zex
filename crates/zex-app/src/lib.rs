@@ -464,6 +464,17 @@ async fn run_task(
         }
     };
 
+    // 先给个能看的标题：GLM/DeepSeek 这类模型跑长任务时，
+    // 等整轮结束再命名，侧栏会空白好几分钟。
+    if let Ok(Some(t)) = agent.quick_title(&text) {
+        let _ = ev_tx
+            .send(CoreEvent::SessionTitled {
+                session: session.to_string(),
+                title: t,
+            })
+            .await;
+    }
+
     let outcome = agent.run_turn(text, Some(&ev_tx)).await;
 
     match &outcome {

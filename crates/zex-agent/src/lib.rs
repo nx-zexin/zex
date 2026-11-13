@@ -191,14 +191,32 @@ impl Agent {
     /// 用一次独立的小请求（不带工具、输出上限很小）。返回 `Some(标题)`
     /// 表示已在库里写好；任何一步失败都返回 `Ok(None)` —— 起标题是锦上
     /// 添花，不该让主流程报错。
-    pub async fn maybe_autotitle(&self) -> Result<Option<String>> {
-        // 已有标题就不覆盖：用户手动改过的名字更该留住
-        if let Some(s) = self.store.get_session(&self.session)? {
-            if !s.title.trim().is_empty() {
-                return Ok(None);
-            }
+    /// 先用第一句话立刻起个标题，不等模型。
+    ///
+    /// 自动命名原本只看模型返回，而模型调用发生在整轮结束之后 ——
+    /// 一个跑十分钟的任务，侧栏就空白十分钟。先给个粗标题，
+    /// 之后 [`Self::maybe_autotitle`] 再用模型结果覆盖它。
+    ///
+    /// 返回 `Some(title)` 表示这次确实写了标题（供 UI 立即刷新）。
+    pub fn quick_title(&self, first_input: &str) -> Result<Option<String>> {
+        let Some(s) = self.store.get_session(&self.session)? else {
+            return Ok(None);
+        };
+        if !s.title.trim().is_empty() {
+            return Ok(None);
         }
+        if first_input.trim().is_empty() {
+            return Ok(None);
+        }
+        let title = truncate_chars(first_input.trim(), 20);
+        if title.is_empty() {
+            return Ok(None);
+        }
+        self.store.rename_session(&self.session, &title)?;
+        Ok(Some(title))
+    }
 
+    pub async fn maybe_autotitle(&self) -> Result<Option<String>> {
         // 只给"刚开始"的会话起名。历史一长，第一条往往是「你好」，
         // 拿它当标题既不贴切也没意义 —— 那种情况留给用户手动改。
         let user_turns = self
@@ -221,6 +239,16 @@ impl Agent {
         else {
             return Ok(None);
         };
+
+        // 已有标题就不覆盖 —— 但「首句截断」那个兜底标题除外，
+        // 它本来就是占位，模型给出的更好就该换掉。
+        let fallback = truncate_chars(user_text.trim(), 20);
+        if let Some(s) = self.store.get_session(&self.session)? {
+            let existing = s.title.trim();
+            if !existing.is_empty() && existing != fallback {
+                return Ok(None);
+            }
+        }
 
         let assistant_text = self
             .history
@@ -246,12 +274,19 @@ impl Agent {
                 "用不超过 12 个汉字概括下面这段对话的主题：\n\n{excerpt}"
             ))],
             tools: Vec::new(),
-            max_tokens: 48,
+            // 推理模型（deepseek-flash 之类）会先花 token 思考再输出，
+            // 48 会被 thinking 吃光、正文为空。留够余量。
+            max_tokens: 512,
             temperature: Some(0.2),
         };
 
-        let mut stream =
-            zex_llm::stream_chat(&self.http, &self.cfg.provider, &self.cfg.model, req).await?;
+        let mut stream = match zex_llm::stream_chat(&self.http, &self.cfg.provider, &self.cfg.model, req).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(target: "autotitle", error = %e, "起名请求失败");
+                return Err(e);
+            }
+        };
         let mut raw = String::new();
         while let Some(item) = stream.next().await {
             if let StreamEvent::Text(t) = item? {
@@ -259,9 +294,16 @@ impl Agent {
             }
         }
 
-        let title = clean_title(&raw);
+        let mut title = clean_title(&raw);
         if title.is_empty() {
-            return Ok(None);
+            // 模型没给出可用标题（空回复、网络抖动、推理模型把 token
+            // 花在了 thinking 上…）。退回到用户第一句话的截断 ——
+            // 有标题总比侧栏一片「会话 3f8a2c」强。
+            tracing::warn!(target: "autotitle", "模型未返回可用标题，改用首句截断");
+            title = truncate_chars(user_text.trim(), 20);
+            if title.is_empty() {
+                return Ok(None);
+            }
         }
         self.store.rename_session(&self.session, &title)?;
         tracing::info!(session = %self.session, title = %title, "自动生成会话标题");
@@ -592,8 +634,13 @@ impl Agent {
         turn: &TurnId,
         events: Option<&mpsc::Sender<CoreEvent>>,
     ) -> Result<(String, String, Vec<zex_core::ToolCall>, Usage)> {
-        let mut stream =
-            zex_llm::stream_chat(&self.http, &self.cfg.provider, &self.cfg.model, req).await?;
+        let mut stream = match zex_llm::stream_chat(&self.http, &self.cfg.provider, &self.cfg.model, req).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(target: "autotitle", error = %e, "起名请求失败");
+                return Err(e);
+            }
+        };
 
         let mut acc = zex_llm::Accumulator::default();
         while let Some(item) = stream.next().await {
@@ -1021,5 +1068,32 @@ mod tests {
         agent.clear().unwrap();
         assert!(agent.history().is_empty());
         assert_eq!(store.count_messages(&sid).unwrap(), 0);
+    }
+}
+
+#[cfg(test)]
+mod autotitle_tests {
+    use super::*;
+
+    /// 模型回空时不该让会话永远没有标题 —— 用户第一句的截断就是兜底。
+    #[test]
+    fn empty_model_reply_falls_back_to_first_line() {
+        let raw = "";
+        let user_text = "帮我分析一下这个项目的功能，看看有没有明显的架构问题";
+        let mut title = clean_title(raw);
+        assert!(title.is_empty(), "前提：模型没给东西");
+        if title.is_empty() {
+            title = truncate_chars(user_text.trim(), 20);
+        }
+        assert!(!title.is_empty());
+        // truncate_chars 会补一个省略号
+        assert!(title.chars().count() <= 21, "标题要短: {title}");
+    }
+
+    #[test]
+    fn model_reply_wins_over_fallback() {
+        let title = clean_title("Rust语言一句话简介");
+        assert_eq!(title, "Rust语言一句话简介");
+        assert!(!title.is_empty());
     }
 }
