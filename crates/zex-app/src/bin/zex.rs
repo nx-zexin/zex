@@ -2856,6 +2856,43 @@ impl ChatView {
             }
         };
 
+        // 选文件/图片：拖拽之外的第二条入口。
+        // 拖拽对触控板和远程桌面都不友好，没有按钮等于没有这个功能。
+        let attach_btn = Button::new("pick-attachments")
+            .ghost()
+            .icon(Icon::default().path("icons/paperclip.svg"))
+            .tooltip("添加附件")
+            .on_click(cx.listener(|_this, _: &ClickEvent, _w, cx| {
+                let rx = cx.prompt_for_paths(gpui_kit::PathPromptOptions {
+                    files: true,
+                    directories: false,
+                    multiple: true,
+                    prompt: Some("选择要添加的文件".into()),
+                });
+                cx.spawn(async move |this, cx| {
+                    match rx.await {
+                        Ok(Ok(Some(paths))) => {
+                            this.update(cx, |this, cx| this.add_attachments(&paths, cx))
+                                .ok();
+                        }
+                        // 用户取消：什么都不做
+                        Ok(Ok(None)) => {}
+                        // Linux 上没有 xdg-desktop-portal 就会走到这里，
+                        // 静默失败的话用户只会觉得「按钮是坏的」
+                        Ok(Err(e)) => {
+                            this.update(cx, |this, cx| {
+                                this.status = format!("打开文件选择器失败：{e}");
+                                cx.notify();
+                            })
+                            .ok();
+                        }
+                        Err(_) => {}
+                    }
+                })
+                .detach();
+            }))
+            .into_any_element();
+
         composer.child(
             div()
                 .relative()
@@ -2883,6 +2920,8 @@ impl ChatView {
                         .flex()
                         .items_center()
                         .gap_2()
+                        .children(team_entry)
+                        .child(model_picker)
                         .child(voice_btn)
                         .child(send_btn),
                 )
@@ -2896,9 +2935,8 @@ impl ChatView {
                         .flex()
                         .items_center()
                         .gap_2()
-                        .child(model_picker)
-                        .child(mode_picker)
-                        .children(team_entry),
+                        .child(attach_btn)
+                        .child(mode_picker),
                 ),
         )
             .child(
