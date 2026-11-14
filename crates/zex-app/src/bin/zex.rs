@@ -1656,10 +1656,9 @@ fn merge_tool_result(items: &mut [MsgItem], ok: bool, output: String) -> bool {
 ///
 /// 用四个反引号而不是三个：工具输出里常有 ``` （diff、markdown 文件），
 /// 三个反引号会被提前闭合，后面的内容全变成正文。
-fn as_code_block(text: &str) -> String {
-    // 不写语言名：否则右上角会挂一个 "text" 标签，
-    // 对工具输出这种一闪而过的内容来说纯属噪音
-    format!("````\n{text}\n````")
+fn as_code_block(text: &str, lang: &str) -> String {
+    // 语言名决定高亮器用哪套规则；空串表示不做高亮
+    format!("````{lang}\n{text}\n````")
 }
 
 /// 工具卡片里代码块的样式：无边框、和主信息流同色。
@@ -1681,9 +1680,51 @@ fn md_style_flat(scale: f32) -> TextViewStyle {
     md_style(scale).code_block(s)
 }
 
+/// 代码块高亮用的主题。
+///
+/// 必须是**另一个 Arc**：组件库里拿 `Arc::ptr_eq` 和默认主题比对，
+/// 相同就认为"调用方没设置"，直接不挂高亮器。所以这里克隆一份
+/// 内容相同但地址不同的实例，且只建一次 —— 每帧新建会让代码块
+/// 每帧重新解析。
+fn hl_theme() -> std::sync::Arc<gpui_kit::component::highlighter::HighlightTheme> {
+    static HL: std::sync::OnceLock<std::sync::Arc<gpui_kit::component::highlighter::HighlightTheme>> =
+        std::sync::OnceLock::new();
+    HL.get_or_init(|| {
+        std::sync::Arc::new((*gpui_kit::component::highlighter::HighlightTheme::default_light()).clone())
+    })
+    .clone()
+}
+
+/// 从工具参数里猜语言，用于高亮结果块。
+///
+/// 只做后缀映射：猜错比猜对更容易误导（把 shell 输出标成 bash 会让
+/// 大段文字被当成注释染色），所以认不出来就不标。
+fn lang_from_args(args: &str) -> &'static str {
+    const MAP: &[(&str, &str)] = &[
+        (".rs", "rust"),
+        (".toml", "toml"),
+        (".json", "json"),
+        (".py", "python"),
+        (".js", "javascript"),
+        (".ts", "typescript"),
+        (".tsx", "tsx"),
+        (".go", "go"),
+        (".md", "markdown"),
+        (".yml", "yaml"),
+        (".yaml", "yaml"),
+        (".sh", "bash"),
+        (".html", "html"),
+        (".css", "css"),
+    ];
+    MAP.iter()
+        .find(|(ext, _)| args.contains(ext))
+        .map(|(_, lang)| *lang)
+        .unwrap_or("")
+}
+
 /// 消息里 markdown 的统一样式：标题压层级、代码块不夺目。
 fn md_style(scale: f32) -> TextViewStyle {
-    TextViewStyle::default()
+    let mut st = TextViewStyle::default()
         .heading_font_size(move |level, _base| {
             let size = match level {
                 1 => 19.0,
@@ -1699,7 +1740,11 @@ fn md_style(scale: f32) -> TextViewStyle {
             let mut s = StyleRefinement::default();
             s.background = Some(gpui_kit::Hsla::transparent_black().into());
             s
-        })
+        });
+    // 不设这个的话代码块永远是纯色文本：组件库拿 Arc 指针判断
+    // 「调用方有没有换过主题」，指针相同就当没设置
+    st.highlight_theme = hl_theme();
+    st
 }
 
 /// 一条消息的右键菜单。
@@ -1933,7 +1978,7 @@ impl ChatView {
                         body = body.child(
                             TextView::markdown(
                                 ElementId::Name(format!("md-call-{idx}").into()),
-                                as_code_block(args),
+                                as_code_block(args, "json"),
                             )
                             .text_size(px(12.5))
                             .line_height(px(19.0))
@@ -1953,7 +1998,10 @@ impl ChatView {
                             body = body.child(
                                 TextView::markdown(
                                     ElementId::Name(format!("md-out-{idx}").into()),
-                                    as_code_block(&truncate_for_display(&r.output, 4000)),
+                                    as_code_block(
+                                        &truncate_for_display(&r.output, 4000),
+                                        lang_from_args(args),
+                                    ),
                                 )
                                 .text_size(px(12.5))
                                 .line_height(px(19.0))
