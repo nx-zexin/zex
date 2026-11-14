@@ -1668,17 +1668,16 @@ fn as_code_block(text: &str) -> String {
 /// 那是另一层可以点开的东西 —— 它就该是连成一片的正文。
 fn md_style_flat(scale: f32) -> TextViewStyle {
     let mut s = StyleRefinement::default();
-    // 跟着卡片底色走，不另铺一层：在灰卡上开一块白，比原来的
-    // 小卡片更扎眼
-    s.background = Some(rgb(BG_RESULT).into());
-    // 四个边都显式设 0：默认的 EdgesRefinement 是"不覆盖"，
-    // 不写死的话主题给的 1px 边框还在
+    // 白底托在灰卡上，再用一道浅边勾出范围：
+    // 纯靠底色差分层在浅色主题下几乎看不出来
+    s.background = Some(rgb(BG_MAIN).into());
     s.border_widths = EdgesRefinement {
-        top: Some(AbsoluteLength::from(px(0.))),
-        right: Some(AbsoluteLength::from(px(0.))),
-        bottom: Some(AbsoluteLength::from(px(0.))),
-        left: Some(AbsoluteLength::from(px(0.))),
+        top: Some(AbsoluteLength::from(px(1.))),
+        right: Some(AbsoluteLength::from(px(1.))),
+        bottom: Some(AbsoluteLength::from(px(1.))),
+        left: Some(AbsoluteLength::from(px(1.))),
     };
+    s.border_color = Some(rgb(BORDER_SOFT).into());
     md_style(scale).code_block(s)
 }
 
