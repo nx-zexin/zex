@@ -1662,6 +1662,24 @@ fn as_code_block(text: &str) -> String {
     format!("````\n{text}\n````")
 }
 
+/// 工具卡片里代码块的样式：无边框、和主信息流同色。
+///
+/// 工具输出不是"代码片段"，套上卡片式的底和边只会让人以为
+/// 那是另一层可以点开的东西 —— 它就该是连成一片的正文。
+fn md_style_flat(scale: f32) -> TextViewStyle {
+    let mut s = StyleRefinement::default();
+    s.background = Some(rgb(BG_MAIN).into());
+    // 四个边都显式设 0：默认的 EdgesRefinement 是"不覆盖"，
+    // 不写死的话主题给的 1px 边框还在
+    s.border_widths = EdgesRefinement {
+        top: Some(AbsoluteLength::from(px(0.))),
+        right: Some(AbsoluteLength::from(px(0.))),
+        bottom: Some(AbsoluteLength::from(px(0.))),
+        left: Some(AbsoluteLength::from(px(0.))),
+    };
+    md_style(scale).code_block(s)
+}
+
 /// 消息里 markdown 的统一样式：标题压层级、代码块不夺目。
 fn md_style(scale: f32) -> TextViewStyle {
     TextViewStyle::default()
@@ -1904,7 +1922,9 @@ impl ChatView {
                     .rounded_lg()
                     .border_1()
                     .border_color(rgb(BORDER_SOFT))
-                    .bg(rgb(BG_RESULT))
+                    // 和主信息流同色：工具卡只是"折起来的一段过程"，
+                    // 铺一层底色反而像个独立区块
+                    .bg(rgb(BG_MAIN))
                     .overflow_hidden()
                     .child(head);
 
@@ -1919,7 +1939,7 @@ impl ChatView {
                             .text_size(px(12.5))
                             .line_height(px(19.0))
                             .text_color(rgb(TEXT))
-                            .style(md_style(1.0)),
+                            .style(md_style_flat(1.0)),
                         );
                     }
                     match result {
@@ -1939,7 +1959,7 @@ impl ChatView {
                                 .text_size(px(12.5))
                                 .line_height(px(19.0))
                                 .text_color(rgb(TEXT_MUTED))
-                                .style(md_style(1.0)),
+                                .style(md_style_flat(1.0)),
                             );
                         }
                         None => {
