@@ -173,6 +173,8 @@ struct ChatView {
     subagent_panel: Option<SubAgentPanel>,
     /// 待发送的附件。
     attachments: Vec<Attachment>,
+    /// 上一次输入的长度，用来发现"粘进来一大段"。
+    last_input_len: usize,
     /// 正在录音。
     recording: Option<zex_voice::Recording>,
     /// 正在等转写结果。
@@ -233,6 +235,8 @@ impl ChatView {
         let input = cx.new(|cx| {
             TextareaState::new(window, cx).placeholder("请输入您的指令，或选择一个快捷操作…")
         });
+        // 在 active_session 被移进结构体之前先把历史捞出来
+        let restored_history = load_input_history(&store, &active_session);
         let rename_input = cx.new(|cx| InputState::new(window, cx).placeholder("会话标题"));
         let model_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder("provider/model，例如 deepseek/deepseek-flash")
@@ -246,9 +250,20 @@ impl ChatView {
                     this.submit(window, cx);
                 }
             }
+            // 焦点变化要重绘，否则高亮边框不跟手
+            if matches!(ev, InputEvent::Focus | InputEvent::Blur) {
+                cx.notify();
+            }
             // 以 / 开头就亮出命令菜单
             if let InputEvent::Change = ev {
                 let v = this.input.read(cx).value();
+                // 一次增加几百字基本只可能是粘贴 —— 提一句，
+                // 免得用户以为界面卡了
+                let len = v.chars().count();
+                if len > this.last_input_len + 500 {
+                    this.status = format!("已插入 {} 字", len - this.last_input_len);
+                }
+                this.last_input_len = len;
                 let v = v.trim_start();
                 this.slash_open = v.starts_with('/') && !v.contains(' ');
                 // 候选集变了，游标回到第一项
@@ -311,7 +326,7 @@ impl ChatView {
         // 打开就先看工作台：用户想知道「我不在的时候发生了什么」
         let mode = ViewMode::Dashboard;
 
-        ChatView {
+        let view = ChatView {
             input,
             tasks,
             mode,
@@ -331,6 +346,7 @@ impl ChatView {
             team: Vec::new(),
             subagent_panel: None,
             attachments: Vec::new(),
+            last_input_len: 0,
             recording: None,
             transcribing: false,
             slash_open: false,
@@ -342,7 +358,7 @@ impl ChatView {
             available_models,
             editing_model: false,
             model_input,
-            input_history: Vec::new(),
+            input_history: restored_history,
             history_cursor: None,
             history_draft: String::new(),
             team_collapsed: false,
@@ -351,7 +367,12 @@ impl ChatView {
             cwd,
             model,
             usage: Usage::default(),
-        }
+        };
+
+        // 打开就能打字：否则用户要先点一下输入框，
+        // 而这是整个应用唯一的入口
+        window.focus(&view.input.focus_handle(cx), cx);
+        view
     }
 
     /// 就地重命名：把输入框里的标题发给内核。
@@ -1423,6 +1444,10 @@ impl ChatView {
                 self.messages = history_to_items(&history);
                 self.active_session = session.clone();
                 self.sessions = summaries_to_items(&sessions);
+                // 每个会话有自己的指令史，切过去要换一份
+                self.input_history = load_input_history(&self.store, &session);
+                self.history_cursor = None;
+                self.history_draft.clear();
                 // 这个会话之前在后台等过授权？现在摆出来。
                 self.show_next_approval(cx);
                 // 切了会话就是要聊，从工作台进对话
@@ -1697,7 +1722,7 @@ impl ChatView {
     }
 
     /// 工作台：离开期间发生了什么。
-    fn render_dashboard(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_dashboard(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         use zex_store::tasks::TaskStatus;
 
         let running: Vec<_> = self
@@ -1760,7 +1785,7 @@ impl ChatView {
         // ─── 新任务输入 ───
         // 放在最上方：打开工作台的第一件事通常是派活，
         // 而不是先翻旧任务。
-        col = col.child(self.render_composer(cx));
+        col = col.child(self.render_composer(window, cx));
 
         // ─── 需要处理（失败） ───
         if !failed.is_empty() {
@@ -2466,7 +2491,7 @@ impl ChatView {
             .into_any_element()
     }
 
-    fn render_composer(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_composer(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         // 附件条：有东西才占位
         let mut attach_row = div().flex().items_center().gap_2().flex_wrap();
         for (i, a) in self.attachments.iter().enumerate() {
@@ -2509,6 +2534,15 @@ impl ChatView {
                     ),
             );
         }
+
+        // 聚焦时边框变品牌色：输入框是主交互面，得让人一眼看出
+        // 现在敲的字会去哪儿
+        let focused = self
+            .input
+            .read(cx)
+            .focus_handle(cx)
+            .contains_focused(window, cx);
+        let border = if focused { BRAND } else { BORDER };
 
         let mut composer = div().flex().flex_col().gap_2();
 
@@ -2557,7 +2591,7 @@ impl ChatView {
                             .flex_1()
                             .rounded(px(14.0))
                             .border_1()
-                            .border_color(rgb(BORDER))
+                            .border_color(rgb(border))
                             .bg(rgb(BG_INPUT))
                             .px_4()
                             .py_2()
@@ -2635,6 +2669,12 @@ impl ChatView {
                                 .into_any_element()
                         }
                     })
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(TEXT_DIM))
+                            .child("Enter 发送 · Shift+Enter 换行 · @ 引文件 · / 命令"),
+                    )
                     .child({
                         // 输入预估 + 已消耗，两件事分开显示
                         let typed = estimate_tokens(&self.input.read(cx).value());
@@ -2757,7 +2797,7 @@ impl ChatView {
 }
 
 impl Render for ChatView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // ─── 顶部状态栏 ───
         let status_dot_color = if self.status == "Ready" { OK } else { BRAND };
         let status_bg = if self.status == "Ready" { OK_SOFT } else { BRAND_SOFT };
@@ -2846,7 +2886,7 @@ impl Render for ChatView {
         if self.approval.is_some() {
             bottom = bottom.child(self.render_approval(cx));
         }
-        bottom = bottom.child(self.render_composer(cx));
+        bottom = bottom.child(self.render_composer(window, cx));
 
         let mut root = div()
             .size_full()
@@ -2925,7 +2965,7 @@ impl Render for ChatView {
                     .flex_col()
                     .child(header)
                     .child(match self.mode {
-                        ViewMode::Dashboard => self.render_dashboard(cx),
+                        ViewMode::Dashboard => self.render_dashboard(window, cx),
                         ViewMode::Chat => {
                             if self.team.is_empty() {
                                 feed.into_any_element()
@@ -3147,6 +3187,33 @@ fn load_tasks(store: &zex_store::Store) -> Vec<zex_store::tasks::TaskRecord> {
 ///
 /// 和主对话用的是同一套 `history_to_items`，保证子智能体的面板里
 /// 工具卡片、结果卡片长得和主对话一致。
+/// 从库里捞本会话发过的指令，给 ↑ 回溯用。
+///
+/// 只留在内存里的话，重启就没了 —— 而"上周我让它干过什么"
+/// 恰恰是最想翻回来重跑的东西。
+fn load_input_history(store: &zex_store::Store, session: &str) -> Vec<String> {
+    let sid = zex_core::SessionId::from(session);
+    let stored = store.load_messages(&sid).unwrap_or_default();
+    stored
+        .into_iter()
+        .filter_map(|s| match s.message {
+            zex_core::Message::User { content } => {
+                let text: String = content
+                    .iter()
+                    .filter_map(|p| match p {
+                        zex_core::message::Part::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("");
+                let t = text.trim().to_string();
+                if t.is_empty() { None } else { Some(t) }
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 fn load_session_items(store: &zex_store::Store, session: &str) -> Vec<MsgItem> {
     let sid = zex_core::SessionId::from(session);
     let stored = store.load_messages(&sid).unwrap_or_default();
