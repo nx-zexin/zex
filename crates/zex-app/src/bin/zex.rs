@@ -368,7 +368,7 @@ impl ChatView {
             selected_model: None,
             models_by_provider,
             active_provider,
-            run_mode: zex_core::RunMode::Normal,
+            run_mode: zex_core::RunMode::Confirm,
             editing_model: false,
             model_input,
             input_history: restored_history,
@@ -2753,33 +2753,68 @@ impl ChatView {
             let view = cx.entity().downgrade();
             Button::new("run-mode")
                 .ghost()
+                .icon(Icon::default().path(mode_icon_path(cur)))
                 .label(cur.label())
                 .dropdown_caret(true)
                 .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _window, _cx| {
-                    let mut menu = menu;
+                    // 每项两行：名字 + 一句话。光看名字，
+                    // 「自动编辑」和「完全访问」差在哪没人猜得出来。
+                    let mut menu = menu.min_w(px(240.0));
                     for m in zex_core::RunMode::all() {
                         let view = view.clone();
+                        let selected = m == cur;
                         menu = menu.item(
-                            PopupMenuItem::new(m.label())
-                                .checked(m == cur)
-                                .on_click(move |_, _w, cx| {
-                                    view.update(cx, |this, cx| {
-                                        this.run_mode = m;
-                                        let sid = zex_core::SessionId::from(
-                                            this.active_session.clone(),
-                                        );
-                                        let _ = this.store.set_session_mode(&sid, m);
-                                        if let Some(item) = this
-                                            .sessions
-                                            .iter_mut()
-                                            .find(|s| s.id == this.active_session)
-                                        {
-                                            item.mode = m;
-                                        }
-                                        cx.notify();
-                                    })
-                                    .ok();
-                                }),
+                            PopupMenuItem::element(move |_w, _c| {
+                                let mut row = div()
+                                    .flex()
+                                    .items_start()
+                                    .gap_3()
+                                    .w_full()
+                                    .child(
+                                        Icon::default().path(mode_icon_path(m))
+                                            .text_size(px(18.0))
+                                            .text_color(rgb(TEXT_MUTED)),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .flex()
+                                            .flex_col()
+                                            .gap(px(2.0))
+                                            .child(div().text_sm().child(m.label()))
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(rgb(TEXT_DIM))
+                                                    .child(m.description()),
+                                            ),
+                                    );
+                                if selected {
+                                    row = row.child(
+                                        Icon::new(IconName::Check)
+                                            .text_size(px(14.0))
+                                            .text_color(rgb(TEXT_MUTED)),
+                                    );
+                                }
+                                row
+                            })
+                            .on_click(move |_, _w, cx| {
+                                view.update(cx, |this, cx| {
+                                    this.run_mode = m;
+                                    let sid =
+                                        zex_core::SessionId::from(this.active_session.clone());
+                                    let _ = this.store.set_session_mode(&sid, m);
+                                    if let Some(item) = this
+                                        .sessions
+                                        .iter_mut()
+                                        .find(|s| s.id == this.active_session)
+                                    {
+                                        item.mode = m;
+                                    }
+                                    cx.notify();
+                                })
+                                .ok();
+                            }),
                         );
                     }
                     menu
@@ -3392,6 +3427,19 @@ fn load_session_items(store: &zex_store::Store, session: &str) -> Vec<MsgItem> {
     let stored = store.load_messages(&sid).unwrap_or_default();
     let msgs: Vec<zex_core::Message> = stored.into_iter().map(|s| s.message).collect();
     history_to_items(&msgs)
+}
+
+/// 运行模式对应的图标。
+///
+/// 引用 `AllAssets` 里的完整 Lucide 目录：`IconName` 枚举只覆盖组件默认的
+/// 106 个，手掌/盾牌这些不在其中，但资源文件在，直接给路径即可。
+fn mode_icon_path(mode: zex_core::RunMode) -> &'static str {
+    match mode {
+        zex_core::RunMode::Confirm => "icons/hand.svg",
+        zex_core::RunMode::AutoEdit => "icons/shield-check.svg",
+        zex_core::RunMode::Plan => "icons/clipboard-list.svg",
+        zex_core::RunMode::FullAccess => "icons/shield-alert.svg",
+    }
 }
 
 fn load_sessions(store: &zex_store::Store) -> Vec<SessionItem> {

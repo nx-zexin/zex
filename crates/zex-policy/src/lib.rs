@@ -125,7 +125,7 @@ impl Policy {
         // 必须早于 grant 与风险上调，否则“上调后提前 return”会绕过它。
         if mode == Mode::Plan && spec.risk != Risk::ReadOnly {
             return Verdict::Deny {
-                reason: "当前处于计划模式（只读），不允许执行会改变状态的操作".into(),
+                reason: "计划模式下只读不写：先把方案说清楚，再切模式动手".into(),
             };
         }
 
@@ -149,7 +149,9 @@ impl Policy {
         }
 
         if escalated {
-            let bump = match default_verdict(effective) {
+            // 被规则上调的调用一律要问，**任何模式都不豁免**：
+            // "完全访问"放宽的是常规命令，不是换了张脸的高危形态。
+            let bump = match mode_verdict(Mode::Confirm, effective) {
                 Verdict::Ask {
                     grantable,
                     double_confirm,
@@ -165,30 +167,66 @@ impl Policy {
             };
         }
 
-        default_verdict(effective)
+        mode_verdict(mode, effective)
     }
 }
 
-/// 静态风险 → 默认判定。
-fn default_verdict(risk: Risk) -> Verdict {
-    match risk {
-        Risk::ReadOnly => Verdict::Allow {
+/// 运行模式 × 静态风险 → 默认判定。
+///
+/// 两条不随模式变化的底线：
+/// - **L0 永远放行**：读不需要许可，任何模式都不该把只读拦下来；
+/// - **L3 永远逐次确认**：不可逆的事没有"自动"可言，
+///   "完全访问"减的是确认次数，不是把不可逆变成可逆。
+///
+/// 中间两档才是模式真正起作用的地方：
+///
+/// | 模式 | L1 可逆（写文件） | L2 有影响（跑命令） |
+/// |------|------------------|--------------------|
+/// | 变更前确认 | 问 | 问 |
+/// | 自动编辑 | 自动 + 快照 | 问 |
+/// | 完全访问 | 自动 + 快照 | 自动 + 快照 |
+fn mode_verdict(mode: Mode, risk: Risk) -> Verdict {
+    if risk == Risk::ReadOnly {
+        return Verdict::Allow {
             snapshot: false,
             by: ApprovedBy::Auto,
+        };
+    }
+    if risk == Risk::Destructive {
+        return Verdict::Ask {
+            reason: "该操作不可逆，且可能造成数据丢失".into(),
+            grantable: false, // L3 永不可记忆
+            double_confirm: true,
+        };
+    }
+    // Plan 已在 evaluate 里提前拒绝，这里只剩 Reversible / Impactful
+    match (mode, risk) {
+        (Mode::Confirm, Risk::Reversible) => Verdict::Ask {
+            reason: "这个操作会修改文件".into(),
+            grantable: true,
+            double_confirm: false,
         },
-        Risk::Reversible => Verdict::Allow {
-            snapshot: true,
-            by: ApprovedBy::Auto,
-        },
-        Risk::Impactful => Verdict::Ask {
+        (Mode::Confirm, _) => Verdict::Ask {
             reason: "该操作会改变系统状态".into(),
             grantable: true,
             double_confirm: false,
         },
-        Risk::Destructive => Verdict::Ask {
-            reason: "该操作不可逆，且可能造成数据丢失".into(),
-            grantable: false, // L3 永不可记忆
-            double_confirm: true,
+        (Mode::AutoEdit, Risk::Reversible) => Verdict::Allow {
+            snapshot: true,
+            by: ApprovedBy::Auto,
+        },
+        (Mode::AutoEdit, _) => Verdict::Ask {
+            reason: "该操作会改变系统状态".into(),
+            grantable: true,
+            double_confirm: false,
+        },
+        (Mode::FullAccess, _) => Verdict::Allow {
+            snapshot: true,
+            by: ApprovedBy::Auto,
+        },
+        // Plan 走不到这里；真走到了按最保守处理
+        (Mode::Plan, _) => Verdict::Deny {
+            reason: "计划模式下只读不写：先把方案说清楚，再切模式动手".into(),
         },
     }
 }
@@ -218,21 +256,22 @@ mod tests {
         let v = p.evaluate(
             &spec("fs_write", Risk::Reversible),
             &serde_json::json!({"path": "/srv/zex-probe.txt"}),
-            Mode::Normal,
+            Mode::Confirm,
         );
         assert!(matches!(v, Verdict::Ask { .. }), "应为 Ask，实际 {v:?}");
     }
 
     #[test]
     fn temp_dir_write_is_allowed() {
-        // 反面：临时目录不该弹审批，否则正常干活会被打断
+        // 临时目录是正常工作位置：自动编辑下照常放行，不该因为"在 /tmp"
+        // 被额外升成强确认
         let p = policy();
         let v = p.evaluate(
             &spec("fs_write", Risk::Reversible),
             &serde_json::json!({"path": "/tmp/zex-probe.txt"}),
-            Mode::Normal,
+            Mode::AutoEdit,
         );
-        assert!(v.is_allow());
+        assert!(v.is_allow(), "得到 {v:?}");
     }
 
     #[test]
@@ -241,7 +280,7 @@ mod tests {
         let v = p.evaluate(
             &spec("fs_write", Risk::Reversible),
             &serde_json::json!({"path": "/usr/local/bin/zex"}),
-            Mode::Normal,
+            Mode::Confirm,
         );
         assert!(matches!(v, Verdict::Deny { .. }), "应为 Deny，实际 {v:?}");
     }
@@ -252,22 +291,90 @@ mod tests {
         let v = p.evaluate(
             &spec("fs_read", Risk::ReadOnly),
             &serde_json::json!({}),
-            Mode::Normal,
+            Mode::Confirm,
         );
         assert!(v.is_allow());
         assert!(!v.needs_snapshot());
     }
 
     #[test]
-    fn reversible_is_allowed_with_snapshot() {
+    fn reversible_is_allowed_with_snapshot_under_auto_edit() {
+        // 「自动编辑」的全部意义：写文件不再问，但仍然留快照
         let p = policy();
         let v = p.evaluate(
             &spec("fs_write", Risk::Reversible),
             &serde_json::json!({}),
-            Mode::Normal,
+            Mode::AutoEdit,
         );
         assert!(v.is_allow());
         assert!(v.needs_snapshot());
+    }
+
+    #[test]
+    fn reversible_asks_under_confirm() {
+        // 「变更前确认」：改文件之前先问
+        let p = policy();
+        let v = p.evaluate(
+            &spec("fs_write", Risk::Reversible),
+            &serde_json::json!({}),
+            Mode::Confirm,
+        );
+        assert!(matches!(v, Verdict::Ask { .. }), "得到 {v:?}");
+    }
+
+    #[test]
+    fn mode_matrix_over_risk_levels() {
+        // 四档模式 × 四档风险的放行表。改动判定逻辑时先看这张表。
+        let p = policy();
+        // L0：任何模式都放行
+        for m in Mode::all() {
+            let v = p.evaluate(&spec("fs_read", Risk::ReadOnly), &serde_json::json!({}), m);
+            assert!(v.is_allow(), "{m:?} 下 L0 应放行，得到 {v:?}");
+        }
+        // L1：只有 Confirm 会问
+        for m in Mode::all() {
+            let v = p.evaluate(&spec("fs_write", Risk::Reversible), &serde_json::json!({}), m);
+            match m {
+                Mode::Confirm => assert!(matches!(v, Verdict::Ask { .. }), "{m:?}"),
+                Mode::Plan => assert!(matches!(v, Verdict::Deny { .. }), "{m:?}"),
+                _ => assert!(v.is_allow(), "{m:?} 下 L1 应放行，得到 {v:?}"),
+            }
+        }
+        // L2：Confirm / AutoEdit 都问，只有 FullAccess 放行
+        for m in Mode::all() {
+            let v = p.evaluate(
+                &spec("shell", Risk::Impactful),
+                &serde_json::json!({"command": "echo hi"}),
+                m,
+            );
+            match m {
+                Mode::FullAccess => assert!(v.is_allow(), "完全访问下 L2 应放行，得到 {v:?}"),
+                Mode::Plan => assert!(matches!(v, Verdict::Deny { .. }), "{m:?}"),
+                _ => assert!(matches!(v, Verdict::Ask { .. }), "{m:?} 下 L2 应问，得到 {v:?}"),
+            }
+        }
+        // L3：除 Plan(直接拒) 外一律强确认，FullAccess 也不例外
+        for m in Mode::all() {
+            let v = p.evaluate(
+                &spec("shell", Risk::Destructive),
+                &serde_json::json!({"command": "true"}),
+                m,
+            );
+            match m {
+                Mode::Plan => assert!(matches!(v, Verdict::Deny { .. }), "{m:?}"),
+                _ => assert!(
+                    matches!(
+                        v,
+                        Verdict::Ask {
+                            double_confirm: true,
+                            grantable: false,
+                            ..
+                        }
+                    ),
+                    "{m:?} 下 L3 必须强确认，得到 {v:?}"
+                ),
+            }
+        }
     }
 
     #[test]
@@ -276,7 +383,7 @@ mod tests {
         let v = p.evaluate(
             &spec("shell", Risk::Impactful),
             &serde_json::json!({"command": "echo hi"}),
-            Mode::Normal,
+            Mode::Confirm,
         );
         assert!(matches!(
             v,
@@ -294,7 +401,7 @@ mod tests {
         let v = p.evaluate(
             &spec("shell", Risk::Destructive),
             &serde_json::json!({"command": "mkfs.ext4 /dev/sda"}),
-            Mode::Normal,
+            Mode::Confirm,
         );
         match v {
             Verdict::Deny { .. } => {} // 也可能被硬 Deny 拦掉
@@ -342,7 +449,7 @@ mod tests {
         let v = p.evaluate(
             &spec("shell", Risk::Impactful),
             &serde_json::json!({"command": "git status"}),
-            Mode::Normal,
+            Mode::Confirm,
         );
         match v {
             Verdict::Allow {
@@ -363,7 +470,7 @@ mod tests {
         let v = p.evaluate(
             &spec("shell", Risk::Impactful),
             &serde_json::json!({"command": "rm -rf build"}),
-            Mode::Normal,
+            Mode::Confirm,
         );
         assert!(matches!(v, Verdict::Ask { .. }));
     }
@@ -379,7 +486,7 @@ mod tests {
         let v = p.evaluate(
             &spec("fs_write", Risk::Reversible),
             &serde_json::json!({"path": "/home/u/.zex/.env", "content": "x"}),
-            Mode::Normal,
+            Mode::Confirm,
         );
         assert!(
             matches!(v, Verdict::Deny { .. }),
@@ -424,14 +531,18 @@ mod tests {
 
     #[test]
     fn tmp_paths_do_not_trigger_extra_approval() {
-        // /tmp 是正常的工作位置，不该因为"不在 HOME 下"就要求审批
+        // /tmp 是正常工作位置：确认模式下会问（和 HOME 下一样），
+        // 但不该因为"不在 HOME 下"被升级成二次确认
         let p = policy();
         let v = p.evaluate(
             &spec("fs_write", Risk::Reversible),
             &serde_json::json!({"path": "/tmp/x.txt"}),
-            Mode::Normal,
+            Mode::Confirm,
         );
-        assert!(v.is_allow(), "/tmp 不应被额外审批，得到 {v:?}");
+        assert!(
+            matches!(v, Verdict::Ask { double_confirm: false, .. }),
+            "/tmp 不应被额外加码，得到 {v:?}"
+        );
     }
 
     #[test]

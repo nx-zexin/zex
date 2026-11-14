@@ -216,25 +216,49 @@ pub struct SessionSummary {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunMode {
-    /// 正常：按风险分级，改动前要确认。
+    /// 改文件之前先问。
     #[default]
-    Normal,
-    /// 计划模式：只读，任何会改变状态的操作一律拒绝。
+    Confirm,
+    /// 文件改动直接做（带快照），其它照旧。
+    AutoEdit,
+    /// 只读：出计划可以，动手不行。
     Plan,
+    /// 减少确认次数：命令也不再逐条问，只剩不可逆的事必问。
+    FullAccess,
 }
 
 impl RunMode {
     /// 给人看的名字（下拉菜单里显示的就是它）。
     pub fn label(self) -> &'static str {
         match self {
-            RunMode::Normal => "变更前确认",
-            RunMode::Plan => "只读计划",
+            RunMode::Confirm => "变更前确认",
+            RunMode::AutoEdit => "自动编辑",
+            RunMode::Plan => "计划模式",
+            RunMode::FullAccess => "完全访问",
         }
     }
 
-    /// 菜单里的候选，顺序即展示顺序。
-    pub fn all() -> [RunMode; 2] {
-        [RunMode::Normal, RunMode::Plan]
+    /// 一句话说明这个模式会怎么对待你的文件。
+    ///
+    /// 菜单里显示在名字下面 —— 光看名字，"自动编辑"和"完全访问"
+    /// 差在哪没人猜得出来。
+    pub fn description(self) -> &'static str {
+        match self {
+            RunMode::Confirm => "改文件前先问我。",
+            RunMode::AutoEdit => "自动编辑文件。",
+            RunMode::Plan => "编辑前先出计划。",
+            RunMode::FullAccess => "减少确认次数。",
+        }
+    }
+
+    /// 菜单里的候选，顺序即展示顺序（由严到松）。
+    pub fn all() -> [RunMode; 4] {
+        [
+            RunMode::Confirm,
+            RunMode::AutoEdit,
+            RunMode::Plan,
+            RunMode::FullAccess,
+        ]
     }
 }
 

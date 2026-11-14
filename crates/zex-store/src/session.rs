@@ -209,7 +209,7 @@ mod tests {
         let s = Store::in_memory().unwrap();
         let ses = s.create_session("模式", "deepseek-chat", "/tmp").unwrap();
         // 新会话默认按风险确认，不是"啥都放行"
-        assert_eq!(s.get_session(&ses.id).unwrap().unwrap().mode, zex_core::RunMode::Normal);
+        assert_eq!(s.get_session(&ses.id).unwrap().unwrap().mode, zex_core::RunMode::Confirm);
 
         s.set_session_mode(&ses.id, zex_core::RunMode::Plan).unwrap();
         assert_eq!(s.get_session(&ses.id).unwrap().unwrap().mode, zex_core::RunMode::Plan);
@@ -307,14 +307,19 @@ mod tests {
 fn parse_mode(raw: String) -> zex_core::RunMode {
     match raw.as_str() {
         "plan" => zex_core::RunMode::Plan,
-        _ => zex_core::RunMode::Normal,
+        "auto_edit" => zex_core::RunMode::AutoEdit,
+        "full_access" => zex_core::RunMode::FullAccess,
+        // `normal` 是增加四档之前写入的旧值，等同于现在的「变更前确认」
+        _ => zex_core::RunMode::Confirm,
     }
 }
 
 /// 枚举转存库字符串。
 fn mode_str(mode: zex_core::RunMode) -> &'static str {
     match mode {
-        zex_core::RunMode::Normal => "normal",
+        zex_core::RunMode::Confirm => "confirm",
+        zex_core::RunMode::AutoEdit => "auto_edit",
         zex_core::RunMode::Plan => "plan",
+        zex_core::RunMode::FullAccess => "full_access",
     }
 }

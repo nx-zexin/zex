@@ -70,7 +70,7 @@ impl AgentConfig {
             max_tokens: 8192,
             cwd,
             budget: ContextBudget::default(),
-            mode: Mode::Normal,
+            mode: Mode::Confirm,
             approval_timeout: approval::DEFAULT_TIMEOUT,
         }
     }
