@@ -430,11 +430,14 @@ impl ChatView {
     /// `messages.len()` 那一行留给流式中的回复 —— 这样"正在输出"和
     /// "已落定的消息"共用同一套跟随逻辑，不必单独处理滚动。
     fn render_row(&self, ix: usize, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        if ix < self.messages.len() {
+        let inner = if ix < self.messages.len() {
             self.render_message(&self.messages[ix], ix, 1.0, cx)
         } else {
             self.render_streaming(cx)
-        }
+        };
+        // 内容和面板边缘之间要留出呼吸：不加这层，正文会直接贴到
+        // 侧栏和窗口右边框上，读起来像没排版的纯文本
+        div().px_8().py_2().child(inner).into_any_element()
     }
 
     /// 正在流式输出的那条回复。
@@ -450,8 +453,6 @@ impl ChatView {
                 .flex()
                 .flex_col()
                 .gap_2()
-                .px_8()
-                .py_3()
                 .child(role_label("ZEX"))
                 .child(
                     div()
@@ -470,8 +471,6 @@ impl ChatView {
             .flex()
             .flex_col()
             .gap_2()
-            .px_8()
-            .py_3()
             .child(role_label("ZEX"))
             .child(content)
             .into_any_element()
