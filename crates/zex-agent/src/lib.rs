@@ -580,19 +580,24 @@ impl Agent {
         match plan {
             CompressionPlan::None => {}
             CompressionPlan::ShrinkToolResults { indices } => {
-                self.history = Compressor::apply_shrink(&self.history, &indices);
+                let max = self.compressor.budget().tool_result_max_tokens;
+                self.history = Compressor::apply_shrink(&self.history, &indices, max);
                 let after = context::estimate_history_tokens(&self.history);
                 tracing::info!(before, after, count = indices.len(), "已截断过长的工具结果");
-                self.emit(
-                    CoreEvent::ContextCompacted {
-                        session: self.session.clone(),
-                        turn: turn.clone(),
-                        before_tokens: before as u64,
-                        after_tokens: after as u64,
-                        strategy: "shrink_tool_results".into(),
-                    },
-                    events,
-                );
+                // 只报有意义的节省：省下的还不如一条提示本身占的地方，
+                // 说出来只是噪音
+                if after + 32 < before {
+                    self.emit(
+                        CoreEvent::ContextCompacted {
+                            session: self.session.clone(),
+                            turn: turn.clone(),
+                            before_tokens: before as u64,
+                            after_tokens: after as u64,
+                            strategy: "shrink_tool_results".into(),
+                        },
+                        events,
+                    );
+                }
             }
             CompressionPlan::Summarize { drop_before, .. } => {
                 let dropped: Vec<Message> = self.history[..drop_before].to_vec();

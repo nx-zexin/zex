@@ -80,15 +80,23 @@ impl Compressor {
         let tokens = provider_tokens.unwrap_or_else(|| estimate_history_tokens(messages));
 
         // 第一层：单条工具结果过长就先截断，不惊动 LLM
+        let max = self.budget.tool_result_max_tokens;
         let oversized: Vec<usize> = messages
             .iter()
             .enumerate()
             .filter_map(|(i, m)| match m {
-                Message::Tool { content, .. }
-                    if crate::context::estimate_tokens(content)
-                        > self.budget.tool_result_max_tokens =>
-                {
-                    Some(i)
+                Message::Tool { content, .. } => {
+                    let before = crate::context::estimate_tokens(content);
+                    if before <= max {
+                        return None;
+                    }
+                    // 关键：只看「截了还能不能变小」。
+                    // 已经截到下限的内容再截也是原样，若仍然按"超标"报，
+                    // 每一轮都会重新触发一次压缩，于是界面上刷出一串
+                    // 「已压缩 14679 → 14678」这种零收益的提示。
+                    let after =
+                        crate::context::estimate_tokens(&truncate_middle(content, max));
+                    (after < before).then_some(i)
                 }
                 _ => None,
             })
@@ -164,14 +172,18 @@ impl Compressor {
     }
 
     /// 应用截断计划（纯函数）。
-    pub fn apply_shrink(messages: &[Message], indices: &[usize]) -> Vec<Message> {
+    pub fn apply_shrink(
+        messages: &[Message],
+        indices: &[usize],
+        budget: usize,
+    ) -> Vec<Message> {
         let mut out = messages.to_vec();
         for &i in indices {
             if let Message::Tool { call_id, name, content, is_error } = &out[i] {
                 out[i] = Message::Tool {
                     call_id: call_id.clone(),
                     name: name.clone(),
-                    content: truncate_middle(content),
+                    content: truncate_middle(content, budget),
                     is_error: *is_error,
                 };
             }
@@ -255,19 +267,27 @@ pub fn summary_message(summary: &str) -> Message {
 ///
 /// 头尾都留：开头通常是"在做什么"，结尾通常是"结果是什么"。
 /// 只留开头会丢掉结论，只留结尾会丢掉意图。
-pub fn truncate_middle(content: &str) -> String {
+pub fn truncate_middle(content: &str, target_tokens: usize) -> String {
     let total = content.chars().count();
     let chars: Vec<char> = content.chars().collect();
-    // 目标 ~1000 token ≈ 4000 字符（保守）
-    const TARGET_CHARS: usize = 4000;
-    if total <= TARGET_CHARS {
+    let cur = crate::context::estimate_tokens(content);
+    if cur <= target_tokens {
         return content.to_string();
     }
-    let head_len = TARGET_CHARS * 2 / 3;
-    let tail_len = TARGET_CHARS / 3;
+    // 按「token → 字符」的实测比例反推要留多少字符。
+    // 不能写死字符数：中文 1 字 1 token、英文 4 字符 1 token，
+    // 写死 4000 字符在中文场景下等于 4000 token —— 比阈值还高，
+    // 截完依然"超标"，于是每轮都重复触发。
+    let keep = (total as f32 * target_tokens as f32 / cur as f32 * 0.9) as usize;
+    let keep = keep.clamp(200, total);
+    let head_len = keep * 2 / 3;
+    let tail_len = keep / 3;
     let head: String = chars[..head_len].iter().collect();
     let tail: String = chars[total - tail_len..].iter().collect();
-    format!("{head}\n\n... [中间省略 {} 字符，原始共 {total} 字符] ...\n\n{tail}", total - head_len - tail_len)
+    format!(
+        "{head}\n\n... [中间省略 {} 字符，原始共 {total} 字符] ...\n\n{tail}",
+        total - head_len - tail_len
+    )
 }
 
 /// 修复工具调用配对：`tool_call.id` 与 `tool.call_id` 取交集。
@@ -389,11 +409,71 @@ mod tests {
             content: big.clone(),
             is_error: false,
         }];
-        let out = Compressor::apply_shrink(&msgs, &[0]);
+        let out = Compressor::apply_shrink(&msgs, &[0], 1000);
         let text = out[0].text();
         assert!(text.len() < big.len());
         assert!(text.contains("中间省略"));
         assert!(text.starts_with('a'));
+    }
+
+    #[test]
+    fn shrink_lands_under_the_trigger_threshold() {
+        // 回归：截断目标曾经写死 4000 字符，而中文 1 字≈1 token，
+        // 截完是 4000 token —— 仍高于 1000 的阈值，于是每轮重新触发，
+        // 界面上刷出一串「已压缩 N → N-1」的零收益提示。
+        let big: String = "中".repeat(8000);
+        let msgs = vec![Message::Tool {
+            call_id: ToolCallId::new("c"),
+            name: None,
+            content: big.clone(),
+            is_error: false,
+        }];
+        let max = ContextBudget::default().tool_result_max_tokens;
+        let out = Compressor::apply_shrink(&msgs, &[0], max);
+        let after = crate::context::estimate_tokens(&out[0].text());
+        assert!(
+            after <= max,
+            "截断后应落在阈值内，实际 {after} > {max}"
+        );
+    }
+
+    #[test]
+    fn already_shrunk_result_does_not_retrigger() {
+        let c = Compressor::new(ContextBudget::default());
+        let big: String = "中".repeat(8000);
+        let mut msgs = vec![
+            Message::User {
+                content: vec![zex_core::Part::Text { text: "开始".into() }],
+            },
+        ];
+        for i in 0..4 {
+            msgs.push(Message::Assistant {
+                content: vec![zex_core::Part::Text { text: format!("第 {i} 步") }],
+                tool_calls: vec![],
+            });
+        }
+        msgs.push(Message::Tool {
+            call_id: ToolCallId::new("c"),
+            name: None,
+            content: big,
+            is_error: false,
+        });
+
+        // 第一次：应当要求截断
+        let indices = match c.plan(&msgs, None) {
+            CompressionPlan::ShrinkToolResults { indices } => indices,
+            other => panic!("应触发截断，得到 {other:?}"),
+        };
+        let max = ContextBudget::default().tool_result_max_tokens;
+        let shrunk = Compressor::apply_shrink(&msgs, &indices, max);
+
+        // 第二次：已经截过了，不能再报同一批
+        match c.plan(&shrunk, None) {
+            CompressionPlan::ShrinkToolResults { .. } => {
+                panic!("已截断的内容不应重复触发压缩")
+            }
+            _ => {}
+        }
     }
 
     #[test]
@@ -603,6 +683,6 @@ mod tests {
 
     #[test]
     fn truncate_middle_short_text_untouched() {
-        assert_eq!(truncate_middle("short"), "short");
+        assert_eq!(truncate_middle("short", 1000), "short");
     }
 }
