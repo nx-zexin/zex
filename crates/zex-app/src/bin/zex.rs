@@ -2613,11 +2613,36 @@ impl ChatView {
                 .into_any_element(),
             false => Button::new("send")
                 .primary()
-                .label("↑")
+                .icon(Icon::new(IconName::ArrowUp))
                 .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                     this.submit(window, cx)
                 }))
                 .into_any_element(),
+        };
+        // 模型切换放在输入框内部左下角：它和"这条消息"一起生效，
+        // 摆到框外会被当成全局设置。
+        let model_picker = if self.editing_model {
+            div()
+                .w(px(180.0))
+                .rounded(px(6.0))
+                .border_1()
+                .border_color(rgb(BRAND))
+                .px_2()
+                .py_1()
+                .child(Input::new(&self.model_input))
+                .into_any_element()
+        } else {
+            Button::new("switch-model")
+                .ghost()
+                .label(format!(
+                    "{}",
+                    self.selected_model.as_deref().unwrap_or(&self.model)
+                ))
+                .dropdown_caret(true)
+                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                    this.begin_model_edit(window, cx);
+                }))
+                .into_any_element()
         };
 
         composer.child(
@@ -2649,6 +2674,18 @@ impl ChatView {
                         .gap_2()
                         .child(voice_btn)
                         .child(send_btn),
+                )
+                // 左下角：模型切换。和右下角的发送键同处框内，
+                // 用户一眼能看出"模型 + 内容"是同一条消息的属性
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(10.0))
+                        .bottom(px(8.0))
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(model_picker),
                 ),
         )
             .child(
@@ -2657,30 +2694,6 @@ impl ChatView {
                     .items_center()
                     .justify_between()
                     .px_1()
-                    .child({
-                        if self.editing_model {
-                            div()
-                                .w(px(260.0))
-                                .rounded(px(6.0))
-                                .border_1()
-                                .border_color(rgb(BRAND))
-                                .px_2()
-                                .py_1()
-                                .child(Input::new(&self.model_input))
-                                .into_any_element()
-                        } else {
-                            Button::new("switch-model")
-                                .ghost()
-                                .label(format!(
-                                    "{} ⌄",
-                                    self.selected_model.as_deref().unwrap_or(&self.model)
-                                ))
-                                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                                    this.begin_model_edit(window, cx);
-                                }))
-                                .into_any_element()
-                        }
-                    })
                     .child(
                         div()
                             .text_xs()
