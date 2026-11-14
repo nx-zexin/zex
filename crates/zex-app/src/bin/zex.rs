@@ -54,12 +54,6 @@ const USER_FONT: f32 = 15.0;
 const DEFAULT_PANEL_WIDTH: f32 = 420.0;
 const MIN_PANEL_WIDTH: f32 = 320.0;
 const MAX_PANEL_WIDTH: f32 = 900.0;
-/// 右侧面板底色。
-///
-/// 比左侧会话栏再暖、再深一档：它是一块**辅助信息区**，
-/// 和主对话区同色会让人分不清哪边是正文。
-const BG_PANEL: u32 = 0xF5F5F1;
-
 const TEXT: u32 = 0x1A1A1A;
 const TEXT_MUTED: u32 = 0x8C8C88;
 const TEXT_DIM: u32 = 0xA8A8A4;
@@ -2131,7 +2125,9 @@ impl ChatView {
             .h_full()
             .flex()
             .flex_row()
-            .bg(rgb(BG_PANEL))
+            // 和主对话区同色：靠左边框划界就够了，
+            // 再叠一层底色反而显得是两个不相干的窗口
+            .bg(rgb(BG_MAIN))
             .border_l_1()
             .border_color(rgb(BORDER))
             .child(handle)
