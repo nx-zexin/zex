@@ -242,6 +242,12 @@ struct ChatView {
     models_by_provider: std::collections::BTreeMap<String, Vec<String>>,
     /// 默认模型所属的 provider，用于菜单里的选中标记。
     active_provider: String,
+    /// `/`、`@` 菜单的方向键拦截器。
+    ///
+    /// 必须走 `intercept_keystrokes`：输入框把 up/down 绑成了移动光标，
+    /// keybinding 先于 key listener 执行并停掉事件，
+    /// `capture_key_down` 在这里根本收不到方向键。
+    _key_interceptor: Option<gpui::Subscription>,
     /// 当前会话的运行模式。
     run_mode: zex_core::RunMode,
     /// 正在编辑模型名。
@@ -384,7 +390,7 @@ impl ChatView {
         // 打开就先看工作台：用户想知道「我不在的时候发生了什么」
         let mode = ViewMode::Dashboard;
 
-        let view = ChatView {
+        let mut view = ChatView {
             input,
             tasks,
             mode,
@@ -415,6 +421,7 @@ impl ChatView {
             selected_model: None,
             models_by_provider,
             active_provider,
+            _key_interceptor: None,
             run_mode: zex_core::RunMode::Confirm,
             editing_model: false,
             model_input,
@@ -431,6 +438,45 @@ impl ChatView {
             model,
             usage: Usage::default(),
         };
+
+        // 方向键：菜单导航与历史回溯
+        //
+        // 只能在 keystroke interceptor 里做。输入框把 up/down 绑成了
+        // 「移动光标」，这一层跑在 keybinding 之前，能先一步把键吃掉；
+        // 放在 capture_key_down 里收不到 —— 事件已被 keybinding
+        // 标记消费，listener 阶段直接跳过了。
+        let weak = cx.entity().downgrade();
+        view._key_interceptor = Some(cx.intercept_keystrokes(move |event, window, cx| {
+            let key = event.keystroke.key.as_str();
+            if key != "up" && key != "down" {
+                return;
+            }
+            let is_up = key == "up";
+            let handled = weak
+                .update(cx, |this, cx| {
+                    // 菜单优先：↑↓ 在候选里走，不动输入框光标
+                    if this.menu_is_open() {
+                        let n = this.menu_items(cx).len();
+                        if is_up {
+                            this.menu_cursor = this.menu_cursor.saturating_sub(1);
+                        } else if this.menu_cursor + 1 < n {
+                            this.menu_cursor += 1;
+                        }
+                        cx.notify();
+                        return true;
+                    }
+                    // 空输入时回溯历史；有内容就把 ↑↓ 让给输入框
+                    if is_up && this.input.read(cx).value().trim().is_empty() {
+                        this.recall_history(true, &mut *window, cx);
+                        return true;
+                    }
+                    false
+                })
+                .unwrap_or(false);
+            if handled {
+                cx.stop_propagation();
+            }
+        }));
 
         // 打开就能打字：否则用户要先点一下输入框，
         // 而这是整个应用唯一的入口
@@ -3513,35 +3559,6 @@ impl Render for ChatView {
         let mut root = div()
             .size_full()
             .relative()
-            // ↑↓ 必须在捕获阶段拦：输入框自己绑了 up/down（移动光标），
-            // 且它在焦点链上更近，普通 keybinding 抢不过它。
-            .capture_key_down(cx.listener(
-                |this, event: &KeyDownEvent, window, cx| {
-                    let key = event.keystroke.key.as_str();
-                    if key != "up" && key != "down" {
-                        return;
-                    }
-                    let is_up = key == "up";
-
-                    if this.menu_is_open() {
-                        let n = this.menu_items(cx).len();
-                        if is_up {
-                            this.menu_cursor = this.menu_cursor.saturating_sub(1);
-                        } else if this.menu_cursor + 1 < n {
-                            this.menu_cursor += 1;
-                        }
-                        cx.stop_propagation();
-                        cx.notify();
-                        return;
-                    }
-
-                    // 空输入时回溯历史；有内容就放行给输入框移动光标
-                    if this.input.read(cx).value().trim().is_empty() {
-                        this.recall_history(is_up, window, cx);
-                        cx.stop_propagation();
-                    }
-                },
-            ))
             // 拖文件进来：图片进上下文，其它按路径引用
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _window, cx| {
                 this.add_attachments(paths.paths(), cx);
