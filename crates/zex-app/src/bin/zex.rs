@@ -2677,32 +2677,6 @@ impl ChatView {
             composer = composer.child(menu);
         }
 
-        // 空输入给几个起点：新用户对着空框不知道这个助理能干什么
-        let typing = !self.input.read(cx).value().trim().is_empty();
-        if !typing && self.attachments.is_empty() && !self.menu_is_open() {
-            const TEMPLATES: &[&str] = &[
-                "梳理这个项目的结构",
-                "找出代码里的 TODO 和未实现部分",
-                "把最近的 git 提交整理成周报",
-                "检查依赖有没有安全风险",
-            ];
-            let mut row = div().flex().items_center().gap_2().flex_wrap();
-            for (i, t) in TEMPLATES.iter().enumerate() {
-                let text = (*t).to_string();
-                row = row.child(
-                    Button::new(SharedString::from(format!("tpl-{i}")))
-                        .ghost()
-                        .label(*t)
-                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                            this.input
-                                .update(cx, |st, cx| st.set_value(text.clone(), window, cx));
-                            cx.notify();
-                        })),
-                );
-            }
-            composer = composer.child(row);
-        }
-
         if !self.attachments.is_empty() {
             composer = composer.child(attach_row);
         }
