@@ -201,7 +201,10 @@ pub fn load() -> Result<ResolvedConfig> {
 /// 这里列的东西用户随时能覆盖。
 fn builtin_models(provider: &str) -> &'static [&'static str] {
     match provider.to_ascii_lowercase().as_str() {
-        "deepseek" => &["deepseek-chat", "deepseek-reasoner", "deepseek-flash"],
+        // DeepSeek 现行模型（官方定价页，2026-11）：
+        // deepseek-flash 与 deepseek-v4-pro。旧的 deepseek-chat /
+        // deepseek-reasoner 已不在文档里，仍可调用但会映射到新模型。
+        "deepseek" => &["deepseek-flash", "deepseek-v4-pro"],
         "anthropic" | "claude" => &[
             "claude-opus-4-6",
             "claude-sonnet-4-6",
@@ -300,7 +303,7 @@ mod tests {
         let list = model_list(&e, "deepseek", Some("deepseek-flash"));
         // 正在用的模型永远排第一
         assert_eq!(list[0], "deepseek-flash");
-        assert!(list.iter().any(|m| m == "deepseek-chat"));
+        assert!(list.iter().any(|m| m == "deepseek-v4-pro"));
         // 内置清单里也有它，但不能出现两次
         assert_eq!(list.iter().filter(|m| *m == "deepseek-flash").count(), 1);
     }

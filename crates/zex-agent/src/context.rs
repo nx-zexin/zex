@@ -53,6 +53,19 @@ impl Default for ContextBudget {
 }
 
 impl ContextBudget {
+    /// 按模型名给一份预算。
+    ///
+    /// 只对**查得到官方数字**的模型调窗口，其余一律走保守默认：
+    /// 窗口估大了会撞 API 报错，估小了会过早压缩、白丢上下文 ——
+    /// 两个方向的错都难受，所以宁可不猜。
+    pub fn for_model(model: &str) -> Self {
+        let mut b = Self::default();
+        if let Some(w) = known_window(model) {
+            b.window = w;
+        }
+        b
+    }
+
     /// 压缩阈值对应的绝对 token 数。
     pub fn compress_limit(&self) -> usize {
         (self.window as f32 * self.compress_at) as usize
@@ -130,6 +143,24 @@ pub fn estimate_history_tokens(msgs: &[Message]) -> usize {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn budget_follows_the_model_window() {
+        // DeepSeek V4 是 1M 上下文，按 128K 压缩等于每轮白扔上下文
+        assert_eq!(
+            super::ContextBudget::for_model("deepseek-flash").window,
+            1_000_000
+        );
+        assert_eq!(
+            super::ContextBudget::for_model("deepseek-v4-pro").window,
+            1_000_000
+        );
+        // 不知道的模型不许瞎猜，保持保守默认
+        assert_eq!(
+            super::ContextBudget::for_model("some-local-llama").window,
+            128_000
+        );
+    }
+
     use super::*;
     use zex_core::{Role, ToolCallId};
 
@@ -201,4 +232,16 @@ mod tests {
         assert_eq!(a, b);
         assert_eq!(Message::user("x").role(), Role::User);
     }
+}
+
+/// 已知模型的上下文窗口（token）。
+///
+/// 来源：DeepSeek 官方定价页（2026-11）标注 deepseek-flash / deepseek-v4-pro
+/// 上下文 1M、输出上限 384K。其余 provider 的数字没查到出处，保持默认 128K。
+fn known_window(model: &str) -> Option<usize> {
+    let m = model.to_ascii_lowercase();
+    if m.starts_with("deepseek-flash") || m.starts_with("deepseek-v4-pro") {
+        return Some(1_000_000);
+    }
+    None
 }

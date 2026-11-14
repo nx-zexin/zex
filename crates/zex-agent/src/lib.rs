@@ -63,13 +63,16 @@ pub struct AgentConfig {
 impl AgentConfig {
     /// 用最小必填项构造。
     pub fn new(provider: ProviderConfig, model: impl Into<String>, cwd: PathBuf) -> Self {
+        let model = model.into();
         AgentConfig {
             provider,
-            model: model.into(),
+            // 预算跟着模型走：1M 窗口的模型按 128K 压缩，
+            // 等于每轮都在白扔上下文
+            budget: ContextBudget::for_model(&model),
+            model,
             max_steps: 25,
             max_tokens: 8192,
             cwd,
-            budget: ContextBudget::default(),
             mode: Mode::Confirm,
             approval_timeout: approval::DEFAULT_TIMEOUT,
         }

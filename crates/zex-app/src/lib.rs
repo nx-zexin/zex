@@ -330,6 +330,10 @@ pub fn spawn_core(
                                         if let Some(pc) = providers.get(p) {
                                             task_cfg.provider = pc.clone();
                                             task_cfg.model = rest.to_string();
+                                            // 换模型顺带换预算：从 128K 的模型
+                                            // 切到 1M 的，压缩阈值得跟着走
+                                            task_cfg.budget =
+                                                zex_agent::context::ContextBudget::for_model(rest);
                                         }
                                     }
                                 }
