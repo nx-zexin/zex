@@ -77,7 +77,7 @@ uuid = { version = "1", features = ["v4", "v7", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 
 # ─── UI ───
-gpui-kit = { version = "0.9", features = ["syntect"] }
+gpui-kit = { version = "0.9", features = ["syntect", "assets"] }
 
 [workspace.lints.rust]
 unsafe_code = "warn"

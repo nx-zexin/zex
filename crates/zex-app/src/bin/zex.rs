@@ -8,6 +8,8 @@
 
 use std::sync::Arc;
 
+use gpui_kit::assets::IconName;
+use gpui_kit::component::Icon;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
@@ -1611,8 +1613,9 @@ impl ChatView {
             }
 
             MsgKind::ToolResult { ok, output, name } => {
-                let (dot_bg, mark) = if *ok { (OK_SOFT, "✓") } else { (DANGER_SOFT, "✕") };
+                let dot_bg = if *ok { OK_SOFT } else { DANGER_SOFT };
                 let mark_color = if *ok { OK } else { DANGER };
+                let mark_icon = if *ok { IconName::Check } else { IconName::Close };
                 // 输出可能很长（日志、文件内容），先截断避免一屏全是工具输出
                 let shown = truncate_for_display(output, 1200);
                 let head_label = match name {
@@ -1649,10 +1652,9 @@ impl ChatView {
                                     .items_center()
                                     .justify_center()
                                     .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(rgb(mark_color))
-                                            .child(mark),
+                                        Icon::new(mark_icon)
+                                            .text_size(px(10.0))
+                                            .text_color(rgb(mark_color)),
                                     ),
                             ),
                     )
@@ -1968,7 +1970,7 @@ impl ChatView {
             .child(
                 Button::new("panel-close")
                     .ghost()
-                    .label("✕")
+                    .icon(Icon::new(IconName::Close))
                     .on_click(cx.listener(|this, _: &ClickEvent, _w, cx| {
                         this.subagent_panel = None;
                         cx.notify();
@@ -2043,7 +2045,11 @@ impl ChatView {
             .overflow_hidden();
 
         // 标题行：整行可点，展开/收起
-        let arrow = if self.team_collapsed { "▸" } else { "▾" };
+        let arrow = if self.team_collapsed {
+            IconName::ChevronRight
+        } else {
+            IconName::ChevronDown
+        };
         let mut head = div()
             .flex()
             .items_center()
@@ -2052,9 +2058,8 @@ impl ChatView {
             .py_2()
             .child(
                 div()
-                    .text_xs()
                     .text_color(rgb(TEXT_DIM))
-                    .child(arrow),
+                    .child(Icon::new(arrow).text_size(px(12.0))),
             )
             .child(
                 div()
@@ -2526,7 +2531,7 @@ impl ChatView {
                     .child(
                         Button::new(SharedString::from(format!("drop-attach-{i}")))
                             .ghost()
-                            .label("✕")
+                            .icon(Icon::new(IconName::Close))
                             .on_click(cx.listener(move |this, _: &ClickEvent, _w, cx| {
                                 this.attachments.remove(i);
                                 cx.notify();
@@ -2583,13 +2588,13 @@ impl ChatView {
         // 语音和提交按钮放进输入框内部右下角：它们属于"这条消息"
         // 的一部分，摆在外面会让人以为和输入内容无关。
         let voice_btn = {
-            let (label, danger) = match (&self.recording, self.transcribing) {
-                (Some(_), _) => ("●", true),
-                (None, true) => ("…", false),
-                _ => ("🎤", false),
+            let (icon, danger) = match (&self.recording, self.transcribing) {
+                (Some(_), _) => (IconName::Square, true),
+                (None, true) => (IconName::LoaderCircle, false),
+                _ => (IconName::Mic, false),
             };
             let btn = Button::new("voice")
-                .label(label)
+                .icon(Icon::new(icon))
                 .on_click(cx.listener(|this, _: &ClickEvent, _w, cx| {
                     this.toggle_recording(cx);
                 }));
@@ -3292,7 +3297,7 @@ fn main() {
     let cmd_tx = handles.cmd_tx.clone();
     let mut event_rx = handles.event_rx;
 
-    gpui_kit::application().run(move |cx| {
+    gpui_kit::application().with_assets(gpui_kit::assets::AllAssets).run(move |cx| {
         gpui_kit::init(cx);
         // 设计稿是浅色主题
         gpui_kit::component::Theme::change(
