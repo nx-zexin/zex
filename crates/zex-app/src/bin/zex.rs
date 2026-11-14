@@ -1332,6 +1332,33 @@ impl ChatView {
                 }
                 cx.notify();
             }
+            CoreEvent::PanelControl { open, agent } => {
+                if open {
+                    // 指定了就看那个；没指定就挑一个能看的 ——
+                    // 优先正在跑的，其次最近的
+                    let target = agent.or_else(|| {
+                        let team = self.visible_team();
+                        team.iter()
+                            .find(|a| a.status == "执行中")
+                            .or_else(|| team.first())
+                            .map(|a| a.id.clone())
+                    });
+                    match target {
+                        Some(id) => self.open_subagent_panel(&id, cx),
+                        None => {
+                            // 没子智能体可看：说清楚，而不是开了个空面板
+                            self.messages.push(MsgItem {
+                                kind: MsgKind::System,
+                                text: "当前会话没有子智能体，右侧面板没有内容可显示".into(),
+                            });
+                            cx.notify();
+                        }
+                    }
+                } else if self.subagent_panel.is_some() {
+                    self.subagent_panel = None;
+                    cx.notify();
+                }
+            }
             CoreEvent::TeamUpdated { agents } => {
                 // 面板显示的那个 agent 状态要跟着团队一起变，
                 // 否则会出现「面板说已完成、团队说执行中」这种自相矛盾。

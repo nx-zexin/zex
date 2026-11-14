@@ -159,6 +159,69 @@ pub struct CoreHandles {
     pub event_rx: mpsc::Receiver<CoreEvent>,
 }
 
+/// 让智能体自己开关右侧面板。
+///
+/// 它不碰文件、不跑命令，只往事件通道里塞一条请求 —— UI 收到后
+/// 再决定照不照办。所以对模型来说这是一次「请求」而非「执行」：
+/// 返回的话术也是"已请求"，不是"已打开"。
+pub struct ControlPanel {
+    /// 事件通道，用来把请求送到 UI 世界。
+    ev_tx: mpsc::Sender<CoreEvent>,
+}
+
+impl ControlPanel {
+    /// 绑定事件通道。
+    pub fn new(ev_tx: mpsc::Sender<CoreEvent>) -> Self {
+        Self { ev_tx }
+    }
+}
+
+/// `control_panel` 的参数。
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct ControlPanelArgs {
+    /// true 打开面板，false 关闭。
+    pub open: bool,
+    /// 要打开哪个子智能体的面板（用 team_status 里的 id）。
+    /// 不填则由界面决定，通常是最近有动静的那个。
+    #[serde(default)]
+    pub agent: Option<String>,
+}
+
+#[async_trait::async_trait]
+impl zex_core::tool::Tool for ControlPanel {
+    const NAME: &'static str = "control_panel";
+    // 只影响界面，不改任何状态
+    const RISK: zex_core::Risk = zex_core::Risk::ReadOnly;
+    type Args = ControlPanelArgs;
+
+    fn description() -> &'static str {
+        "打开或关闭右侧的子智能体面板。想带用户看某个子智能体的过程时用。\
+         只能影响界面，不会改变任何文件或进程。"
+    }
+
+    async fn call(
+        &self,
+        _cx: &dyn zex_core::tool::ToolCtx,
+        args: Self::Args,
+    ) -> zex_core::Result<zex_core::tool::ToolOutput> {
+        self.ev_tx
+            .send(CoreEvent::PanelControl {
+                open: args.open,
+                agent: args.agent,
+            })
+            .await
+            .map_err(|_| zex_core::Error::ToolFailed {
+                tool: "control_panel".into(),
+                message: "界面已经不在了，请求没送到".into(),
+            })?;
+        Ok(zex_core::tool::ToolOutput::ok(if args.open {
+            "已请求打开子智能体面板".to_string()
+        } else {
+            "已请求关闭子智能体面板".to_string()
+        }))
+    }
+}
+
 /// 在独立线程上启动 tokio 内核。
 ///
 /// 这是 ADR-002 双世界桥接的落地：gpui 主线程只做渲染，
@@ -213,6 +276,9 @@ pub fn spawn_core(
     tools.push(Arc::new(zex_agent::subagent::TerminateAgent {
         registry: registry.clone(),
     }));
+    // 面板开关：和团队工具同一批注册，因为它俩是一件事的两半 ——
+    // 派了活、看进度、把人叫出来
+    tools.push(Arc::new(ControlPanel::new(ev_tx.clone())));
     registry.install(
         cfg.clone(),
         tools.clone(),
@@ -560,5 +626,75 @@ async fn run_task(
                 title,
             })
             .await;
+    }
+}
+
+#[cfg(test)]
+mod control_panel_tests {
+    use super::*;
+    use zex_core::tool::{Tool, ToolCtx};
+
+    struct MockCtx {
+        sid: SessionId,
+    }
+
+    impl ToolCtx for MockCtx {
+        fn cwd(&self) -> &std::path::Path {
+            std::path::Path::new("/tmp")
+        }
+        fn session_id(&self) -> &SessionId {
+            &self.sid
+        }
+        fn resolve_path(&self, raw: &str) -> zex_core::Result<PathBuf> {
+            Ok(PathBuf::from(raw))
+        }
+    }
+
+    #[tokio::test]
+    async fn open_request_reaches_the_ui_channel() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let tool = ControlPanel::new(tx);
+        let ctx = MockCtx {
+            sid: SessionId::generate(),
+        };
+        let out = tool
+            .call(
+                &ctx,
+                ControlPanelArgs {
+                    open: true,
+                    agent: Some("coder-1".into()),
+                },
+            )
+            .await
+            .expect("发送应当成功");
+        // 回给模型的是「已请求」而不是「已打开」：开不开由界面说了算
+        assert!(out.content.contains("已请求"), "got {}", out.content);
+
+        match rx.recv().await.expect("应收到事件") {
+            CoreEvent::PanelControl { open, agent } => {
+                assert!(open);
+                assert_eq!(agent.as_deref(), Some("coder-1"));
+            }
+            other => panic!("事件类型不对: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn close_request_carries_no_agent() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let tool = ControlPanel::new(tx);
+        let ctx = MockCtx {
+            sid: SessionId::generate(),
+        };
+        tool.call(&ctx, ControlPanelArgs { open: false, agent: None })
+            .await
+            .expect("发送应当成功");
+        match rx.recv().await.expect("应收到事件") {
+            CoreEvent::PanelControl { open, agent } => {
+                assert!(!open);
+                assert!(agent.is_none());
+            }
+            other => panic!("事件类型不对: {other:?}"),
+        }
     }
 }

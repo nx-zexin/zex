@@ -9092,7 +9092,9 @@ dependencies = [
 name = "zex-app"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "gpui-kit",
+ "schemars",
  "serde",
  "serde_json",
  "tokio",
