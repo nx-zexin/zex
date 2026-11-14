@@ -2580,65 +2580,72 @@ impl ChatView {
         if !self.attachments.is_empty() {
             composer = composer.child(attach_row);
         }
-        composer
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .child(
-                        div()
-                            .flex_1()
-                            .rounded(px(14.0))
-                            .border_1()
-                            .border_color(rgb(border))
-                            .bg(rgb(BG_INPUT))
-                            .px_4()
-                            .py_2()
-                            // 高度跟着内容长：一行起步，最多六行后内部滚动
-                            .child(
-                                Textarea::new(&self.input)
-                                    .appearance(false)
-                                    .bordered(false)
-                                    .h(px(self.composer_height(cx))),
-                            ),
-                    )
-                    .child({
-                        // 麦克风：录音中变红并提示时长
-                        let (label, danger) = match (&self.recording, self.transcribing) {
-                            (Some(_), _) => ("●", true),
-                            (None, true) => ("…", false),
-                            _ => ("🎤", false),
-                        };
-                        let btn = Button::new("voice")
-                            .label(label)
-                            .on_click(cx.listener(|this, _: &ClickEvent, _w, cx| {
-                                this.toggle_recording(cx);
-                            }));
-                        if danger {
-                            btn.danger().into_any_element()
-                        } else {
-                            btn.into_any_element()
-                        }
-                    })
-                    .child(match self.streaming.is_some() {
-                        // 正在跑就换成停止键：否则用户只能干等长任务跑完
-                        true => Button::new("stop")
-                            .danger()
-                            .label("■")
-                            .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
-                                this.cancel(cx)
-                            }))
-                            .into_any_element(),
-                        false => Button::new("send")
-                            .primary()
-                            .label("↑")
-                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                                this.submit(window, cx)
-                            }))
-                            .into_any_element(),
-                    }),
-            )
+        // 语音和提交按钮放进输入框内部右下角：它们属于"这条消息"
+        // 的一部分，摆在外面会让人以为和输入内容无关。
+        let voice_btn = {
+            let (label, danger) = match (&self.recording, self.transcribing) {
+                (Some(_), _) => ("●", true),
+                (None, true) => ("…", false),
+                _ => ("🎤", false),
+            };
+            let btn = Button::new("voice")
+                .label(label)
+                .on_click(cx.listener(|this, _: &ClickEvent, _w, cx| {
+                    this.toggle_recording(cx);
+                }));
+            if danger {
+                btn.danger().into_any_element()
+            } else {
+                btn.into_any_element()
+            }
+        };
+        let send_btn = match self.streaming.is_some() {
+            // 正在跑就换成停止键：否则用户只能干等长任务跑完
+            true => Button::new("stop")
+                .danger()
+                .label("■")
+                .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| this.cancel(cx)))
+                .into_any_element(),
+            false => Button::new("send")
+                .primary()
+                .label("↑")
+                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                    this.submit(window, cx)
+                }))
+                .into_any_element(),
+        };
+
+        composer.child(
+            div()
+                .relative()
+                .rounded(px(16.0))
+                .border_1()
+                .border_color(rgb(border))
+                .bg(rgb(BG_INPUT))
+                // 底部给按钮留出空间，文字不会钻到按钮底下
+                .pb(px(44.0))
+                .child(
+                    div().px_4().pt_3().child(
+                        Textarea::new(&self.input)
+                            .appearance(false)
+                            .bordered(false)
+                            .h(px(self.composer_height(cx))),
+                    ),
+                )
+                // 按钮浮在右下角：它们属于这条消息的一部分，
+                // 摆在框外会让人以为是独立控件
+                .child(
+                    div()
+                        .absolute()
+                        .right(px(10.0))
+                        .bottom(px(8.0))
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(voice_btn)
+                        .child(send_btn),
+                ),
+        )
             .child(
                 div()
                     .flex()
