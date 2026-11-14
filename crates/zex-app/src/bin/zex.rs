@@ -67,17 +67,37 @@ const DANGER: u32 = 0xE5534B;
 const DANGER_SOFT: u32 = 0xFDECEA;
 const MONO: &str = "JetBrains Mono";
 
-/// 一条展示用的消息。
+/// 工具执行结果。
+#[derive(Clone)]
+struct ToolOutcome {
+    ok: bool,
+    output: String,
+}
+
+impl MsgItem {
+    /// 这条消息在信息流里的唯一标识，用于记住「哪个工具卡被展开了」。
+    ///
+    /// 用序号而不是消息下标：下标会随着新消息追加、会话切换而漂移，
+    /// 展开状态会莫名其妙跳到别人身上。
+    fn key(&self, idx: usize) -> String {
+        format!("row-{idx}")
+    }
+}
+
 #[derive(Clone)]
 enum MsgKind {
     User,
     Assistant,
-    ToolCall { name: String, args: String, risk: String },
-    ToolResult {
-        ok: bool,
-        output: String,
-        /// 产出这条结果的工具名。历史消息里可能缺失（老数据没存）。
-        name: Option<String>,
+    /// 一次工具调用连同它的结果。
+    ///
+    /// 合并成一条而不是两条：调用和结果本来就是同一件事，
+    /// 分开渲染时中间会夹一条分割线，看起来像两次无关的操作。
+    ToolPair {
+        name: String,
+        args: String,
+        risk: String,
+        /// `None` 表示还没出结果（正在跑，或这一轮被中断了）。
+        result: Option<ToolOutcome>,
     },
     System,
     /// 子智能体的一步动作。缩进显示在主对话里，
@@ -226,6 +246,11 @@ struct ChatView {
     history_cursor: Option<usize>,
     /// 开始回溯前的草稿，回溯回来要还原。
     history_draft: String,
+    /// 哪些工具卡被展开了（按消息序号记）。
+    ///
+    /// 默认全折叠：一轮对话里工具调用经常有七八条，
+    /// 全摊开会把真正要读的回复挤出屏幕。
+    expanded_tools: std::collections::HashSet<String>,
     /// 右侧子智能体面板的宽度（像素，可拖拽）。
     subagent_panel_width: f32,
     /// 正在拖面板边框。
@@ -389,6 +414,7 @@ impl ChatView {
             input_history: restored_history,
             history_cursor: None,
             history_draft: String::new(),
+            expanded_tools: std::collections::HashSet::new(),
             subagent_panel_width: DEFAULT_PANEL_WIDTH,
             subagent_resizing: false,
             subagent_drag_origin: (0.0, 0.0),
@@ -1247,28 +1273,31 @@ impl ChatView {
                     }
                 }
                 panel.messages.push(MsgItem {
-                    kind: MsgKind::ToolCall {
+                    kind: MsgKind::ToolPair {
                         name: name.clone(),
                         args: compact_args(arguments),
                         risk: risk.label().to_string(),
+                        result: None,
                     },
                     text: String::new(),
                 });
             }
             CoreEvent::ToolCallEnd { ok, brief, .. } => {
-                // 工具名靠前一条 ToolCall 记录，这里不重复
-                let name = panel.messages.iter().rev().find_map(|m| match &m.kind {
-                    MsgKind::ToolCall { name, .. } => Some(name.clone()),
-                    _ => None,
-                });
-                panel.messages.push(MsgItem {
-                    kind: MsgKind::ToolResult {
-                        ok: *ok,
-                        output: brief.clone(),
-                        name,
-                    },
-                    text: String::new(),
-                });
+                // 并进前面那条调用；配不上就单独摆一条
+                if !merge_tool_result(&mut panel.messages, *ok, brief.clone()) {
+                    panel.messages.push(MsgItem {
+                        kind: MsgKind::ToolPair {
+                            name: String::new(),
+                            args: String::new(),
+                            risk: String::new(),
+                            result: Some(ToolOutcome {
+                                ok: *ok,
+                                output: brief.clone(),
+                            }),
+                        },
+                        text: String::new(),
+                    });
+                }
             }
             CoreEvent::TurnEnded { reason, .. } => {
                 if let Some(buf) = panel.streaming.take() {
@@ -1424,10 +1453,11 @@ impl ChatView {
                 self.running_tool = Some(name.clone());
                 self.status = format!("执行 {name}");
                 self.messages.push(MsgItem {
-                    kind: MsgKind::ToolCall {
+                    kind: MsgKind::ToolPair {
                         name: name.clone(),
                         args: compact_args(&arguments),
                         risk: risk.label().to_string(),
+                        result: None,
                     },
                     text: String::new(),
                 });
@@ -1438,13 +1468,20 @@ impl ChatView {
                 if !self.is_active(&session) {
                     return;
                 }
-                // take 而不是 clean：结果卡要显示是哪个工具产出的
-                let name = self.running_tool.take();
+                self.running_tool = None;
                 self.status = "Ready".into();
-                self.messages.push(MsgItem {
-                    kind: MsgKind::ToolResult { ok, output: brief, name },
-                    text: String::new(),
-                });
+                // 并进前面那条调用，而不是再追加一张卡
+                if !merge_tool_result(&mut self.messages, ok, brief.clone()) {
+                    self.messages.push(MsgItem {
+                        kind: MsgKind::ToolPair {
+                            name: String::new(),
+                            args: String::new(),
+                            risk: String::new(),
+                            result: Some(ToolOutcome { ok, output: brief }),
+                        },
+                        text: String::new(),
+                    });
+                }
                 self.sync_scroller(cx);
             }
             CoreEvent::ApprovalRequired { session, req } => {
@@ -1590,6 +1627,31 @@ fn pill(label: String, bg: u32, fg: u32) -> impl IntoElement {
         .child(label)
 }
 
+/// 把一条工具结果并进前面那条尚未配对的调用。
+///
+/// 实时事件流和历史重放共用这一个函数：前者只需匹配末尾一条，
+/// 后者要从后往前找（一轮里可能连着好几个调用）。
+///
+/// 返回 `false` 表示这是一条**孤立结果**（调用记录丢了，比如老数据），
+/// 由调用方决定怎么摆。
+fn merge_tool_result(items: &mut [MsgItem], ok: bool, output: String) -> bool {
+    for item in items.iter_mut().rev() {
+        match &item.kind {
+            MsgKind::ToolPair { result: None, .. } => {
+                if let MsgKind::ToolPair { result, .. } = &mut item.kind {
+                    *result = Some(ToolOutcome { ok, output });
+                }
+                return true;
+            }
+            // 已经配过对的跳过，继续往前找
+            MsgKind::ToolPair { result: Some(_), .. } => continue,
+            // 遇到非工具消息就停：结果不该跨过对话内容去认领调用
+            _ => return false,
+        }
+    }
+    false
+}
+
 /// 把纯文本包成 markdown 代码块。
 ///
 /// 用四个反引号而不是三个：工具输出里常有 ``` （diff、markdown 文件），
@@ -1725,87 +1787,79 @@ impl ChatView {
                     .into_any_element()
             }
 
-            MsgKind::ToolCall { name, args, risk } => {
-                // 风险等级决定胶囊配色
-                let (bg, fg) = match risk.as_str() {
-                    "高危" => (DANGER_SOFT, DANGER),
-                    "有影响" => (BRAND_SOFT, BRAND),
-                    _ => (BG_HOVER, TEXT_MUTED),
+            MsgKind::ToolPair { name, args, risk, result } => {
+                // 折叠是默认：一轮里工具调用常有七八条，
+                // 全摊开会把真正要读的回复挤出屏幕
+                let key = m.key(idx);
+                let expanded = self.expanded_tools.contains(&key);
+
+                let (dot_bg, dot_fg) = match result {
+                    None => (BRAND_SOFT, BRAND),
+                    Some(r) if r.ok => (OK_SOFT, OK),
+                    Some(_) => (DANGER_SOFT, DANGER),
                 };
-                let head = div()
+
+                // 标题栏一句话摘要：折叠时也得知道这次干了什么
+                let summary = if !args.trim().is_empty() {
+                    truncate_for_display(args, 90)
+                } else if let Some(r) = result {
+                    truncate_for_display(&r.output, 90)
+                } else {
+                    String::new()
+                };
+
+                let mut head = div()
                     .flex()
                     .items_center()
-                    .justify_between()
+                    .gap_2()
+                    .px_3()
+                    .py_2()
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(BG_HOVER)))
+                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _: &MouseDownEvent, _w, cx| {
+                        let key = key.clone();
+                        if !this.expanded_tools.remove(&key) {
+                            this.expanded_tools.insert(key);
+                        }
+                        cx.notify();
+                    }))
                     .child(
                         div()
-                            .flex()
-                            .items_center()
-                            .gap_3()
+                            .text_color(rgb(TEXT_DIM))
                             .child(
-                                div()
-                                    .text_xs()
-                                    .font_weight(FontWeight::BOLD)
-                                    .text_color(rgb(BRAND))
-                                    .child("TOOL CALL"),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .font_family(MONO)
-                                    .text_color(rgb(TEXT_MUTED))
-                                    .child(name.clone()),
+                                Icon::new(if expanded {
+                                    IconName::ChevronDown
+                                } else {
+                                    IconName::ChevronRight
+                                })
+                                .text_size(px(12.0)),
                             ),
-                    );
-                // 历史消息没有风险等级，此时不画空胶囊
-                let head = if risk.is_empty() {
-                    head
-                } else {
-                    head.child(pill(risk.clone(), bg, fg))
-                };
-
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .p_4()
-                    .rounded_lg()
-                    .bg(rgb(BG_TOOL))
-                    .border_1()
-                    .border_color(rgb(BORDER_SOFT))
-                    .child(head)
-                    .child(
-                        TextView::markdown(
-                            ElementId::Name(format!("md-call-{idx}").into()),
-                            as_code_block(args),
-                        )
-                        .text_size(px(12.5))
-                        .line_height(px(19.0))
-                        .text_color(rgb(TEXT))
-                        .style(md_style(1.0)),
                     )
-                    .context_menu(copy_context_menu(args.clone()))
-                    .into_any_element()
-            }
+                    .child(
+                        div()
+                            .font_family(MONO)
+                            .text_size(px(12.5))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(rgb(TEXT))
+                            .child(if name.is_empty() {
+                                "tool".to_string()
+                            } else {
+                                name.clone()
+                            }),
+                    );
 
-            MsgKind::ToolResult { ok, output, name } => {
-                let dot_bg = if *ok { OK_SOFT } else { DANGER_SOFT };
-                let mark_color = if *ok { OK } else { DANGER };
-                let mark_icon = if *ok { IconName::Check } else { IconName::Close };
-                // 输出可能很长（日志、文件内容），先截断避免一屏全是工具输出
-                let shown = truncate_for_display(output, 1200);
-                let head_label = match name {
-                    Some(n) if !n.is_empty() => format!("TOOL RESULT · {n}"),
-                    _ => "TOOL RESULT".to_string(),
-                };
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .p_4()
-                    .rounded_lg()
-                    .bg(rgb(BG_RESULT))
-                    .border_1()
-                    .border_color(rgb(BORDER_SOFT))
+                // 风险胶囊：历史消息没有等级，此时不画
+                if !risk.is_empty() {
+                    let (bg, fg) = match risk.as_str() {
+                        "高危" => (DANGER_SOFT, DANGER),
+                        "有影响" => (BRAND_SOFT, BRAND),
+                        _ => (BG_HOVER, TEXT_MUTED),
+                    };
+                    head = head.child(pill(risk.clone(), bg, fg));
+                }
+
+                head = head
+                    .child(div().flex_1().min_w(px(0.0)))
                     .child(
                         div()
                             .flex()
@@ -1814,9 +1868,9 @@ impl ChatView {
                             .child(
                                 div()
                                     .text_xs()
-                                    .font_weight(FontWeight::BOLD)
                                     .text_color(rgb(TEXT_MUTED))
-                                    .child(head_label),
+                                    .overflow_hidden()
+                                    .child(summary),
                             )
                             .child(
                                 div()
@@ -1826,25 +1880,89 @@ impl ChatView {
                                     .flex()
                                     .items_center()
                                     .justify_center()
-                                    .child(
-                                        Icon::new(mark_icon)
-                                            .text_size(px(10.0))
-                                            .text_color(rgb(mark_color)),
-                                    ),
+                                    .child(match result {
+                                        None => div()
+                                            .size(px(6.0))
+                                            .rounded_full()
+                                            .bg(rgb(dot_fg))
+                                            .into_any_element(),
+                                        Some(r) => Icon::new(if r.ok {
+                                            IconName::Check
+                                        } else {
+                                            IconName::Close
+                                        })
+                                        .text_size(px(10.0))
+                                        .text_color(rgb(dot_fg))
+                                        .into_any_element(),
+                                    }),
                             ),
-                    )
-                    .child(
-                        TextView::markdown(
-                            ElementId::Name(format!("md-out-{idx}").into()),
-                            as_code_block(&shown),
-                        )
-                        .text_size(px(12.5))
-                        .line_height(px(19.0))
-                        .text_color(rgb(TEXT_MUTED))
-                        .style(md_style(1.0)),
-                    )
-                    .context_menu(copy_context_menu(output.clone()))
-                    .into_any_element()
+                    );
+
+                let mut card = div()
+                    .flex()
+                    .flex_col()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(rgb(BORDER_SOFT))
+                    .bg(rgb(BG_RESULT))
+                    .overflow_hidden()
+                    .child(head);
+
+                if expanded {
+                    let mut body = div().flex().flex_col().gap_2().px_3().pb_3();
+                    if !args.trim().is_empty() {
+                        body = body.child(
+                            TextView::markdown(
+                                ElementId::Name(format!("md-call-{idx}").into()),
+                                as_code_block(args),
+                            )
+                            .text_size(px(12.5))
+                            .line_height(px(19.0))
+                            .text_color(rgb(TEXT))
+                            .style(md_style(1.0)),
+                        );
+                    }
+                    match result {
+                        Some(r) => {
+                            body = body.child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(if r.ok { rgb(OK) } else { rgb(DANGER) })
+                                    .child(if r.ok { "结果" } else { "失败" }),
+                            );
+                            body = body.child(
+                                TextView::markdown(
+                                    ElementId::Name(format!("md-out-{idx}").into()),
+                                    as_code_block(&truncate_for_display(&r.output, 4000)),
+                                )
+                                .text_size(px(12.5))
+                                .line_height(px(19.0))
+                                .text_color(rgb(TEXT_MUTED))
+                                .style(md_style(1.0)),
+                            );
+                        }
+                        None => {
+                            body = body.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(TEXT_MUTED))
+                                    .child("执行中…"),
+                            );
+                        }
+                    }
+                    card = card.child(body);
+                }
+
+                card.context_menu(copy_context_menu(format!(
+                    "{}\n{}",
+                    args,
+                    result
+                        .as_ref()
+                        .map(|r| r.output.clone())
+                        .unwrap_or_default()
+                )))
+                .into_any_element()
             }
 
             MsgKind::SubAgentStep { agent, name, args } => {
@@ -3444,25 +3562,34 @@ fn history_to_items(msgs: &[zex_core::Message]) -> Vec<MsgItem> {
                 // 只剩一堆结果、看不出中间发生了什么
                 for call in tool_calls {
                     out.push(MsgItem {
-                        kind: MsgKind::ToolCall {
+                        kind: MsgKind::ToolPair {
                             name: call.name.clone(),
                             args: compact_args(&call.arguments),
                             // 历史里没存风险等级，留空即不画胶囊
                             risk: String::new(),
+                            result: None,
                         },
                         text: String::new(),
                     });
                 }
             }
-            Message::Tool { content, is_error, name, .. } => {
-                out.push(MsgItem {
-                    kind: MsgKind::ToolResult {
-                        ok: !*is_error,
-                        output: content.clone(),
-                        name: name.clone(),
-                    },
-                    text: String::new(),
-                });
+            Message::Tool { content, is_error, .. } => {
+                // 结果的归属靠"前面那条还没配对的调用"，不靠工具名 ——
+                // 同一轮里连着调两个 shell 时名字是重复的
+                if !merge_tool_result(&mut out, !*is_error, content.clone()) {
+                    out.push(MsgItem {
+                        kind: MsgKind::ToolPair {
+                            name: String::new(),
+                            args: String::new(),
+                            risk: String::new(),
+                            result: Some(ToolOutcome {
+                                ok: !*is_error,
+                                output: content.clone(),
+                            }),
+                        },
+                        text: String::new(),
+                    });
+                }
             }
             Message::System { .. } => {}
         }
