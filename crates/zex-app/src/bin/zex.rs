@@ -1668,7 +1668,9 @@ fn as_code_block(text: &str) -> String {
 /// 那是另一层可以点开的东西 —— 它就该是连成一片的正文。
 fn md_style_flat(scale: f32) -> TextViewStyle {
     let mut s = StyleRefinement::default();
-    s.background = Some(rgb(BG_MAIN).into());
+    // 跟着卡片底色走，不另铺一层：在灰卡上开一块白，比原来的
+    // 小卡片更扎眼
+    s.background = Some(rgb(BG_RESULT).into());
     // 四个边都显式设 0：默认的 EdgesRefinement 是"不覆盖"，
     // 不写死的话主题给的 1px 边框还在
     s.border_widths = EdgesRefinement {
@@ -1922,9 +1924,7 @@ impl ChatView {
                     .rounded_lg()
                     .border_1()
                     .border_color(rgb(BORDER_SOFT))
-                    // 和主信息流同色：工具卡只是"折起来的一段过程"，
-                    // 铺一层底色反而像个独立区块
-                    .bg(rgb(BG_MAIN))
+                    .bg(rgb(BG_RESULT))
                     .overflow_hidden()
                     .child(head);
 
