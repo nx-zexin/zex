@@ -2026,14 +2026,14 @@ impl ChatView {
                             )
                             .child(
                                 div()
-                                    .font_family(MONO)
+                                    .flex_none()
                                     .text_size(px(12.5))
                                     .font_weight(FontWeight::MEDIUM)
                                     .text_color(rgb(TEXT))
                                     .child(if step.name.is_empty() {
-                                        "tool".to_string()
+                                        "工具".to_string()
                                     } else {
-                                        step.name.clone()
+                                        tool_display_name(&step.name).to_string()
                                     }),
                             );
 
@@ -2047,17 +2047,10 @@ impl ChatView {
                         }
 
                         head = head
-                            .child(div().flex_1().min_w(px(0.0)))
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(TEXT_MUTED))
-                                    .overflow_hidden()
-                                    .child(truncate_for_display(&step.args, 60)),
-                            )
                             .child(
                                 div()
                                     .size(px(16.0))
+                                    .flex_none()
                                     .rounded_full()
                                     .bg(rgb(s_dot_bg))
                                     .flex()
@@ -2078,7 +2071,8 @@ impl ChatView {
                                         .text_color(rgb(s_dot_fg))
                                         .into_any_element(),
                                     }),
-                            );
+                            )
+                            .child(div().flex_1());
 
                         let mut step_card = div()
                             .flex()
@@ -3710,6 +3704,42 @@ fn truncate_for_display(s: &str, limit: usize) -> String {
     let head: String = s.chars().take(limit * 2 / 3).collect();
     let tail: String = s.chars().skip(n - limit / 3).collect();
     format!("{head}\n\n… 省略 {} 字符 …\n\n{tail}", n - limit)
+}
+
+/// 把多行文本压成单行并截断，用于工具卡片的摘要行。
+fn one_line(s: &str, max: usize) -> String {
+    let flat = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let n = flat.chars().count();
+    if n <= max {
+        return flat;
+    }
+    let mut out: String = flat.chars().take(max).collect();
+    out.push('…');
+    out
+}
+
+/// 工具名 → 界面显示名。未知工具原样返回。
+fn tool_display_name(name: &str) -> &str {
+    match name {
+        "fs_read" => "读取文件",
+        "fs_write" => "写入文件",
+        "fs_edit" => "编辑文件",
+        "fs_list" => "列出目录",
+        "fs_grep" => "搜索内容",
+        "shell" => "执行命令",
+        "web_fetch" => "抓取网页",
+        "web_search" => "搜索网页",
+        "control_panel" => "控制面板",
+        "echo" => "回声",
+        "spawn_agent" => "创建子智能体",
+        "send_message" => "发送消息",
+        "wait_for_agents" => "等待子智能体",
+        "team_status" => "查看团队",
+        "terminate_agent" => "终止子智能体",
+        "todo_write" => "更新待办",
+        "ask_user" => "询问用户",
+        other => other,
+    }
 }
 
 /// 按平台选择 UI 字体。
