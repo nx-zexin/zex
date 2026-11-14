@@ -203,6 +203,39 @@ pub struct SessionSummary {
     pub title: String,
     /// 最后更新时间（unix 秒）。
     pub updated_at: i64,
+    /// 这个会话用的模型（`provider/model`；空串表示用配置默认）。
+    pub model: String,
+    /// 这个会话的运行模式。
+    pub mode: RunMode,
+}
+
+/// 运行模式：这一轮允许多"放得开"。
+///
+/// 定义在 core 而不是 policy，是因为它要跨层走：
+/// UI 选择 → 命令 → 内核执行。放在 policy 里会让 core 反向依赖。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunMode {
+    /// 正常：按风险分级，改动前要确认。
+    #[default]
+    Normal,
+    /// 计划模式：只读，任何会改变状态的操作一律拒绝。
+    Plan,
+}
+
+impl RunMode {
+    /// 给人看的名字（下拉菜单里显示的就是它）。
+    pub fn label(self) -> &'static str {
+        match self {
+            RunMode::Normal => "变更前确认",
+            RunMode::Plan => "只读计划",
+        }
+    }
+
+    /// 菜单里的候选，顺序即展示顺序。
+    pub fn all() -> [RunMode; 2] {
+        [RunMode::Normal, RunMode::Plan]
+    }
 }
 
 /// UI → 内核的命令。
@@ -218,6 +251,11 @@ pub enum UiCommand {
         /// 放请求里而不是改内核状态：切模型不必重启，也不必影响
         /// 正在跑的其它会话。
         model: Option<String>,
+        /// 覆盖本轮的运行模式。`None` 用内核默认。
+        ///
+        /// 和 `model` 一样走请求：模式是**每个会话**的选择，
+        /// 存在进程状态里会让并行会话互相污染。
+        mode: Option<RunMode>,
         /// 文本。
         text: String,
         /// 附件（图片等）。

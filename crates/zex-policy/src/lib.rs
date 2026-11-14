@@ -90,14 +90,10 @@ impl Verdict {
 }
 
 /// 运行模式。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Mode {
-    /// 正常：按风险分级。
-    #[default]
-    Normal,
-    /// 计划模式：只读，任何 L1+ 一律拒绝。
-    Plan,
-}
+///
+/// 定义在 `zex_core`：UI、命令、内核都要用它，放在这里会逼 core 反向依赖。
+/// 这个名字保留成别名，policy 内部读起来仍然自然。
+pub use zex_core::RunMode as Mode;
 
 /// 权限判定器。
 #[derive(Debug, Clone)]

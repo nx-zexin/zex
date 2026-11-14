@@ -173,6 +173,8 @@ fn session_summaries(agent: &Agent) -> Vec<zex_core::event::SessionSummary> {
             id: s.id.to_string(),
             title: s.title,
             updated_at: s.updated_at,
+            model: s.model,
+            mode: s.mode,
         })
         .collect()
 }
@@ -235,7 +237,7 @@ pub fn spawn_core(
             rt.block_on(async move {
                 while let Some(cmd) = cmd_rx.recv().await {
                     match cmd {
-                        UiCommand::UserPrompt { session, text, attachments, model } => {
+                        UiCommand::UserPrompt { session, text, attachments, model, mode } => {
                             // 派到后台执行，主循环立刻回去收下一条命令 ——
                             // 否则一个慢任务会把「切会话」「审批」全堵在队列里。
                             // 同一会话内部仍串行（run_task 里的会话锁），
@@ -252,6 +254,11 @@ pub fn spawn_core(
                             tokio::spawn(async move {
                                 // 请求级模型覆盖：换了模型不必重启内核
                                 let mut task_cfg = cfg.clone();
+                                // 运行模式同理：跟着这一轮走，不改进程状态，
+                                // 否则并行会话会互相覆盖对方的模式
+                                if let Some(m) = mode {
+                                    task_cfg.mode = m;
+                                }
                                 if let Some(m) = model.as_deref() {
                                     if let Some((p, rest)) = m.split_once('/') {
                                         if let Some(pc) = providers.get(p) {

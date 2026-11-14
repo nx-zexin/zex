@@ -20,6 +20,8 @@ pub struct Session {
     pub created_at: i64,
     /// 最后活动时间。
     pub updated_at: i64,
+    /// 这个会话的运行模式。
+    pub mode: zex_core::RunMode,
 }
 
 impl Store {
@@ -43,6 +45,7 @@ impl Store {
             cwd: cwd.to_string(),
             created_at: ts,
             updated_at: ts,
+            mode: zex_core::RunMode::default(),
         })
     }
 
@@ -50,7 +53,7 @@ impl Store {
     pub fn get_session(&self, id: &SessionId) -> Result<Option<Session>> {
         self.with_conn(|c| {
             c.query_row(
-                "SELECT id, title, model, cwd, created_at, updated_at FROM sessions WHERE id = ?1",
+                "SELECT id, title, model, cwd, created_at, updated_at, mode FROM sessions WHERE id = ?1",
                 params![id.as_str()],
                 |r| {
                     Ok(Session {
@@ -60,6 +63,7 @@ impl Store {
                         cwd: r.get(3)?,
                         created_at: r.get(4)?,
                         updated_at: r.get(5)?,
+                        mode: parse_mode(r.get::<_, String>(6)?),
                     })
                 },
             )
@@ -73,7 +77,7 @@ impl Store {
         self.with_conn(|c| {
             let mut stmt = c
                 .prepare(
-                    "SELECT id, title, model, cwd, created_at, updated_at
+                    "SELECT id, title, model, cwd, created_at, updated_at, mode
                      FROM sessions ORDER BY updated_at DESC LIMIT ?1",
                 )
                 .map_err(|e| Error::Store(e.to_string()))?;
@@ -86,6 +90,7 @@ impl Store {
                         cwd: r.get(3)?,
                         created_at: r.get(4)?,
                         updated_at: r.get(5)?,
+                        mode: parse_mode(r.get::<_, String>(6)?),
                     })
                 })
                 .map_err(|e| Error::Store(e.to_string()))?;
@@ -108,7 +113,7 @@ impl Store {
         self.with_conn(|c| {
             let mut stmt = c
                 .prepare(
-                    "SELECT id, title, model, cwd, created_at, updated_at
+                    "SELECT id, title, model, cwd, created_at, updated_at, mode
                      FROM sessions
                      WHERE id NOT IN (SELECT session_id FROM sub_agents)
                      ORDER BY updated_at DESC LIMIT ?1",
@@ -123,6 +128,7 @@ impl Store {
                         cwd: r.get(3)?,
                         created_at: r.get(4)?,
                         updated_at: r.get(5)?,
+                        mode: parse_mode(r.get::<_, String>(6)?),
                     })
                 })
                 .map_err(|e| Error::Store(e.to_string()))?;
@@ -142,6 +148,32 @@ impl Store {
                 params![title, id.as_str()],
             )
             .map_err(|e| Error::Store(format!("改标题失败: {e}")))?;
+            Ok(())
+        })
+    }
+
+    /// 记住这个会话用哪个模型（`provider/model`）。
+    ///
+    /// 不碰 `updated_at`：切模型不是"有活动"，否则侧栏顺序会莫名其妙地跳。
+    pub fn set_session_model(&self, id: &SessionId, model: &str) -> Result<()> {
+        self.with_conn(|c| {
+            c.execute(
+                "UPDATE sessions SET model = ?1 WHERE id = ?2",
+                params![model, id.as_str()],
+            )
+            .map_err(|e| Error::Store(format!("更新会话模型失败: {e}")))?;
+            Ok(())
+        })
+    }
+
+    /// 记住这个会话的运行模式。
+    pub fn set_session_mode(&self, id: &SessionId, mode: zex_core::RunMode) -> Result<()> {
+        self.with_conn(|c| {
+            c.execute(
+                "UPDATE sessions SET mode = ?1 WHERE id = ?2",
+                params![mode_str(mode), id.as_str()],
+            )
+            .map_err(|e| Error::Store(format!("更新会话模式失败: {e}")))?;
             Ok(())
         })
     }
@@ -171,6 +203,33 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_mode_defaults_to_normal_and_roundtrips() {
+        let s = Store::in_memory().unwrap();
+        let ses = s.create_session("模式", "deepseek-chat", "/tmp").unwrap();
+        // 新会话默认按风险确认，不是"啥都放行"
+        assert_eq!(s.get_session(&ses.id).unwrap().unwrap().mode, zex_core::RunMode::Normal);
+
+        s.set_session_mode(&ses.id, zex_core::RunMode::Plan).unwrap();
+        assert_eq!(s.get_session(&ses.id).unwrap().unwrap().mode, zex_core::RunMode::Plan);
+
+        // 列表查询也要带上，否则切会话时读不回来
+        let listed = s.list_visible_sessions(10).unwrap();
+        assert_eq!(listed[0].mode, zex_core::RunMode::Plan);
+    }
+
+    #[test]
+    fn set_session_model_persists() {
+        let s = Store::in_memory().unwrap();
+        let ses = s.create_session("模型", "deepseek-chat", "/tmp").unwrap();
+        s.set_session_model(&ses.id, "deepseek/deepseek-reasoner")
+            .unwrap();
+        assert_eq!(
+            s.get_session(&ses.id).unwrap().unwrap().model,
+            "deepseek/deepseek-reasoner"
+        );
+    }
 
     #[test]
     fn create_and_read_back() {
@@ -238,5 +297,24 @@ mod tests {
         let ses = s.create_session("x", "m", "/tmp").unwrap();
         s.delete_session(&ses.id).unwrap();
         assert!(s.get_session(&ses.id).unwrap().is_none());
+    }
+}
+
+/// 从库里读出来的模式字符串转回枚举。
+///
+/// 认不出来一律按 Normal：宁可多问一次，也不要因为一个坏值
+/// 静默变成"少问一次"。
+fn parse_mode(raw: String) -> zex_core::RunMode {
+    match raw.as_str() {
+        "plan" => zex_core::RunMode::Plan,
+        _ => zex_core::RunMode::Normal,
+    }
+}
+
+/// 枚举转存库字符串。
+fn mode_str(mode: zex_core::RunMode) -> &'static str {
+    match mode {
+        zex_core::RunMode::Normal => "normal",
+        zex_core::RunMode::Plan => "plan",
     }
 }

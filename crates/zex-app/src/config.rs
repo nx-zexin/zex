@@ -16,7 +16,7 @@ use zex_core::{Error, Result};
 use zex_llm::{ProviderConfig, ProviderKind};
 
 /// 一个 provider 的 JSON 表示。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProviderEntry {
     /// `openai-compat` 或 `anthropic`。
     pub kind: String,
@@ -28,6 +28,12 @@ pub struct ProviderEntry {
     /// 额外请求头。
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
+    /// 这个 provider 下可选的模型名。
+    ///
+    /// 留空时按 provider 名回退到内置清单（见 [`builtin_models`]）。
+    /// 不在这里硬编码全部：模型上下线比程序发版快，用户能自己写才跟得上。
+    #[serde(default)]
+    pub models: Vec<String>,
 }
 
 /// `config.json` 的结构。
@@ -48,10 +54,16 @@ pub struct ResolvedConfig {
     pub provider: ProviderConfig,
     /// 模型名。
     pub model: String,
+    /// 默认模型所属的 provider 名。
+    pub provider_name: String,
     /// 配置文件里声明的全部 provider（按名字索引）。
     ///
     /// 界面上的模型切换要能列出可选项，光有默认那一个不够。
     pub all_providers: BTreeMap<String, ProviderConfig>,
+    /// 每个 provider 下可选的模型（provider → 模型名列表）。
+    ///
+    /// 供模型菜单做二级展示：一级机构，二级模型。
+    pub models: BTreeMap<String, Vec<String>>,
 }
 
 /// Zex 的配置目录 `~/.zex`。
@@ -93,11 +105,15 @@ pub fn load() -> Result<ResolvedConfig> {
             headers: BTreeMap::new(),
         };
         let mut all = BTreeMap::new();
-        all.insert(kind_str, provider.clone());
+        all.insert(kind_str.clone(), provider.clone());
+        let mut models = BTreeMap::new();
+        models.insert(kind_str.clone(), model_list(&ProviderEntry::default(), &kind_str, Some(&model)));
         return Ok(ResolvedConfig {
             provider,
             model,
+            provider_name: kind_str,
             all_providers: all,
+            models,
         });
     }
 
@@ -157,6 +173,14 @@ pub fn load() -> Result<ResolvedConfig> {
         }
     }
 
+    // 每个 provider 的模型清单：默认模型的 provider 要把当前模型排进去，
+    // 否则菜单里选不中正在用的那个
+    let mut models = BTreeMap::new();
+    for (name, e) in &file.providers {
+        let cur = (name == &provider_name).then_some(model.as_str());
+        models.insert(name.clone(), model_list(e, name, cur));
+    }
+
     Ok(ResolvedConfig {
         provider: ProviderConfig {
             kind,
@@ -165,8 +189,49 @@ pub fn load() -> Result<ResolvedConfig> {
             headers: entry.headers.clone(),
         },
         model,
+        provider_name,
         all_providers,
+        models,
     })
+}
+
+/// 内置的 provider → 常见模型清单。
+///
+/// 只是**起点**：配置里写了 `models` 就以配置为准。模型上下线比程序发版快，
+/// 这里列的东西用户随时能覆盖。
+fn builtin_models(provider: &str) -> &'static [&'static str] {
+    match provider.to_ascii_lowercase().as_str() {
+        "deepseek" => &["deepseek-chat", "deepseek-reasoner", "deepseek-flash"],
+        "anthropic" | "claude" => &[
+            "claude-opus-4-6",
+            "claude-sonnet-4-6",
+            "claude-haiku-4-5",
+        ],
+        "openai" | "gpt" => &["gpt-5", "gpt-5-mini", "o4"],
+        "moonshot" | "moonshotai" | "kimi" => &["kimi-k2", "kimi-k2-turbo"],
+        "google" | "gemini" => &["gemini-2.5-pro", "gemini-2.5-flash"],
+        _ => &[],
+    }
+}
+
+/// 一个 provider 的可选模型清单。
+///
+/// 顺序：配置显式声明 > 内置清单 > 当前模型兜底。
+/// 当前模型永远排在第一位 —— 它是"正在用的"，不该藏在列表深处。
+fn model_list(entry: &ProviderEntry, name: &str, current: Option<&str>) -> Vec<String> {
+    let mut list: Vec<String> = if !entry.models.is_empty() {
+        entry.models.clone()
+    } else {
+        builtin_models(name)
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect()
+    };
+    if let Some(cur) = current {
+        list.retain(|m| m != cur);
+        list.insert(0, cur.to_string());
+    }
+    list
 }
 
 fn read_file_config() -> Option<FileConfig> {
@@ -227,6 +292,36 @@ pub fn example_config() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_list_falls_back_to_builtin() {
+        // 配置里没写 models 时按 provider 名给一份起点
+        let e = ProviderEntry::default();
+        let list = model_list(&e, "deepseek", Some("deepseek-flash"));
+        // 正在用的模型永远排第一
+        assert_eq!(list[0], "deepseek-flash");
+        assert!(list.iter().any(|m| m == "deepseek-chat"));
+        // 内置清单里也有它，但不能出现两次
+        assert_eq!(list.iter().filter(|m| *m == "deepseek-flash").count(), 1);
+    }
+
+    #[test]
+    fn model_list_prefers_configured() {
+        let e = ProviderEntry {
+            models: vec!["a".into(), "b".into()],
+            ..Default::default()
+        };
+        let list = model_list(&e, "deepseek", Some("b"));
+        assert_eq!(list, vec!["b".to_string(), "a".to_string()]);
+    }
+
+    #[test]
+    fn unknown_provider_still_lists_current_model() {
+        // 没见过的 provider 名不该让菜单变空
+        let e = ProviderEntry::default();
+        let list = model_list(&e, "my-local-llama", Some("llama-3"));
+        assert_eq!(list, vec!["llama-3".to_string()]);
+    }
 
     #[test]
     fn parses_both_kinds() {

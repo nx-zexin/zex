@@ -7,7 +7,7 @@ use rusqlite::Connection;
 use zex_core::{Error, Result};
 
 /// 当前 schema 版本。新增迁移时 +1。
-pub const LATEST: i64 = 3;
+pub const LATEST: i64 = 4;
 
 /// 跑完所有未应用的迁移。
 pub fn run(conn: &Connection) -> Result<()> {
@@ -28,6 +28,7 @@ pub fn run(conn: &Connection) -> Result<()> {
             0 => v1_initial(conn)?,
             1 => v2_tasks(conn)?,
             2 => v3_sub_agents(conn)?,
+            3 => v4_session_mode(conn)?,
             other => {
                 // 正常情况下不可达：version 已在上面校验过 <= LATEST
                 return Err(Error::Store(format!("迁移分支缺失: 版本 {other}")));
@@ -259,5 +260,19 @@ fn v3_sub_agents(conn: &Connection) -> Result<()> {
         "#,
     )
     .map_err(|e| Error::Store(format!("v3 迁移失败: {e}")))?;
+    Ok(())
+}
+
+/// v4：会话自己的运行模式。
+///
+/// 模式是**每个会话**的选择：一个会话在只读地读代码，另一个在放开改，
+/// 两者并存完全是合理用法。存在进程状态里会互相污染。
+fn v4_session_mode(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        ALTER TABLE sessions ADD COLUMN mode TEXT NOT NULL DEFAULT 'normal';
+        "#,
+    )
+    .map_err(|e| Error::Store(format!("v4 迁移失败: {e}")))?;
     Ok(())
 }

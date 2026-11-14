@@ -20,7 +20,7 @@ pub mod shell_risk;
 pub mod tool;
 
 pub use error::{Error, Result};
-pub use event::{ApprovalRequest, CoreEvent, EndReason, RememberScope, UiCommand};
+pub use event::{ApprovalRequest, CoreEvent, EndReason, RememberScope, RunMode, UiCommand};
 pub use ids::{ApprovalId, SessionId, TaskId, ToolCallId, TurnId};
 pub use message::{ImageRef, Message, Part, Role, ToolCall, Usage};
 pub use risk::{Decision, Risk};

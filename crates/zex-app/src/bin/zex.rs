@@ -133,6 +133,10 @@ enum ViewMode {
 struct SessionItem {
     id: String,
     title: String,
+    /// 这个会话上次用的模型（`provider/model`），空=用配置默认。
+    model: String,
+    /// 这个会话上次的运行模式。
+    mode: zex_core::RunMode,
 }
 
 /// 主视图。
@@ -193,8 +197,12 @@ struct ChatView {
     menu_cursor: usize,
     /// 本轮用哪个模型（`provider/model`）；None 用配置默认。
     selected_model: Option<String>,
-    /// 可选的模型清单（来自配置文件的 provider）。
-    available_models: Vec<String>,
+    /// 可选的模型清单，按 provider 分组：一级机构，二级模型。
+    models_by_provider: std::collections::BTreeMap<String, Vec<String>>,
+    /// 默认模型所属的 provider，用于菜单里的选中标记。
+    active_provider: String,
+    /// 当前会话的运行模式。
+    run_mode: zex_core::RunMode,
     /// 正在编辑模型名。
     editing_model: bool,
     model_input: Entity<InputState>,
@@ -227,7 +235,8 @@ impl ChatView {
         active_session: String,
         cwd: String,
         model: String,
-        available_models: Vec<String>,
+        models_by_provider: std::collections::BTreeMap<String, Vec<String>>,
+        active_provider: String,
         history: Vec<MsgItem>,
         tasks: Vec<zex_store::tasks::TaskRecord>,
         store: Arc<zex_store::Store>,
@@ -357,7 +366,9 @@ impl ChatView {
             history_search_open: false,
             menu_cursor: 0,
             selected_model: None,
-            available_models,
+            models_by_provider,
+            active_provider,
+            run_mode: zex_core::RunMode::Normal,
             editing_model: false,
             model_input,
             input_history: restored_history,
@@ -844,11 +855,15 @@ impl ChatView {
             return;
         }
         // 只接受配置里声明过的 provider，否则那一轮会静默用默认模型
-        let ok = self.available_models.iter().any(|m| *m == v)
+        // 认「provider/model」和「光写模型名」两种写法：
+        // 光写模型名时，只要它属于任一声明过的 provider 就放行
+        let ok = self
+            .models_by_provider
+            .values()
+            .any(|list| list.iter().any(|m| m == &v))
             || self
-                .available_models
-                .iter()
-                .any(|m| m.split('/').next() == v.split('/').next());
+                .models_by_provider
+                .contains_key(v.split('/').next().unwrap_or(""));
         if ok {
             self.selected_model = if v == self.model { None } else { Some(v) };
         } else {
@@ -1024,6 +1039,7 @@ impl ChatView {
         let tx = self.cmd_tx.clone();
         let session = self.active_session.clone();
         let selected_model = self.selected_model.clone();
+        let run_mode = self.run_mode;
         cx.spawn(async move |_this, _cx| {
             let _ = tx
                 .send(UiCommand::UserPrompt {
@@ -1031,6 +1047,7 @@ impl ChatView {
                     text,
                     attachments: images,
                     model: selected_model,
+                    mode: Some(run_mode),
                 })
                 .await;
         })
@@ -1446,6 +1463,19 @@ impl ChatView {
                 self.messages = history_to_items(&history);
                 self.active_session = session.clone();
                 self.sessions = summaries_to_items(&sessions);
+                // 模型和模式是会话自己的属性：切过去就该是它原来的样子，
+                // 而不是把上一个会话的选择带过来
+                if let Some(item) = self.sessions.iter().find(|s| s.id == *session) {
+                    self.selected_model = if item.model.is_empty() {
+                        None
+                    } else if item.model.contains('/') {
+                        Some(item.model.clone())
+                    } else {
+                        // 老数据只存了裸模型名，用默认 provider 补全
+                        Some(format!("{}/{}", self.active_provider, item.model))
+                    };
+                    self.run_mode = item.mode;
+                }
                 // 每个会话有自己的指令史，切过去要换一份
                 self.input_history = load_input_history(&self.store, &session);
                 self.history_cursor = None;
@@ -2632,16 +2662,128 @@ impl ChatView {
                 .child(Input::new(&self.model_input))
                 .into_any_element()
         } else {
+            // selected_model 是 `provider/model`；按钮上只留模型名，
+            // provider 在菜单里当分组标题
+            let cur_full = self
+                .selected_model
+                .clone()
+                .unwrap_or_else(|| format!("{}/{}", self.active_provider, self.model));
+            let cur_label = cur_full
+                .split('/')
+                .nth(1)
+                .unwrap_or(&cur_full)
+                .to_string();
+            let groups: Vec<(String, Vec<String>)> = self
+                .models_by_provider
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            let view = cx.entity().downgrade();
+
             Button::new("switch-model")
                 .ghost()
-                .label(format!(
-                    "{}",
-                    self.selected_model.as_deref().unwrap_or(&self.model)
-                ))
+                .label(cur_label)
                 .dropdown_caret(true)
-                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                    this.begin_model_edit(window, cx);
-                }))
+                .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, window, cx| {
+                    let mut menu = menu;
+                    // 一级：provider；二级：这个 provider 下的模型
+                    for (provider, models) in groups.iter() {
+                        let provider_name = provider.clone();
+                        let models = models.clone();
+                        let view = view.clone();
+                        let cur_full = cur_full.clone();
+                        menu = menu.submenu(
+                            provider_name.clone(),
+                            window,
+                            cx,
+                            move |submenu, _w, _c| {
+                                let mut submenu = submenu;
+                                for m in models.iter() {
+                                    let full = format!("{provider_name}/{m}");
+                                    let selected = full == cur_full;
+                                    let view = view.clone();
+                                    submenu = submenu.item(
+                                        PopupMenuItem::new(m.clone())
+                                            .checked(selected)
+                                            .on_click(move |_, _w, cx| {
+                                                let full = full.clone();
+                                                view.update(cx, |this, cx| {
+                                                    this.selected_model = Some(full.clone());
+                                                    // 落到会话上：切走再切回来还是这个模型
+                                                    let sid = zex_core::SessionId::from(
+                                                        this.active_session.clone(),
+                                                    );
+                                                    let _ =
+                                                        this.store.set_session_model(&sid, &full);
+                                                    if let Some(item) = this
+                                                        .sessions
+                                                        .iter_mut()
+                                                        .find(|s| s.id == this.active_session)
+                                                    {
+                                                        item.model = full.clone();
+                                                    }
+                                                    cx.notify();
+                                                })
+                                                .ok();
+                                            }),
+                                    );
+                                }
+                                submenu
+                            },
+                        );
+                    }
+                    // 配置里没声明的模型也允许手填：provider 组合是用户自己写的
+                    menu.separator().item(
+                        PopupMenuItem::new("手动输入模型名…").on_click({
+                            let view = view.clone();
+                            move |_, window, cx| {
+                                view.update(cx, |this, cx| this.begin_model_edit(window, cx))
+                                    .ok();
+                            }
+                        }),
+                    )
+                })
+                .into_any_element()
+        };
+
+        // 运行模式：决定这一轮工具调用的放行尺度。
+        // 放在模型旁边，因为两者都是"这条消息怎么跑"的开关。
+        let mode_picker = {
+            let cur = self.run_mode;
+            let view = cx.entity().downgrade();
+            Button::new("run-mode")
+                .ghost()
+                .label(cur.label())
+                .dropdown_caret(true)
+                .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _window, _cx| {
+                    let mut menu = menu;
+                    for m in zex_core::RunMode::all() {
+                        let view = view.clone();
+                        menu = menu.item(
+                            PopupMenuItem::new(m.label())
+                                .checked(m == cur)
+                                .on_click(move |_, _w, cx| {
+                                    view.update(cx, |this, cx| {
+                                        this.run_mode = m;
+                                        let sid = zex_core::SessionId::from(
+                                            this.active_session.clone(),
+                                        );
+                                        let _ = this.store.set_session_mode(&sid, m);
+                                        if let Some(item) = this
+                                            .sessions
+                                            .iter_mut()
+                                            .find(|s| s.id == this.active_session)
+                                        {
+                                            item.mode = m;
+                                        }
+                                        cx.notify();
+                                    })
+                                    .ok();
+                                }),
+                        );
+                    }
+                    menu
+                })
                 .into_any_element()
         };
 
@@ -2685,7 +2827,8 @@ impl ChatView {
                         .flex()
                         .items_center()
                         .gap_2()
-                        .child(model_picker),
+                        .child(model_picker)
+                        .child(mode_picker),
                 ),
         )
             .child(
@@ -3170,7 +3313,12 @@ fn summaries_to_items(list: &[zex_core::event::SessionSummary]) -> Vec<SessionIt
             } else {
                 s.title.clone()
             };
-            SessionItem { id: s.id.clone(), title }
+            SessionItem {
+                id: s.id.clone(),
+                title,
+                model: s.model.clone(),
+                mode: s.mode,
+            }
         })
         .collect()
 }
@@ -3261,7 +3409,12 @@ fn load_sessions(store: &zex_store::Store) -> Vec<SessionItem> {
             } else {
                 s.title
             };
-            SessionItem { id: s.id.as_str().to_string(), title }
+            SessionItem {
+                id: s.id.as_str().to_string(),
+                title,
+                model: s.model,
+                mode: s.mode,
+            }
         })
         .collect()
 }
@@ -3294,14 +3447,11 @@ fn main() {
     let active_session = agent.session_id().as_str().to_string();
     let sessions = load_sessions(agent.store());
     let model = cfg.model.clone();
+    let provider_name = cfg.provider_name.clone();
     // 模型菜单：每个 provider 配当前模型名的后缀。配置里没写模型清单，
     // 用「provider/当前模型」的组合列出最务实 —— 切 provider 时
     // 模型名不变，用户可以在 config.json 里改。
-    let available_models: Vec<String> = cfg
-        .all_providers
-        .keys()
-        .map(|p| format!("{p}/{model}"))
-        .collect();
+    let models_by_provider = cfg.models.clone();
     let cwd_str = cwd.display().to_string();
     let history = history_to_items(agent.history());
     let tasks = load_tasks(agent.store());
@@ -3363,7 +3513,8 @@ fn main() {
                         active,
                         cwd,
                         model,
-                        available_models,
+                        models_by_provider,
+                        provider_name.clone(),
                         history,
                         tasks,
                         store_for_view,
@@ -3458,6 +3609,7 @@ fn main() {
                                 text: prompt,
                                 attachments: vec![],
                                 model: None,
+                                mode: None,
                             });
                         }
                     }
