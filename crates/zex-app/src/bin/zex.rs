@@ -686,14 +686,17 @@ impl ChatView {
         Some(menu.into_any_element())
     }
 
-    /// 选中菜单里第 `i` 项并执行。
+    /// 选中菜单里第 `i` 项。
+    ///
+    /// `/` 只做补全，不执行 —— 命令多带参数（`/model deepseek/…`），
+    /// 选中就发出去的话用户没有补参数的余地。`@` 是插入引用，同样不改内容。
     fn menu_pick(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
         let items = self.menu_items(cx);
         let Some(item) = items.get(i).cloned() else {
             return;
         };
         if self.slash_open {
-            self.run_slash(&item, window, cx);
+            self.complete_slash(&item, window, cx);
         } else if self.at_open {
             self.insert_at_reference(&item, window, cx);
         } else if self.history_search_open {
@@ -702,6 +705,22 @@ impl ChatView {
             self.history_search_open = false;
             cx.notify();
         }
+    }
+
+    /// 把选中的命令补全进输入框，光标停在末尾，等用户自己回车执行。
+    fn complete_slash(&mut self, cmd: &str, window: &mut Window, cx: &mut Context<Self>) {
+        // 带一个尾随空格：多数命令后面要跟参数，直接接着打字即可
+        let text = format!("{cmd} ");
+        let end = text.len();
+        self.input.update(cx, |st, cx| {
+            st.set_value(text, window, cx);
+            // set_value 内部会 reset_selection（多行输入回到 0），
+            // 不显式挪的话下一个字会插到命令前面
+            st.set_selected_range(end..end, cx);
+        });
+        self.menu_cursor = 0;
+        self.slash_open = false;
+        cx.notify();
     }
 
     /// 当前菜单的候选。
@@ -791,8 +810,11 @@ impl ChatView {
             Some(i) => format!("{}@{} ", &v[..i], path),
             None => format!("{v}@{path} "),
         };
-        self.input
-            .update(cx, |st, cx| st.set_value(new.clone(), window, cx));
+        let end = new.len();
+        self.input.update(cx, |st, cx| {
+            st.set_value(new, window, cx);
+            st.set_selected_range(end..end, cx);
+        });
         self.at_open = false;
         cx.notify();
     }
@@ -3745,18 +3767,6 @@ fn truncate_for_display(s: &str, limit: usize) -> String {
     let head: String = s.chars().take(limit * 2 / 3).collect();
     let tail: String = s.chars().skip(n - limit / 3).collect();
     format!("{head}\n\n… 省略 {} 字符 …\n\n{tail}", n - limit)
-}
-
-/// 把多行文本压成单行并截断，用于工具卡片的摘要行。
-fn one_line(s: &str, max: usize) -> String {
-    let flat = s.split_whitespace().collect::<Vec<_>>().join(" ");
-    let n = flat.chars().count();
-    if n <= max {
-        return flat;
-    }
-    let mut out: String = flat.chars().take(max).collect();
-    out.push('…');
-    out
 }
 
 /// 工具名 → 界面显示名。未知工具原样返回。
