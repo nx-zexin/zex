@@ -251,6 +251,7 @@ mod tests {
             "coder",
             "干活",
             child.id.as_str(),
+            mine.id.as_str(),
             crate::subagents::SubAgentState::Running,
             None,
         )

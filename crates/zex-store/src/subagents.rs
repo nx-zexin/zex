@@ -67,6 +67,8 @@ pub struct SubAgentRecord {
     pub description: String,
     /// 它占用的会话。
     pub session_id: String,
+    /// 派生它的主会话（团队列表按这个过滤）。
+    pub parent_session: String,
     /// 状态。
     pub status: SubAgentState,
     /// 结果摘要。
@@ -85,6 +87,7 @@ impl Store {
         role: &str,
         description: &str,
         session_id: &str,
+        parent_session: &str,
         status: SubAgentState,
         result: Option<&str>,
     ) -> Result<()> {
@@ -92,16 +95,26 @@ impl Store {
         self.with_conn(|conn| {
             conn.execute(
                 "INSERT INTO sub_agents
-                   (id, role, description, session_id, status, result, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
+                   (id, role, description, session_id, parent_session, status, result, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)
                  ON CONFLICT(id) DO UPDATE SET
                    role = excluded.role,
                    description = excluded.description,
                    session_id = excluded.session_id,
+                   parent_session = excluded.parent_session,
                    status = excluded.status,
                    result = excluded.result,
                    updated_at = excluded.updated_at",
-                params![id, role, description, session_id, status.as_str(), result, ts],
+                params![
+                    id,
+                    role,
+                    description,
+                    session_id,
+                    parent_session,
+                    status.as_str(),
+                    result,
+                    ts
+                ],
             )
             .map_err(|e| Error::Store(format!("写子智能体失败: {e}")))?;
             Ok(())
@@ -113,7 +126,8 @@ impl Store {
         self.with_conn(|conn| {
             let mut stmt = conn
                 .prepare(
-                    "SELECT id, role, description, session_id, status, result, created_at, updated_at
+                    "SELECT id, role, description, session_id, parent_session,
+                            status, result, created_at, updated_at
                      FROM sub_agents ORDER BY updated_at DESC",
                 )
                 .map_err(|e| Error::Store(format!("查子智能体失败: {e}")))?;
@@ -124,10 +138,11 @@ impl Store {
                         role: r.get(1)?,
                         description: r.get(2)?,
                         session_id: r.get(3)?,
-                        status: SubAgentState::parse(&r.get::<_, String>(4)?),
-                        result: r.get(5)?,
-                        created_at: r.get(6)?,
-                        updated_at: r.get(7)?,
+                        parent_session: r.get(4)?,
+                        status: SubAgentState::parse(&r.get::<_, String>(5)?),
+                        result: r.get(6)?,
+                        created_at: r.get(7)?,
+                        updated_at: r.get(8)?,
                     })
                 })
                 .map_err(|e| Error::Store(format!("读子智能体失败: {e}")))?;
@@ -173,7 +188,13 @@ mod tests {
     #[test]
     fn upsert_then_list_roundtrip() {
         let s = Store::in_memory().unwrap();
-        s.upsert_sub_agent("a1", "coder", "写代码", "ses_1", SubAgentState::Running, None)
+        s.upsert_sub_agent(
+            "a1",
+            "coder",
+            "写代码",
+            "ses_1",
+            "ses_parent",
+            SubAgentState::Running, None)
             .unwrap();
         let list = s.list_sub_agents().unwrap();
         assert_eq!(list.len(), 1);
@@ -184,13 +205,20 @@ mod tests {
     #[test]
     fn upsert_updates_status_in_place() {
         let s = Store::in_memory().unwrap();
-        s.upsert_sub_agent("a1", "coder", "写代码", "ses_1", SubAgentState::Running, None)
+        s.upsert_sub_agent(
+            "a1",
+            "coder",
+            "写代码",
+            "ses_1",
+            "ses_parent",
+            SubAgentState::Running, None)
             .unwrap();
         s.upsert_sub_agent(
             "a1",
             "coder",
             "写代码",
             "ses_1",
+            "ses_parent",
             SubAgentState::Completed,
             Some("做完了"),
         )
@@ -204,9 +232,21 @@ mod tests {
     #[test]
     fn orphans_become_interrupted() {
         let s = Store::in_memory().unwrap();
-        s.upsert_sub_agent("a1", "coder", "x", "ses_1", SubAgentState::Running, None)
+        s.upsert_sub_agent(
+            "a1",
+            "coder",
+            "x",
+            "ses_1",
+            "ses_parent",
+            SubAgentState::Running, None)
             .unwrap();
-        s.upsert_sub_agent("a2", "coder", "y", "ses_2", SubAgentState::Completed, Some("ok"))
+        s.upsert_sub_agent(
+            "a2",
+            "coder",
+            "y",
+            "ses_2",
+            "ses_parent",
+            SubAgentState::Completed, Some("ok"))
             .unwrap();
         assert_eq!(s.interrupt_orphan_sub_agents().unwrap(), 1);
         let list = s.list_sub_agents().unwrap();
@@ -219,7 +259,13 @@ mod tests {
     #[test]
     fn delete_removes_row() {
         let s = Store::in_memory().unwrap();
-        s.upsert_sub_agent("a1", "coder", "x", "ses_1", SubAgentState::Running, None)
+        s.upsert_sub_agent(
+            "a1",
+            "coder",
+            "x",
+            "ses_1",
+            "ses_parent",
+            SubAgentState::Running, None)
             .unwrap();
         s.delete_sub_agent("a1").unwrap();
         assert!(s.list_sub_agents().unwrap().is_empty());
@@ -238,14 +284,21 @@ mod restart_tests {
 
         {
             let s = Store::open(&path).unwrap();
-            s.upsert_sub_agent("coder-1", "coder", "查依赖", "ses_a", SubAgentState::Running, None)
+            s.upsert_sub_agent(
+            "coder-1",
+            "coder",
+            "查依赖",
+            "ses_a",
+            "ses_parent",
+            SubAgentState::Running, None)
                 .unwrap();
             s.upsert_sub_agent(
-                "reviewer-1",
-                "reviewer",
-                "审代码",
-                "ses_b",
-                SubAgentState::Completed,
+            "reviewer-1",
+            "reviewer",
+            "审代码",
+            "ses_b",
+            "ses_parent",
+            SubAgentState::Completed,
                 Some("没问题"),
             )
             .unwrap();

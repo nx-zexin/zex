@@ -225,11 +225,6 @@ struct ChatView {
     history_cursor: Option<usize>,
     /// 开始回溯前的草稿，回溯回来要还原。
     history_draft: String,
-    /// 团队面板是否收起。
-    ///
-    /// 子智能体在跑的时候这块会一直占着对话底部，用户想专心看主线
-    /// 内容时会碍事 —— 收起来只留一行摘要。
-    team_collapsed: bool,
     /// 右侧子智能体面板的宽度（像素，可拖拽）。
     subagent_panel_width: f32,
     /// 正在拖面板边框。
@@ -393,7 +388,6 @@ impl ChatView {
             input_history: restored_history,
             history_cursor: None,
             history_draft: String::new(),
-            team_collapsed: false,
             subagent_panel_width: DEFAULT_PANEL_WIDTH,
             subagent_resizing: false,
             subagent_drag_origin: (0.0, 0.0),
@@ -1097,6 +1091,18 @@ impl ChatView {
     ///
     /// 从库里读一份快照 —— 切会话那套会丢掉当前对话，而用户这里
     /// 只是想「瞄一眼」。
+    /// 当前会话派生的子智能体。
+    ///
+    /// 团队是**按会话**的：registry 里存着所有会话派出去的 agent，
+    /// 但界面上只该看到自己这边的 —— 否则切到别的对话，
+    /// 门口还杵着一队不相干的人在报进度。
+    fn visible_team(&self) -> Vec<&zex_core::event::SubAgentView> {
+        self.team
+            .iter()
+            .filter(|a| a.parent_session == self.active_session)
+            .collect()
+    }
+
     fn open_subagent_panel(&mut self, id: &str, cx: &mut Context<Self>) {
         let info = self.team.iter().find(|a| a.id == id).cloned();
         let (session, description, status, id) = match info {
@@ -2152,133 +2158,6 @@ impl ChatView {
             .into_any_element()
     }
 
-    fn render_team(&self, cx: &mut Context<Self>) -> AnyElement {
-        let running = self.team.iter().filter(|a| a.status == "执行中").count();
-
-        let mut panel = div()
-            .flex_none()
-            .mx_6()
-            .mb_3()
-            .rounded_lg()
-            .border_1()
-            .border_color(rgb(BORDER))
-            .bg(rgb(BG_RESULT))
-            .overflow_hidden();
-
-        // 标题行：整行可点，展开/收起
-        let arrow = if self.team_collapsed {
-            IconName::ChevronRight
-        } else {
-            IconName::ChevronDown
-        };
-        let mut head = div()
-            .flex()
-            .items_center()
-            .gap_2()
-            .px_4()
-            .py_2()
-            .child(
-                div()
-                    .text_color(rgb(TEXT_DIM))
-                    .child(Icon::new(arrow).text_size(px(12.0))),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(rgb(TEXT))
-                    .child("团队"),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(TEXT_MUTED))
-                    .child(if running > 0 {
-                        format!("{} 个执行中 · 共 {} 个", running, self.team.len())
-                    } else {
-                        format!("{} 个", self.team.len())
-                    }),
-            )
-            .child(div().flex_1())
-            .child(
-                Button::new("toggle-team")
-                    .ghost()
-                    .label(if self.team_collapsed { "展开" } else { "收起" })
-                    .on_click(cx.listener(|this, _: &ClickEvent, _w, cx| {
-                        this.team_collapsed = !this.team_collapsed;
-                        cx.notify();
-                    })),
-            );
-        if !self.team_collapsed {
-            head = head.border_b_1().border_color(rgb(BORDER_SOFT));
-        }
-        panel = panel.child(head);
-
-        // 收起来就只留这一行摘要
-        if self.team_collapsed {
-            return panel.into_any_element();
-        }
-
-        for a in &self.team {
-            let (dot, dot_bg) = match a.status.as_str() {
-                "执行中" => (BRAND, BRAND_SOFT),
-                "已完成" => (OK, OK_SOFT),
-                "失败" => (DANGER, DANGER_SOFT),
-                _ => (TEXT_DIM, BG_HOVER),
-            };
-
-            let mut row = div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .px_4()
-                .py_2()
-                .child(div().size(px(6.0)).rounded_full().bg(rgb(dot)));
-
-            row = row
-                .child(
-                    div()
-                        .text_xs()
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(rgb(TEXT))
-                        .child(a.id.clone()),
-                )
-                .child(
-                    div()
-                        .px_1p5()
-                        .rounded_sm()
-                        .bg(rgb(dot_bg))
-                        .text_color(rgb(dot))
-                        .text_xs()
-                        .child(a.status.clone()),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .text_xs()
-                        .text_color(rgb(TEXT_MUTED))
-                        .overflow_hidden()
-                        .child(a.description.clone()),
-                );
-
-            // 「查看」开右侧面板，不切走当前对话
-            let agent_id = a.id.clone();
-            row = row.child(
-                Button::new(SharedString::from(format!("team-open-{}", a.id)))
-                    .ghost()
-                    .label("查看")
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _w, cx| {
-                        this.open_subagent_panel(&agent_id, cx);
-                    })),
-            );
-
-            panel = panel.child(row);
-        }
-
-        panel.into_any_element()
-    }
-
     fn render_task_card(
         &self,
         t: &zex_store::tasks::TaskRecord,
@@ -2887,6 +2766,96 @@ impl ChatView {
                 .into_any_element()
         };
 
+        // 团队入口：只在当前会话真的派过子智能体时出现。
+        // 它是「查看」而不是「设置」，所以和模型/模式同一行摆着，
+        // 但不带下拉箭头 —— 点开是名单，不是一个可选项。
+        let team_entry = {
+            let members: Vec<(String, String, String)> = self
+                .visible_team()
+                .iter()
+                .map(|a| (a.id.clone(), a.status.clone(), a.description.clone()))
+                .collect();
+            if members.is_empty() {
+                None
+            } else {
+                let running = members.iter().filter(|(_, s, _)| s == "执行中").count();
+                let label = if running > 0 {
+                    format!("团队 {} · {} 进行中", members.len(), running)
+                } else {
+                    format!("团队 {}", members.len())
+                };
+                let view = cx.entity().downgrade();
+                Some(
+                    Button::new("team-menu")
+                        .ghost()
+                        .icon(Icon::default().path("icons/users.svg"))
+                        .label(label)
+                        .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _w, _cx| {
+                            let mut menu = menu.min_w(px(260.0));
+                            for (id, status, desc) in members.iter() {
+                                let view = view.clone();
+                                let open_id = id.clone();
+                                let (id, status, desc) =
+                                    (id.clone(), status.clone(), desc.clone());
+                                menu = menu.item(
+                                    PopupMenuItem::element(move |_w, _c| {
+                                        let (dot, dot_bg) = match status.as_str() {
+                                            "执行中" => (BRAND, BRAND_SOFT),
+                                            "已完成" => (OK, OK_SOFT),
+                                            "失败" => (DANGER, DANGER_SOFT),
+                                            _ => (TEXT_DIM, BG_HOVER),
+                                        };
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .w_full()
+                                            .child(
+                                                div()
+                                                    .size(px(6.0))
+                                                    .rounded_full()
+                                                    .bg(rgb(dot)),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_sm()
+                                                    .font_weight(FontWeight::MEDIUM)
+                                                    .child(id.clone()),
+                                            )
+                                            .child(
+                                                div()
+                                                    .px_1p5()
+                                                    .rounded_sm()
+                                                    .bg(rgb(dot_bg))
+                                                    .text_color(rgb(dot))
+                                                    .text_xs()
+                                                    .child(status.clone()),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .min_w(px(0.0))
+                                                    .text_xs()
+                                                    .text_color(rgb(TEXT_MUTED))
+                                                    .child(desc.clone()),
+                                            )
+                                    })
+                                    .on_click(move |_, _w, cx| {
+                                        let id = open_id.clone();
+                                        view.update(cx, |this, cx| {
+                                            this.open_subagent_panel(&id, cx)
+                                        })
+                                        .ok();
+                                    }),
+                                );
+                            }
+                            menu
+                        })
+                        .into_any_element(),
+                )
+            }
+        };
+
         composer.child(
             div()
                 .relative()
@@ -2928,7 +2897,8 @@ impl ChatView {
                         .items_center()
                         .gap_2()
                         .child(model_picker)
-                        .child(mode_picker),
+                        .child(mode_picker)
+                        .children(team_entry),
                 ),
         )
             .child(
@@ -3260,18 +3230,9 @@ impl Render for ChatView {
                     .child(match self.mode {
                         ViewMode::Dashboard => self.render_dashboard(window, cx),
                         ViewMode::Chat => {
-                            if self.team.is_empty() {
-                                feed.into_any_element()
-                            } else {
-                                div()
-                                    .flex_1()
-                                    .min_h(px(0.0))
-                                    .flex()
-                                    .flex_col()
-                                    .child(feed)
-                                    .child(self.render_team(cx))
-                                    .into_any_element()
-                            }
+                            // 团队入口已经收进编辑器，底部不再挂卡片：
+                            // 它挡在消息流和输入框之间，长对话时很碍事
+                            feed.into_any_element()
                         }
                     });
                 // 工作台模式下不需要输入框：还没决定要干什么

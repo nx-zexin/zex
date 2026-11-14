@@ -403,6 +403,8 @@ pub struct SubAgentView {
     pub description: String,
     /// 它占用的会话，点进去能看过程。
     pub session: String,
+    /// 派生它的主会话。团队列表只显示属于当前会话的那些。
+    pub parent_session: String,
     /// 结果摘要（跑完之后才有）。
     pub result: Option<String>,
 }

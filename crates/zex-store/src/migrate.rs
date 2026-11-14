@@ -7,7 +7,7 @@ use rusqlite::Connection;
 use zex_core::{Error, Result};
 
 /// 当前 schema 版本。新增迁移时 +1。
-pub const LATEST: i64 = 4;
+pub const LATEST: i64 = 5;
 
 /// 跑完所有未应用的迁移。
 pub fn run(conn: &Connection) -> Result<()> {
@@ -29,6 +29,7 @@ pub fn run(conn: &Connection) -> Result<()> {
             1 => v2_tasks(conn)?,
             2 => v3_sub_agents(conn)?,
             3 => v4_session_mode(conn)?,
+            4 => v5_subagent_parent(conn)?,
             other => {
                 // 正常情况下不可达：version 已在上面校验过 <= LATEST
                 return Err(Error::Store(format!("迁移分支缺失: 版本 {other}")));
@@ -274,5 +275,22 @@ fn v4_session_mode(conn: &Connection) -> Result<()> {
         "#,
     )
     .map_err(|e| Error::Store(format!("v4 迁移失败: {e}")))?;
+    Ok(())
+}
+
+/// v5：子智能体记住它由哪个会话派生。
+///
+/// 在此之前团队列表是全局的：不管当前在看哪个会话，都会显示所有
+/// 子智能体。加这一列之后，团队只属于派出它的那个会话。
+/// 老数据留空串 —— 那些 agent 的归属已经无法追溯，宁可不显示，
+/// 也不要塞进当前会话假装是它的。
+fn v5_subagent_parent(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        ALTER TABLE sub_agents ADD COLUMN parent_session TEXT NOT NULL DEFAULT '';
+        CREATE INDEX IF NOT EXISTS idx_sub_agents_parent ON sub_agents(parent_session);
+        "#,
+    )
+    .map_err(|e| Error::Store(format!("v5 迁移失败: {e}")))?;
     Ok(())
 }

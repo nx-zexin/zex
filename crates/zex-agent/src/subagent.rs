@@ -80,6 +80,8 @@ pub struct SubAgentInfo {
     pub description: String,
     /// 它独立占用的会话。
     pub session: SessionId,
+    /// 派生它的主会话。
+    pub parent: SessionId,
     /// 当前状态。
     pub status: SubAgentStatus,
     /// 跑完之后的结果摘要。
@@ -90,6 +92,8 @@ struct Entry {
     role: String,
     description: String,
     session: SessionId,
+    /// 派生它的主会话。
+    parent: SessionId,
     status: SubAgentStatus,
     result: Option<String>,
     /// 叫停这个 agent 的开关。跨轮次有效。
@@ -173,6 +177,7 @@ impl AgentRegistry {
         role: String,
         description: String,
         task: String,
+        parent: SessionId,
     ) -> Result<String> {
         let deps = self.deps.get().ok_or_else(|| Error::ToolFailed {
             tool: "spawn_agent".into(),
@@ -205,6 +210,7 @@ impl AgentRegistry {
                 role: role.clone(),
                 description,
                 session,
+                parent,
                 status: SubAgentStatus::Running,
                 result: None,
                 cancel,
@@ -336,6 +342,7 @@ impl AgentRegistry {
                     &a.role,
                     &a.description,
                     a.session.as_str(),
+                    a.parent.as_str(),
                     state,
                     a.result.as_deref(),
                 );
@@ -350,6 +357,7 @@ impl AgentRegistry {
                     status: a.status.label().to_string(),
                     description: a.description,
                     session: a.session.to_string(),
+                    parent_session: a.parent.to_string(),
                     result: a.result,
                 })
                 .collect();
@@ -386,6 +394,7 @@ impl AgentRegistry {
                         role: r.role,
                         description: r.description,
                         session: SessionId::from(r.session_id),
+                        parent: SessionId::from(r.parent_session),
                         status,
                         result: r.result,
                         cancel: Arc::new(AtomicBool::new(false)),
@@ -406,6 +415,7 @@ impl AgentRegistry {
                 role: e.role.clone(),
                 description: e.description.clone(),
                 session: e.session.clone(),
+                parent: e.parent.clone(),
                 status: e.status.clone(),
                 result: e.result.clone(),
             })
@@ -487,12 +497,15 @@ impl Tool for SpawnAgent {
          适合可以拆开、彼此不依赖的子任务。派完记得用 wait_for_agents 收结果。"
     }
 
-    async fn call(&self, _cx: &dyn ToolCtx, args: SpawnArgs) -> Result<ToolOutput> {
+    async fn call(&self, cx: &dyn ToolCtx, args: SpawnArgs) -> Result<ToolOutput> {
+        // 记下是谁派出去的：团队列表要按会话过滤，
+        // 否则切到别的会话还会看到一堆不相干的 agent
         let id = self.registry.spawn(
             args.id.clone(),
             args.role.clone(),
             args.description.clone(),
             args.task,
+            cx.session_id().clone(),
         )?;
         Ok(ToolOutput::ok(format!(
             "已拉起 `{id}`（{}）。它独立跑，不会阻塞你；\
@@ -620,7 +633,13 @@ mod tests {
         // 没装依赖就 spawn，应该报错而不是 panic
         let r = Arc::new(AgentRegistry::new());
         let err = r
-            .spawn("a1".into(), "coder".into(), "写代码".into(), "干活".into())
+            .spawn(
+                "a1".into(),
+                "coder".into(),
+                "写代码".into(),
+                "干活".into(),
+                zex_core::SessionId::generate(),
+            )
             .unwrap_err();
         assert!(err.to_string().contains("尚未初始化"), "got: {err}");
     }
@@ -718,6 +737,7 @@ mod fixes {
                 role: "coder".into(),
                 description: "卡住的".into(),
                 session: SessionId::generate(),
+                parent: SessionId::generate(),
                 status: SubAgentStatus::Running,
                 result: None,
                 cancel: Arc::new(AtomicBool::new(false)),
@@ -746,6 +766,7 @@ mod fixes {
                     role: "coder".into(),
                     description: "完成的".into(),
                     session: SessionId::generate(),
+                    parent: SessionId::generate(),
                     status: SubAgentStatus::Completed,
                     result: Some("好了".into()),
                     cancel: Arc::new(AtomicBool::new(false)),
@@ -757,6 +778,7 @@ mod fixes {
                     role: "coder".into(),
                     description: "卡住的".into(),
                     session: SessionId::generate(),
+                    parent: SessionId::generate(),
                     status: SubAgentStatus::Running,
                     result: None,
                     cancel: Arc::new(AtomicBool::new(false)),
