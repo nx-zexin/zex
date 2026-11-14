@@ -1980,12 +1980,50 @@ impl ChatView {
                     .child(head);
 
                 if expanded {
+                    // 组内每一步仍是独立小卡片，各自折叠 ——
+                    // 一个组里常有七八次调用，全铺开等于没分组
                     let mut body = div().flex().flex_col().gap_2().px_3().pb_3();
                     for (i, step) in steps.iter().enumerate() {
-                        let mut row = div()
+                        let step_key = format!("{idx}-step-{i}");
+                        let step_open = self.expanded_tools.contains(&step_key);
+
+                        let (s_dot_bg, s_dot_fg) = match &step.result {
+                            None => (BRAND_SOFT, BRAND),
+                            Some(r) if r.ok => (OK_SOFT, OK),
+                            Some(_) => (DANGER_SOFT, DANGER),
+                        };
+
+                        let mut head = div()
                             .flex()
                             .items_center()
                             .gap_2()
+                            .px_3()
+                            .py_2()
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(BG_HOVER)))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener({
+                                    let step_key = step_key.clone();
+                                    move |this, _: &MouseDownEvent, _w, cx| {
+                                        let k = step_key.clone();
+                                        if !this.expanded_tools.remove(&k) {
+                                            this.expanded_tools.insert(k);
+                                        }
+                                        cx.notify();
+                                    }
+                                }),
+                            )
+                            .child(
+                                div().text_color(rgb(TEXT_DIM)).child(
+                                    Icon::new(if step_open {
+                                        IconName::ChevronDown
+                                    } else {
+                                        IconName::ChevronRight
+                                    })
+                                    .text_size(px(12.0)),
+                                ),
+                            )
                             .child(
                                 div()
                                     .font_family(MONO)
@@ -1998,70 +2036,105 @@ impl ChatView {
                                         step.name.clone()
                                     }),
                             );
+
                         if !step.risk.is_empty() {
                             let (bg, fg) = match step.risk.as_str() {
                                 "高危" => (DANGER_SOFT, DANGER),
                                 "有影响" => (BRAND_SOFT, BRAND),
                                 _ => (BG_HOVER, TEXT_MUTED),
                             };
-                            row = row.child(pill(step.risk.clone(), bg, fg));
+                            head = head.child(pill(step.risk.clone(), bg, fg));
                         }
-                        row = row
+
+                        head = head
                             .child(div().flex_1().min_w(px(0.0)))
                             .child(
                                 div()
                                     .text_xs()
                                     .text_color(rgb(TEXT_MUTED))
                                     .overflow_hidden()
-                                    .child(truncate_for_display(&step.args, 70)),
+                                    .child(truncate_for_display(&step.args, 60)),
                             )
-                            .child(match &step.result {
-                                None => div()
-                                    .size(px(6.0))
+                            .child(
+                                div()
+                                    .size(px(16.0))
                                     .rounded_full()
-                                    .bg(rgb(BRAND))
-                                    .into_any_element(),
-                                Some(r) => Icon::new(if r.ok {
-                                    IconName::Check
-                                } else {
-                                    IconName::Close
-                                })
-                                .text_size(px(11.0))
-                                .text_color(if r.ok { rgb(OK) } else { rgb(DANGER) })
-                                .into_any_element(),
-                            });
-                        body = body.child(row);
-
-                        // 参数：一行 JSON，量不大，直接铺开
-                        if !step.args.trim().is_empty() {
-                            body = body.child(
-                                TextView::markdown(
-                                    ElementId::Name(format!("md-call-{idx}-{i}").into()),
-                                    as_code_block(&step.args, "json"),
-                                )
-                                .text_size(px(12.5))
-                                .line_height(px(19.0))
-                                .text_color(rgb(TEXT))
-                                .style(md_style_flat(1.0)),
+                                    .bg(rgb(s_dot_bg))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(match &step.result {
+                                        None => div()
+                                            .size(px(6.0))
+                                            .rounded_full()
+                                            .bg(rgb(s_dot_fg))
+                                            .into_any_element(),
+                                        Some(r) => Icon::new(if r.ok {
+                                            IconName::Check
+                                        } else {
+                                            IconName::Close
+                                        })
+                                        .text_size(px(10.0))
+                                        .text_color(rgb(s_dot_fg))
+                                        .into_any_element(),
+                                    }),
                             );
-                        }
-                        if let Some(r) = &step.result {
-                            if !r.output.trim().is_empty() {
-                                body = body.child(
+
+                        let mut step_card = div()
+                            .flex()
+                            .flex_col()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(rgb(BORDER_SOFT))
+                            .bg(rgb(BG_MAIN))
+                            .overflow_hidden()
+                            .child(head);
+
+                        if step_open {
+                            let mut sb = div().flex().flex_col().gap_2().px_3().pb_2();
+                            if !step.args.trim().is_empty() {
+                                sb = sb.child(
                                     TextView::markdown(
-                                        ElementId::Name(format!("md-out-{idx}-{i}").into()),
-                                        as_code_block(
-                                            &truncate_for_display(&r.output, 2000),
-                                            lang_from_args(&step.args),
-                                        ),
+                                        ElementId::Name(format!("md-call-{idx}-{i}").into()),
+                                        as_code_block(&step.args, "json"),
                                     )
                                     .text_size(px(12.5))
                                     .line_height(px(19.0))
-                                    .text_color(rgb(TEXT_MUTED))
+                                    .text_color(rgb(TEXT))
                                     .style(md_style_flat(1.0)),
                                 );
                             }
+                            if let Some(r) = &step.result {
+                                if !r.output.trim().is_empty() {
+                                    sb = sb.child(
+                                        TextView::markdown(
+                                            ElementId::Name(format!("md-out-{idx}-{i}").into()),
+                                            as_code_block(
+                                                &truncate_for_display(&r.output, 2000),
+                                                lang_from_args(&step.args),
+                                            ),
+                                        )
+                                        .text_size(px(12.5))
+                                        .line_height(px(19.0))
+                                        .text_color(rgb(TEXT_MUTED))
+                                        .style(md_style_flat(1.0)),
+                                    );
+                                }
+                            }
+                            step_card = step_card.child(sb);
                         }
+
+                        body = body.child(
+                            step_card.context_menu(copy_context_menu(format!(
+                                "{}({}) → {}",
+                                step.name,
+                                step.args,
+                                step.result
+                                    .as_ref()
+                                    .map(|r| r.output.as_str())
+                                    .unwrap_or("（未完成）")
+                            ))),
+                        );
                     }
                     card = card.child(body);
                 }
