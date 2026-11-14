@@ -50,6 +50,16 @@ const MSG_LINE: f32 = 24.0;
 /// 用户自己敲的那句话，比模型回复略大一点，便于回看时定位。
 const USER_FONT: f32 = 15.0;
 
+/// 右侧面板默认宽度，以及拖拽的上下限。
+const DEFAULT_PANEL_WIDTH: f32 = 420.0;
+const MIN_PANEL_WIDTH: f32 = 320.0;
+const MAX_PANEL_WIDTH: f32 = 900.0;
+/// 右侧面板底色。
+///
+/// 比左侧会话栏再暖、再深一档：它是一块**辅助信息区**，
+/// 和主对话区同色会让人分不清哪边是正文。
+const BG_PANEL: u32 = 0xF5F5F1;
+
 const TEXT: u32 = 0x1A1A1A;
 const TEXT_MUTED: u32 = 0x8C8C88;
 const TEXT_DIM: u32 = 0xA8A8A4;
@@ -226,6 +236,12 @@ struct ChatView {
     /// 子智能体在跑的时候这块会一直占着对话底部，用户想专心看主线
     /// 内容时会碍事 —— 收起来只留一行摘要。
     team_collapsed: bool,
+    /// 右侧子智能体面板的宽度（像素，可拖拽）。
+    subagent_panel_width: f32,
+    /// 正在拖面板边框。
+    subagent_resizing: bool,
+    /// 拖拽起点：按下时的鼠标 x 与当时的宽度。
+    subagent_drag_origin: (f32, f32),
     /// 别的会话发来的授权请求。切到那个会话时再摆出来，
     /// 免得后台任务把当前视图顶掉。
     pending_approvals: Vec<(String, ApprovalRequest)>,
@@ -384,6 +400,9 @@ impl ChatView {
             history_cursor: None,
             history_draft: String::new(),
             team_collapsed: false,
+            subagent_panel_width: DEFAULT_PANEL_WIDTH,
+            subagent_resizing: false,
+            subagent_drag_origin: (0.0, 0.0),
             pending_approvals: Vec::new(),
             store,
             cwd,
@@ -2085,25 +2104,55 @@ impl ChatView {
             }
         }
 
+        // 左边缘的拖拽手柄：5px 宽，够点中又不占地方。
+        // 真正的位置计算在根容器的 on_mouse_move 里 ——
+        // 只在手柄上听 move 的话，鼠标一滑出手柄就丢事件。
+        let handle = div()
+            .id("subagent-resize")
+            .w(px(5.0))
+            .h_full()
+            .flex_none()
+            .cursor_col_resize()
+            // 常态和面板同色（看着就是一条边），
+            // 悬停才亮出来 —— 否则一条 5px 的色带天天杵在那儿太吵
+            .hover(|s| s.bg(rgb(BRAND_BORDER)))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, e: &MouseDownEvent, _w, cx| {
+                    this.subagent_resizing = true;
+                    this.subagent_drag_origin = (f32::from(e.position.x), this.subagent_panel_width);
+                    cx.notify();
+                }),
+            );
+
         div()
-            .w(px(420.0))
+            .w(px(self.subagent_panel_width))
             .flex_none()
             .h_full()
             .flex()
-            .flex_col()
-            .bg(rgb(BG_SIDEBAR))
+            .flex_row()
+            .bg(rgb(BG_PANEL))
             .border_l_1()
             .border_color(rgb(BORDER))
-            .child(header)
+            .child(handle)
             .child(
                 div()
-                    .px_4()
-                    .py_2()
-                    .text_xs()
-                    .text_color(rgb(TEXT_MUTED))
-                    .child(panel.description.clone()),
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .h_full()
+                    .flex()
+                    .flex_col()
+                    .child(header)
+                    .child(
+                        div()
+                            .px_4()
+                            .py_2()
+                            .text_xs()
+                            .text_color(rgb(TEXT_MUTED))
+                            .child(panel.description.clone()),
+                    )
+                    .child(body),
             )
-            .child(body)
             .into_any_element()
     }
 
@@ -3201,6 +3250,31 @@ impl Render for ChatView {
                 this.history_search_open = !this.history_search_open;
                 cx.notify();
             }))
+            // 面板拖拽的移动与松手挂在整窗根容器上：
+            // 手柄只有 5px 宽，鼠标一快就滑出去了，听手柄自己的
+            // on_mouse_move 会在中途断掉。
+            .on_mouse_move(cx.listener(|this, e: &MouseMoveEvent, _w, cx| {
+                if !this.subagent_resizing {
+                    return;
+                }
+                let (origin_x, origin_w) = this.subagent_drag_origin;
+                let delta = f32::from(e.position.x) - origin_x;
+                // 手柄在左边缘：鼠标往左拖，面板变宽
+                let w = (origin_w - delta).clamp(MIN_PANEL_WIDTH, MAX_PANEL_WIDTH);
+                if (w - this.subagent_panel_width).abs() > 0.5 {
+                    this.subagent_panel_width = w;
+                    cx.notify();
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _e: &MouseUpEvent, _w, cx| {
+                    if this.subagent_resizing {
+                        this.subagent_resizing = false;
+                        cx.notify();
+                    }
+                }),
+            )
             .flex()
             .bg(rgb(BG_MAIN))
             .text_color(rgb(TEXT))
