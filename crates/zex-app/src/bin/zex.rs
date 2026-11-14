@@ -1871,8 +1871,11 @@ impl ChatView {
             MsgKind::ToolGroup { steps } => {
                 // 默认整组收起，只占一行：一轮里连着七八次调用时，
                 // 一条一卡会把真正要读的回复顶出屏幕
-                let key = m.key(idx);
+                // key 带会话前缀：否则切到另一个会话时，
+                // 同一行号上的工具组会继承这边的展开状态
+                let key = format!("{}/{}", self.active_session, m.key(idx));
                 let expanded = self.expanded_tools.contains(&key);
+                let step_prefix = key.clone();
 
                 let total = steps.len();
                 let done = steps.iter().filter(|s| s.result.is_some()).count();
@@ -1984,7 +1987,7 @@ impl ChatView {
                     // 一个组里常有七八次调用，全铺开等于没分组
                     let mut body = div().flex().flex_col().gap_2().px_3().pb_3();
                     for (i, step) in steps.iter().enumerate() {
-                        let step_key = format!("{idx}-step-{i}");
+                        let step_key = format!("{step_prefix}-step-{i}");
                         let step_open = self.expanded_tools.contains(&step_key);
 
                         let (s_dot_bg, s_dot_fg) = match &step.result {
