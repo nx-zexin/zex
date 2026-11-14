@@ -14,7 +14,8 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerState};
-use gpui_kit::component::text::{TextViewStyle, markdown};
+use gpui_kit::component::menu::ContextMenuExt as _;
+use gpui_kit::component::text::{TextView, TextViewStyle, markdown};
 use gpui_kit::*;
 
 use tokio::sync::mpsc;
@@ -1590,6 +1591,57 @@ fn pill(label: String, bg: u32, fg: u32) -> impl IntoElement {
         .child(label)
 }
 
+/// 把纯文本包成 markdown 代码块。
+///
+/// 用四个反引号而不是三个：工具输出里常有 ``` （diff、markdown 文件），
+/// 三个反引号会被提前闭合，后面的内容全变成正文。
+fn as_code_block(text: &str) -> String {
+    // 不写语言名：否则右上角会挂一个 "text" 标签，
+    // 对工具输出这种一闪而过的内容来说纯属噪音
+    format!("````\n{text}\n````")
+}
+
+/// 消息里 markdown 的统一样式：标题压层级、代码块不夺目。
+fn md_style(scale: f32) -> TextViewStyle {
+    TextViewStyle::default()
+        .heading_font_size(move |level, _base| {
+            let size = match level {
+                1 => 19.0,
+                2 => 17.0,
+                3 => 15.5,
+                _ => 14.5,
+            };
+            px(size * scale)
+        })
+        // 工具输出常整段包在代码块里：去掉默认的重底色，
+        // 让它读起来还是"一段输出"，不是"一块代码"
+        .code_block({
+            let mut s = StyleRefinement::default();
+            s.background = Some(gpui_kit::Hsla::transparent_black().into());
+            s
+        })
+}
+
+/// 一条消息的右键菜单。
+///
+/// 目前的动作只有「复制整条」：跨元素拖选（消息正文 + 工具输出）
+/// 在 gpui 里还做不到，先给一个能一次拿走全文的出口。
+fn copy_context_menu(
+    text: String,
+) -> impl Fn(
+    gpui_kit::component::menu::PopupMenu,
+    &mut Window,
+    &mut Context<gpui_kit::component::menu::PopupMenu>,
+) -> gpui_kit::component::menu::PopupMenu
+       + 'static {
+    move |menu, _w, _cx| {
+        let t = text.clone();
+        menu.item(PopupMenuItem::new("复制").on_click(move |_, _w, cx| {
+            cx.write_to_clipboard(ClipboardItem::new_string(t.clone()));
+        }))
+    }
+}
+
 impl ChatView {
     /// 渲染一条消息。
     ///
@@ -1609,12 +1661,18 @@ impl ChatView {
                 .gap_2()
                 .child(role_label("USER"))
                 .child(
-                    div()
-                        .text_size(px(USER_FONT * scale))
-                        .line_height(px(MSG_LINE * scale))
-                        .text_color(rgb(TEXT))
-                        .child(m.text.clone()),
+                    // 用 TextView 而不是裸 div：gpui 里只有 TextView 的文字
+                    // 能用鼠标选中，div 里的字符串选不了
+                    TextView::markdown(
+                        ElementId::Name(format!("md-user-{idx}").into()),
+                        m.text.clone(),
+                    )
+                    .text_size(px(USER_FONT * scale))
+                    .line_height(px(MSG_LINE * scale))
+                    .text_color(rgb(TEXT))
+                    .style(md_style(scale)),
                 )
+                .context_menu(copy_context_menu(m.text.clone()))
                 .into_any_element(),
 
             MsgKind::Assistant => {
@@ -1632,25 +1690,19 @@ impl ChatView {
                     // 模型回复是 markdown：代码块、列表、粗体都要按语义渲染，
                     // 而不是把 ** 和 - 原样吐给用户
                     .child(
-                        markdown(m.text.clone())
+                        TextView::markdown(
+                            ElementId::Name(format!("md-ai-{idx}").into()),
+                            m.text.clone(),
+                        )
                             .text_size(px(MSG_FONT * scale))
                             .line_height(px(MSG_LINE * scale))
                             // 标题默认按 14px 基准放大，h2 能到 24px——
                             // 在消息流里比正文抢眼太多。压到这个比例后，
                             // 层级还在，但不再喧宾夺主。
-                            .style(TextViewStyle::default().heading_font_size(
-                                move |level, _base| {
-                                    let size = match level {
-                                        1 => 19.0,
-                                        2 => 17.0,
-                                        3 => 15.5,
-                                        _ => 14.5,
-                                    };
-                                    px(size * scale)
-                                },
-                            ))
+                            .style(md_style(scale))
                             .into_any_element(),
                     )
+                    .context_menu(copy_context_menu(m.text.clone()))
                     .child(
                         div()
                             .flex()
@@ -1723,12 +1775,16 @@ impl ChatView {
                     .border_color(rgb(BORDER_SOFT))
                     .child(head)
                     .child(
-                        div()
-                            .text_sm()
-                            .font_family(MONO)
-                            .text_color(rgb(TEXT))
-                            .child(args.clone()),
+                        TextView::markdown(
+                            ElementId::Name(format!("md-call-{idx}").into()),
+                            as_code_block(args),
+                        )
+                        .text_size(px(12.5))
+                        .line_height(px(19.0))
+                        .text_color(rgb(TEXT))
+                        .style(md_style(1.0)),
                     )
+                    .context_menu(copy_context_menu(args.clone()))
                     .into_any_element()
             }
 
@@ -1779,12 +1835,16 @@ impl ChatView {
                             ),
                     )
                     .child(
-                        div()
-                            .text_sm()
-                            .font_family(MONO)
-                            .text_color(rgb(TEXT_MUTED))
-                            .child(shown),
+                        TextView::markdown(
+                            ElementId::Name(format!("md-out-{idx}").into()),
+                            as_code_block(&shown),
+                        )
+                        .text_size(px(12.5))
+                        .line_height(px(19.0))
+                        .text_color(rgb(TEXT_MUTED))
+                        .style(md_style(1.0)),
                     )
+                    .context_menu(copy_context_menu(output.clone()))
                     .into_any_element()
             }
 
