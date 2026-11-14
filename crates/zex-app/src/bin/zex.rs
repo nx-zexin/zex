@@ -2488,6 +2488,8 @@ impl ChatView {
                         .gap_2()
                         .text_sm()
                         .text_color(rgb(TEXT))
+                        // 「＋ 新建会话」下面补一个回工作台的入口：
+                        // 顶栏删掉之后，看进度/进度的首页就没地方进了
                         .child(div().text_base().child("＋"))
                         .child("新建会话")
                         .cursor_pointer()
@@ -2498,6 +2500,29 @@ impl ChatView {
                                 let _ = tx.send(UiCommand::NewSession).await;
                             })
                             .detach();
+                            cx.notify();
+                        })),
+                ),
+            )
+            // 工作台入口：顶栏去掉之后，首页没有别的路可走了
+            .child(
+                div().px_3().pb_2().child(
+                    div()
+                        .w_full()
+                        .h(px(34.0))
+                        .rounded(px(8.0))
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .px_3()
+                        .text_sm()
+                        .text_color(rgb(TEXT_MUTED))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(rgb(BG_HOVER)))
+                        .child(Icon::default().path("icons/layout-dashboard.svg").text_size(px(14.0)))
+                        .child("工作台")
+                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
+                            this.mode = ViewMode::Dashboard;
                             cx.notify();
                         })),
                 ),
@@ -3101,76 +3126,6 @@ impl ChatView {
 
 impl Render for ChatView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // ─── 顶部状态栏 ───
-        let status_dot_color = if self.status == "Ready" { OK } else { BRAND };
-        let status_bg = if self.status == "Ready" { OK_SOFT } else { BRAND_SOFT };
-        let status_fg = if self.status == "Ready" { OK } else { BRAND };
-
-        let header = div()
-            .h(px(52.0))
-            .flex_shrink_0()
-            .flex()
-            .items_center()
-            .justify_between()
-            .px_6()
-            .border_b_1()
-            .border_color(rgb(BORDER_SOFT))
-            .bg(rgb(BG_MAIN))
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(rgb(TEXT_MUTED))
-                    .child(self.cwd.clone()),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .px_3()
-                            .py_1()
-                            .rounded_full()
-                            .bg(rgb(status_bg))
-                            .child(div().size(px(6.0)).rounded_full().bg(rgb(status_dot_color)))
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(rgb(status_fg))
-                                    .child(self.status.clone()),
-                            ),
-                    )
-                    .child({
-                        let total = self.usage.input_tokens + self.usage.output_tokens;
-                        // 不足一千就给准确数字，"0.0k" 看着像统计坏了
-                        let label = match total {
-                            0..=999 => format!("{total} tokens"),
-                            _ => format!("{:.1}k tokens", total as f64 / 1000.0),
-                        };
-                        let mut meta = div().flex().items_center().gap_2().child(
-                            div().text_sm().text_color(rgb(TEXT)).child(label),
-                        );
-                        // 对话模式下给一个回工作台的入口
-                        if self.mode == ViewMode::Chat {
-                            meta = meta.child(
-                                Button::new("back-to-dashboard")
-                                    .ghost()
-                                    .label("工作台")
-                                    .on_click(cx.listener(|this, _: &ClickEvent, _w, cx| {
-                                        this.mode = ViewMode::Dashboard;
-                                        cx.notify();
-                                    })),
-                            );
-                        }
-                        meta
-                    }),
-            );
-
         // ─── 消息流 ───
         // 交给组件库的虚拟列表：它用 FollowMode::Tail 贴住最新内容，
         // 用户往上翻时不会被强行拽回，翻回底部后自动恢复跟随。
@@ -3291,7 +3246,6 @@ impl Render for ChatView {
                     .h_full()
                     .flex()
                     .flex_col()
-                    .child(header)
                     .child(match self.mode {
                         ViewMode::Dashboard => self.render_dashboard(window, cx),
                         ViewMode::Chat => {
