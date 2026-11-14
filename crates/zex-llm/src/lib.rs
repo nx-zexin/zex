@@ -329,6 +329,24 @@ mod tests {
         assert!(STREAM_IDLE_TIMEOUT <= Duration::from_secs(300));
     }
 
+    /// 真机验证 ASR 链路。需要 DEEPSEEK_API_KEY 和 /tmp/silence.wav。
+    /// 手动跑：cargo test -p zex-llm asr_end_to_end -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn asr_end_to_end() {
+        let cfg = ProviderConfig {
+            kind: ProviderKind::OpenAiCompat,
+            base_url: "https://api.deepseek.com/v1".into(),
+            api_key_env: Some("DEEPSEEK_API_KEY".into()),
+            headers: Default::default(),
+        };
+        let http = build_http_client().unwrap();
+        let wav = std::fs::read("/tmp/silence.wav").expect("先造一个 /tmp/silence.wav");
+        let text = transcribe(&http, &cfg, wav).await.unwrap();
+        println!("转写结果: {text:?}");
+        assert!(text.is_empty(), "静音应该转出空文本");
+    }
+
     #[test]
     fn endpoint_appends_v1_when_absent() {
         let c = cfg(ProviderKind::Anthropic, "https://api.anthropic.com");
@@ -442,4 +460,61 @@ mod tests {
         let out = acc.finish().unwrap();
         assert_eq!(out.text, "Hello");
     }
+}
+
+/// 语音识别（ASR）。
+///
+/// DeepSeek 专有端点：一次上传完整音频，返回整段转写文本，
+/// 不支持流式。音频要求 16 位 PCM WAV 或 Ogg Opus，≤8 MiB、≤120 秒。
+///
+/// 不是所有 provider 都有这个能力 —— 调用方要么确认 base_url 指向
+/// DeepSeek，要么接受 404。
+pub async fn transcribe(
+    http: &reqwest::Client,
+    cfg: &ProviderConfig,
+    wav: Vec<u8>,
+) -> Result<String> {
+    let url = cfg.endpoint("tools/asr");
+    let mut form = reqwest::multipart::Form::new().part(
+        "file",
+        reqwest::multipart::Part::bytes(wav)
+            .file_name("speech.wav")
+            .mime_str("audio/wav")
+            .map_err(|e| Error::Other(format!("构造上传体失败: {e}")))?,
+    );
+
+    let mut req = http.post(&url);
+    if let Some(key) = cfg.api_key() {
+        req = req.bearer_auth(key);
+    }
+    // 上传 + 识别可能比一次对话慢，但也不该无限等
+    req = req.timeout(Duration::from_secs(90));
+
+    let resp = req
+        .multipart(std::mem::take(&mut form))
+        .send()
+        .await
+        .map_err(|e| Error::Other(format!("语音识别请求失败: {e}")))?;
+
+    let status = resp.status();
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| Error::Other(format!("读取语音识别响应失败: {e}")))?;
+
+    if !status.is_success() {
+        return Err(Error::Other(format!(
+            "语音识别失败（HTTP {}）：{}",
+            status.as_u16(),
+            body.chars().take(200).collect::<String>()
+        )));
+    }
+
+    let v: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|e| Error::Other(format!("解析语音识别响应失败: {e}：{body}")))?;
+    Ok(v.get("text")
+        .and_then(|t| t.as_str())
+        .unwrap_or_default()
+        .trim()
+        .to_string())
 }

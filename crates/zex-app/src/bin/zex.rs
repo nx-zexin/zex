@@ -173,6 +173,10 @@ struct ChatView {
     subagent_panel: Option<SubAgentPanel>,
     /// 待发送的附件。
     attachments: Vec<Attachment>,
+    /// 正在录音。
+    recording: Option<zex_voice::Recording>,
+    /// 正在等转写结果。
+    transcribing: bool,
     /// 斜杠命令菜单是否展开。
     slash_open: bool,
     /// `@` 引用的候选文件（懒加载，只扫一次）。
@@ -327,6 +331,8 @@ impl ChatView {
             team: Vec::new(),
             subagent_panel: None,
             attachments: Vec::new(),
+            recording: None,
+            transcribing: false,
             slash_open: false,
             file_index: None,
             at_open: false,
@@ -698,6 +704,97 @@ impl ChatView {
         self.slash_open = false;
         cx.notify();
         true
+    }
+
+    /// 点麦克风：开始录音，再点停止并转写。
+    fn toggle_recording(&mut self, cx: &mut Context<Self>) {
+        if self.transcribing {
+            return;
+        }
+        if self.recording.is_some() {
+            let Some(rec) = self.recording.take() else {
+                return;
+            };
+            let secs = rec.elapsed().as_secs();
+            if secs == 0 {
+                self.messages.push(MsgItem {
+                    kind: MsgKind::System,
+                    text: "录得太短了，按住多说一会儿".into(),
+                });
+                cx.notify();
+                return;
+            }
+            self.status = "识别中…".into();
+            self.transcribing = true;
+            let tx = self.cmd_tx.clone();
+            // 停止录音要等后台线程收尾，别卡住界面
+            cx.spawn(async move |this, cx| {
+                let wav = rec.stop();
+                let _ = this.update(cx, |this, cx| {
+                    match wav {
+                        Ok(bytes) => {
+                            let _ = tx.try_send(UiCommand::Transcribe { audio: bytes });
+                        }
+                        Err(e) => {
+                            this.transcribing = false;
+                            this.status = "Ready".into();
+                            this.messages.push(MsgItem {
+                                kind: MsgKind::System,
+                                text: format!("录音失败：{e}"),
+                            });
+                            cx.notify();
+                        }
+                    }
+                });
+            })
+            .detach();
+            cx.notify();
+            return;
+        }
+
+        match zex_voice::Recording::start() {
+            Ok(rec) => {
+                self.recording = Some(rec);
+                self.status = "录音中…（再点一次结束）".into();
+                // 每秒刷新时长；超过 110 秒自动停 —— ASR 上限 120 秒，
+                // 撞上限会直接 400，不如提前收尾
+                cx.spawn(async move |this, cx| {
+                    loop {
+                        cx.background_executor()
+                            .timer(std::time::Duration::from_secs(1))
+                            .await;
+                        let Some(secs) = this
+                            .update(cx, |this, cx| {
+                                let s = this.recording.as_ref().map(|r| r.elapsed().as_secs());
+                                if let Some(s) = s {
+                                    this.status = format!("录音中 {s}s（再点一次结束）");
+                                    if s >= 110 {
+                                        this.toggle_recording(cx);
+                                    }
+                                    cx.notify();
+                                }
+                                s
+                            })
+                            .ok()
+                            .flatten()
+                        else {
+                            break;
+                        };
+                        if secs == 0 || secs >= 110 {
+                            break;
+                        }
+                    }
+                })
+                .detach();
+            }
+            Err(e) => {
+                self.messages.push(MsgItem {
+                    kind: MsgKind::System,
+                    text: format!("无法开始录音：{e}"),
+                });
+            }
+        }
+        cx.notify();
     }
 
     /// 点模型名进入编辑：预填当前值，回车生效。
@@ -1132,6 +1229,41 @@ impl ChatView {
             return;
         }
         match ev {
+            CoreEvent::Transcribed { text, error } => {
+                self.transcribing = false;
+                match (text, error) {
+                    (Some(t), _) => {
+                        // 接到已有内容后面，别把用户打的字冲掉
+                        let cur = self.input.read(cx).value().to_string();
+                        let joined = if cur.trim().is_empty() {
+                            t
+                        } else {
+                            format!("{cur} {t}")
+                        };
+                        // set_value 要 window，handle_event 这里拿不到，
+                        // 走 update_in 借一帧
+                        cx.spawn(async move |this, cx| {
+                            this.update_in(cx, |this, window, cx| {
+                                this.input
+                                    .update(cx, |st, cx| st.set_value(joined, window, cx));
+                                cx.notify();
+                            })
+                            .ok();
+                        })
+                        .detach();
+                        self.status = "Ready".into();
+                    }
+                    (None, Some(e)) => {
+                        self.messages.push(MsgItem {
+                            kind: MsgKind::System,
+                            text: format!("语音识别失败：{e}"),
+                        });
+                        self.status = "Ready".into();
+                    }
+                    _ => {}
+                }
+                cx.notify();
+            }
             CoreEvent::TeamUpdated { agents } => {
                 // 面板显示的那个 agent 状态要跟着团队一起变，
                 // 否则会出现「面板说已完成、团队说执行中」这种自相矛盾。
@@ -2437,6 +2569,24 @@ impl ChatView {
                                     .h(px(self.composer_height(cx))),
                             ),
                     )
+                    .child({
+                        // 麦克风：录音中变红并提示时长
+                        let (label, danger) = match (&self.recording, self.transcribing) {
+                            (Some(_), _) => ("●", true),
+                            (None, true) => ("…", false),
+                            _ => ("🎤", false),
+                        };
+                        let btn = Button::new("voice")
+                            .label(label)
+                            .on_click(cx.listener(|this, _: &ClickEvent, _w, cx| {
+                                this.toggle_recording(cx);
+                            }));
+                        if danger {
+                            btn.danger().into_any_element()
+                        } else {
+                            btn.into_any_element()
+                        }
+                    })
                     .child(match self.streaming.is_some() {
                         // 正在跑就换成停止键：否则用户只能干等长任务跑完
                         true => Button::new("stop")
@@ -3148,6 +3298,32 @@ fn main() {
                         // 先不关：等用户在确认层里做决定
                         false
                     });
+                }
+
+                // 测试钩子：ZEX_AUTO_VOICE=<秒数> 自动录一段并转写。
+                // Wayland 下既没法模拟点击、也没法对着麦克风说话，
+                // 这是唯一能自动跑通录音→ASR 全链路的方式。
+                if let Ok(secs) = std::env::var("ZEX_AUTO_VOICE") {
+                    if let Ok(secs) = secs.parse::<u64>() {
+                        let weak = view.downgrade();
+                        cx.spawn(async move |cx| {
+                            cx.background_executor()
+                                .timer(std::time::Duration::from_secs(2))
+                                .await;
+                            let _ = weak.update(cx, |this, cx| {
+                                this.toggle_recording(cx);
+                                eprintln!("[voice] 开始录音 {secs}s");
+                            });
+                            cx.background_executor()
+                                .timer(std::time::Duration::from_secs(secs))
+                                .await;
+                            let _ = weak.update(cx, |this, cx| {
+                                eprintln!("[voice] 停止录音");
+                                this.toggle_recording(cx);
+                            });
+                        })
+                        .detach();
+                    }
                 }
 
                 // 测试钩子：ZEX_AUTO_PANEL=1 时，等团队出现后自动打开

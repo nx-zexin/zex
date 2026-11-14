@@ -24,6 +24,7 @@ zex-knowledge = { path = "crates/zex-knowledge" }
 zex-evolve = { path = "crates/zex-evolve" }
 zex-schedule = { path = "crates/zex-schedule" }
 zex-app = { path = "crates/zex-app" }
+zex-voice = { path = "crates/zex-voice" }
 
 # ─── 序列化 ───
 serde = { version = "1", features = ["derive"] }
@@ -60,6 +61,8 @@ reqwest = { version = "0.13", default-features = false, features = [
     "rustls",
     "rustls-native-certs",
     "http2",
+    # 语音识别走 multipart 上传
+    "multipart",
 ] }
 
 # ─── 存储 ───

@@ -25,6 +25,7 @@ zex-agent.workspace = true
 zex-tools.workspace = true
 zex-store.workspace = true
 zex-policy.workspace = true
+zex-voice.workspace = true
 gpui-kit.workspace = true
 tokio.workspace = true
 tracing.workspace = true

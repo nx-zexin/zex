@@ -353,6 +353,16 @@ impl Agent {
         &self.cfg
     }
 
+    /// provider 连接配置（语音转写这类非对话调用要用）。
+    pub fn provider(&self) -> &zex_llm::ProviderConfig {
+        &self.cfg.provider
+    }
+
+    /// 复用的 HTTP 客户端。
+    pub fn http(&self) -> &reqwest::Client {
+        &self.http
+    }
+
     /// 工具集。元素是 `Arc`，克隆成本很低。
     pub fn tools(&self) -> &[Arc<dyn ErasedTool>] {
         &self.tools

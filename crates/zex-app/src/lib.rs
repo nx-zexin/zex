@@ -267,6 +267,27 @@ pub fn spawn_core(
                                 .await;
                             });
                         }
+                        UiCommand::Transcribe { audio } => {
+                            // 转写不走对话模型，直接调 provider 的 ASR 端点
+                            let http = agent.http().clone();
+                            let provider = agent.provider().clone();
+                            let ev = ev_tx.clone();
+                            tokio::spawn(async move {
+                                let out =
+                                    zex_llm::transcribe(&http, &provider, audio).await;
+                                let (text, error) = match out {
+                                    Ok(t) if t.is_empty() => (
+                                        None,
+                                        Some("没有识别出内容，可能说得太轻".to_string()),
+                                    ),
+                                    Ok(t) => (Some(t), None),
+                                    Err(e) => (None, Some(e.to_string())),
+                                };
+                                let _ = ev
+                                    .send(CoreEvent::Transcribed { text, error })
+                                    .await;
+                            });
+                        }
                         UiCommand::Approve { id, remember } => {
                             let _ = broker
                                 .resolve(&id, ApprovalDecision::Approve { remember })

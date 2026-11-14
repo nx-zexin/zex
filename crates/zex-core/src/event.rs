@@ -139,6 +139,14 @@ pub enum CoreEvent {
         /// 新标题。
         title: String,
     },
+    /// 语音转写完成。
+    Transcribed {
+        /// 成功时的文本。
+        text: Option<String>,
+        /// 失败原因。
+        error: Option<String>,
+    },
+
     /// 子智能体团队的整体状态变了。
     ///
     /// 一次推全量而不是增量：团队通常只有几个成员，全量最省心，
@@ -234,6 +242,12 @@ pub enum UiCommand {
         /// 轮次。
         turn: TurnId,
     },
+    /// 转写一段录音（语音输入）。
+    Transcribe {
+        /// 16 位 PCM 单声道 WAV。
+        audio: Vec<u8>,
+    },
+
     /// 开一个新会话。
     NewSession,
     /// 清空指定会话的消息（保留会话本身）。
