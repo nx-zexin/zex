@@ -14,7 +14,7 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerState};
-use gpui_kit::component::text::markdown;
+use gpui_kit::component::text::{TextViewStyle, markdown};
 use gpui_kit::*;
 
 use tokio::sync::mpsc;
@@ -41,6 +41,15 @@ const BG_RESULT: u32 = 0xFAFAF8;
 const BG_INPUT: u32 = 0xFFFFFF;
 const BORDER: u32 = 0xE5E5E2;
 const BORDER_SOFT: u32 = 0xEDEDEA;
+/// 消息正文字号与行高。
+///
+/// 界面里读得最多的字就是它，所以比全局正文小半档、行距放大一档：
+/// 长段落（模型回复动辄两三屏）靠行距分隔比靠字号堆砌舒服得多。
+const MSG_FONT: f32 = 14.5;
+const MSG_LINE: f32 = 24.0;
+/// 用户自己敲的那句话，比模型回复略大一点，便于回看时定位。
+const USER_FONT: f32 = 15.0;
+
 const TEXT: u32 = 0x1A1A1A;
 const TEXT_MUTED: u32 = 0x8C8C88;
 const TEXT_DIM: u32 = 0xA8A8A4;
@@ -414,7 +423,7 @@ impl ChatView {
     /// "已落定的消息"共用同一套跟随逻辑，不必单独处理滚动。
     fn render_row(&self, ix: usize, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         if ix < self.messages.len() {
-            self.render_message(&self.messages[ix], ix, cx)
+            self.render_message(&self.messages[ix], ix, 1.0, cx)
         } else {
             self.render_streaming(cx)
         }
@@ -1517,8 +1526,8 @@ impl ChatView {
 
 fn role_label(text: &str) -> impl IntoElement {
     div()
-        .text_xs()
-        .font_weight(FontWeight::BOLD)
+        .text_size(px(11.0))
+        .font_weight(FontWeight::SEMIBOLD)
         .text_color(rgb(BRAND))
         .child(text.to_string())
 }
@@ -1536,14 +1545,30 @@ fn pill(label: String, bg: u32, fg: u32) -> impl IntoElement {
 }
 
 impl ChatView {
-    fn render_message(&self, m: &MsgItem, idx: usize, cx: &mut Context<Self>) -> AnyElement {
+    /// 渲染一条消息。
+    ///
+    /// `scale` 让子智能体面板（420px 窄栏）用略小一号的字，
+    /// 否则同样的行宽在窄栏里显得拥挤。
+    fn render_message(
+        &self,
+        m: &MsgItem,
+        idx: usize,
+        scale: f32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         match &m.kind {
             MsgKind::User => div()
                 .flex()
                 .flex_col()
                 .gap_2()
                 .child(role_label("USER"))
-                .child(div().text_lg().text_color(rgb(TEXT)).child(m.text.clone()))
+                .child(
+                    div()
+                        .text_size(px(USER_FONT * scale))
+                        .line_height(px(MSG_LINE * scale))
+                        .text_color(rgb(TEXT))
+                        .child(m.text.clone()),
+                )
                 .into_any_element(),
 
             MsgKind::Assistant => {
@@ -1560,7 +1585,26 @@ impl ChatView {
                     .child(role_label("ZEX"))
                     // 模型回复是 markdown：代码块、列表、粗体都要按语义渲染，
                     // 而不是把 ** 和 - 原样吐给用户
-                    .child(markdown(m.text.clone()).into_any_element())
+                    .child(
+                        markdown(m.text.clone())
+                            .text_size(px(MSG_FONT * scale))
+                            .line_height(px(MSG_LINE * scale))
+                            // 标题默认按 14px 基准放大，h2 能到 24px——
+                            // 在消息流里比正文抢眼太多。压到这个比例后，
+                            // 层级还在，但不再喧宾夺主。
+                            .style(TextViewStyle::default().heading_font_size(
+                                move |level, _base| {
+                                    let size = match level {
+                                        1 => 19.0,
+                                        2 => 17.0,
+                                        3 => 15.5,
+                                        _ => 14.5,
+                                    };
+                                    px(size * scale)
+                                },
+                            ))
+                            .into_any_element(),
+                    )
                     .child(
                         div()
                             .flex()
@@ -2018,7 +2062,8 @@ impl ChatView {
             .p_4();
 
         for (i, m) in panel.messages.iter().enumerate() {
-            body = body.child(self.render_message(m, i + 10_000, cx));
+            // 窄栏用 0.93 倍：字号小一点，行宽才不至于挤
+            body = body.child(self.render_message(m, i + 10_000, 0.93, cx));
         }
         // 流式中的文本：单独一块，带光标感
         if let Some(buf) = &panel.streaming {
@@ -2031,7 +2076,8 @@ impl ChatView {
                         .child(role_label("THINKING"))
                         .child(
                             div()
-                                .text_sm()
+                                .text_size(px(13.0))
+                                .line_height(px(21.0))
                                 .text_color(rgb(TEXT_MUTED))
                                 .child(buf.clone()),
                         ),
@@ -3286,7 +3332,12 @@ fn apply_platform_font(cx: &mut App) {
             "Microsoft YaHei".to_string()
         }
     });
-    cx.global_mut::<gpui_kit::component::Theme>().font_family = candidate.into();
+    let theme = cx.global_mut::<gpui_kit::component::Theme>();
+    theme.font_family = candidate.into();
+    // 组件默认 16px，对桌面端偏大：按钮、输入框、列表全都跟着涨。
+    // 降到 15px，各处 text_sm/base 按比例落回正常观感。
+    // 等宽保持 13px：代码块本来就靠小字号挤进窄栏，再降会糊。
+    theme.font_size = px(15.0);
 }
 
 /// 把持久化的 Message 映射成展示项。
