@@ -448,6 +448,26 @@ impl ChatView {
         let weak = cx.entity().downgrade();
         view._key_interceptor = Some(cx.intercept_keystrokes(move |event, window, cx| {
             let key = event.keystroke.key.as_str();
+
+            // Enter：菜单开着时由这里确认选中项。
+            // 输入框是多行 Textarea，它收到 Enter 会先往值里插一个换行，
+            // 再发 PressEnter —— 等 submit 拿到时值已变成 "@/\n"，
+            // 过滤条件带着换行符，候选直接变空。
+            if key == "enter" {
+                let mut picked = false;
+                let _ = weak.update(cx, |this, cx| {
+                    if this.menu_is_open() {
+                        let cursor = this.menu_cursor;
+                        this.menu_pick(cursor, &mut *window, cx);
+                        picked = true;
+                    }
+                });
+                if picked {
+                    cx.stop_propagation();
+                }
+                return;
+            }
+
             if key != "up" && key != "down" {
                 return;
             }
@@ -698,9 +718,10 @@ impl ChatView {
                 .collect()
         } else if self.at_open {
             let typed = self.input.read(cx).value().to_string();
+            // trim：多行输入框可能在尾部留下换行
             let q = typed
                 .rfind('@')
-                .map(|i| typed[i + 1..].to_lowercase())
+                .map(|i| typed[i + 1..].trim().to_lowercase())
                 .unwrap_or_default();
             let mut hits: Vec<String> = self
                 .file_index
@@ -765,13 +786,13 @@ impl ChatView {
 
     /// 把 `@片段` 换成 `@完整路径`。
     fn insert_at_reference(&mut self, path: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let v = self.input.read(cx).value().to_string();
+        let v = self.input.read(cx).value().trim_end().to_string();
         let new = match v.rfind('@') {
             Some(i) => format!("{}@{} ", &v[..i], path),
             None => format!("{v}@{path} "),
         };
         self.input
-            .update(cx, |st, cx| st.set_value(new, window, cx));
+            .update(cx, |st, cx| st.set_value(new.clone(), window, cx));
         self.at_open = false;
         cx.notify();
     }
