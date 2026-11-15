@@ -2941,11 +2941,37 @@ impl ChatView {
         bar = if cfg!(target_os = "macos") {
             bar.pl(px(78.0))
         } else {
-            bar.pl(px(12.0))
+            bar.pl(px(16.0))
         };
 
-        // 品牌已经在侧栏顶部，这里只留一条干净的拖拽区
-        bar = bar.child(div().flex_1());
+        // 品牌跟着标题栏走：窗口最上沿统一是标题栏，
+        // 侧栏从那下面才开始
+        bar = bar
+            .child(
+                div()
+                    .size(px(22.0))
+                    .rounded(px(6.0))
+                    .bg(rgb(BRAND))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        div()
+                            .text_size(px(13.0))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(rgb(0xFFFFFF))
+                            .child("Z"),
+                    ),
+            )
+            .child(div().w(px(8.0)))
+            .child(
+                div()
+                    .text_size(px(15.0))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(rgb(TEXT))
+                    .child("Zex"),
+            )
+            .child(div().flex_1());
 
         // macOS 用系统红绿灯，不重复画按钮
         if !cfg!(target_os = "macos") {
@@ -3101,34 +3127,9 @@ impl ChatView {
             .bg(rgb(BG_SIDEBAR))
             .border_r_1()
             .border_color(rgb(BORDER))
-            // 品牌区
+            // 品牌挪到标题栏了，这里直接从"新建会话"开始
             .child(
-                div().flex().items_center().gap_2().px_4().pt_4().pb_3().child(
-                    div()
-                        .size(px(26.0))
-                        .rounded(px(7.0))
-                        .bg(rgb(BRAND))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(
-                            div()
-                                .text_sm()
-                                .font_weight(FontWeight::BOLD)
-                                .text_color(rgb(0xFFFFFF))
-                                .child("Z"),
-                        ),
-                ).child(
-                    div()
-                        .text_lg()
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(rgb(TEXT))
-                        .child("Zex"),
-                ),
-            )
-            // 新建会话
-            .child(
-                div().px_3().pb_3().child(
+                div().px_3().pt_2().pb_3().child(
                     div()
                         .w_full()
                         .h(px(38.0))
