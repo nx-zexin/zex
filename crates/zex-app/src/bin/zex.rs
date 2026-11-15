@@ -1958,12 +1958,15 @@ impl ChatView {
                         div()
                             .flex()
                             .items_center()
-                            .gap_2()
+                            // 靠右收尾：文字按钮占一整块太抢眼，
+                            // 一个图标悬在段落末尾就够
+                            .justify_end()
                             .child(
                                 Button::new(ElementId::Name(format!("copy-{idx}").into()))
                                     .ghost()
                                     .compact()
-                                    .label("复制")
+                                    .icon(IconName::Copy)
+                                    .tooltip("复制原文")
                                     .on_click(cx.listener(move |this, _: &ClickEvent, _w, cx| {
                                         // 复制原文而非渲染结果：贴到别处还能保留 markdown
                                         cx.write_to_clipboard(ClipboardItem::new_string(
