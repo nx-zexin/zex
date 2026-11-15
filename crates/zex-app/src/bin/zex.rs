@@ -106,6 +106,11 @@ enum MsgKind {
     ToolGroup {
         steps: Vec<ToolStep>,
     },
+    /// 模型的思考过程（provider 支持时才有）。
+    ///
+    /// 默认折叠成一行：推理往往几百上千字，摊开会把正文顶下去；
+    /// 但它解释「模型为什么这么做」，需要时得能翻出来。
+    Thinking,
     System,
     /// 子智能体的一步动作。缩进显示在主对话里，
     /// 让用户不切视图也知道后台那些 agent 在干什么。
@@ -1686,7 +1691,22 @@ impl ChatView {
                 self.status = "出错".into();
                 self.messages.push(MsgItem { kind: MsgKind::System, text: format!("错误：{message}") });
             }
-            CoreEvent::Thinking { .. } => {}
+            CoreEvent::Thinking { session, text, .. } => {
+                if !self.is_active(&session) {
+                    return;
+                }
+                // 同一次思考逐 token 追加到末尾那条上；
+                // 中间隔着工具调用时另起一条，保留先后顺序
+                match self.messages.last_mut() {
+                    Some(m) if matches!(m.kind, MsgKind::Thinking) => m.text.push_str(&text),
+                    _ => self.messages.push(MsgItem {
+                        kind: MsgKind::Thinking,
+                        text,
+                    }),
+                }
+                self.status = "思考中…".into();
+                self.sync_scroller(cx);
+            }
         }
         cx.notify();
     }
@@ -2276,6 +2296,90 @@ impl ChatView {
                             .child(args.clone()),
                     )
                     .into_any_element()
+            }
+
+            MsgKind::Thinking => {
+                // 展开状态和工具卡片共用一套 key（会话+行号），
+                // 否则切到别的会话会继承这边的开合状态
+                let key = format!("{}/thinking-{idx}", self.active_session);
+                let expanded = self.expanded_tools.contains(&key);
+                let chars = m.text.chars().count();
+
+                let mut card = div()
+                    .w_full()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(rgb(BORDER_SOFT))
+                    .bg(rgb(BG_TOOL))
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .px_3()
+                            .py_2()
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(BG_HOVER)))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener({
+                                    let key = key.clone();
+                                    move |this, _: &MouseDownEvent, _w, cx| {
+                                        let k = key.clone();
+                                        if !this.expanded_tools.remove(&k) {
+                                            this.expanded_tools.insert(k);
+                                        }
+                                        cx.notify();
+                                    }
+                                }),
+                            )
+                            .child(
+                                div().text_color(rgb(TEXT_DIM)).child(
+                                    Icon::new(if expanded {
+                                        IconName::ChevronDown
+                                    } else {
+                                        IconName::ChevronRight
+                                    })
+                                    .text_size(px(12.0)),
+                                ),
+                            )
+                            .child(
+                                Icon::new(IconName::Brain)
+                                    .text_size(px(12.0))
+                                    .text_color(rgb(TEXT_DIM)),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(TEXT_MUTED))
+                                    .child("思考过程"),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(TEXT_DIM))
+                                    .child(format!("· {chars} 字")),
+                            )
+                            .child(div().flex_1()),
+                    );
+
+                if expanded {
+                    card = card.child(
+                        div().px_3().pb_3().child(
+                            TextView::markdown(
+                                ElementId::Name(format!("md-think-{idx}").into()),
+                                m.text.clone(),
+                            )
+                            .text_size(px(12.5))
+                            .line_height(px(19.0))
+                            .text_color(rgb(TEXT_MUTED))
+                            .style(md_style_flat(1.0)),
+                        ),
+                    );
+                }
+
+                card.into_any_element()
             }
 
             MsgKind::System => div()
