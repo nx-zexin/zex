@@ -99,17 +99,21 @@ impl Tool for FsRead {
 
         let mut out = String::new();
         let mut emitted = 0usize;
-        let mut total_lines = 0usize;
+
+        // 行号宽度按实际总行数算。固定 6 位是给"百万行"留的余量，
+        // 但绝大多数文件只有几十上百行，白占 5 个字符的缩进 ——
+        // 在卡片里看是左边一大条空白，对模型也是每行白付几个 token。
+        let total_lines = text.lines().count();
+        let num_width = total_lines.to_string().len().max(2);
 
         for (i, line) in text.lines().enumerate() {
-            total_lines = i + 1;
             if i + 1 < offset {
                 continue;
             }
             if emitted >= limit {
                 continue; // 继续数行数以给出总数
             }
-            out.push_str(&format!("{:>6}\t{}\n", i + 1, line));
+            out.push_str(&format!("{:>num_width$}\t{}\n", i + 1, line, num_width = num_width));
             emitted += 1;
         }
 
