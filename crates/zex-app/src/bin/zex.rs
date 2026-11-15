@@ -3884,19 +3884,19 @@ impl Render for ChatView {
                 if self.mode == ViewMode::Chat {
                     main = main.child(bottom);
                 }
-                div()
+                let mut body = div()
                     .flex_1()
                     .min_h(px(0.0))
                     .flex()
                     .child(self.render_sidebar(cx))
-                    .child(main)
-                    .into_any_element()
+                    .child(main);
+                // 面板是横排里的第三列。挂在 root 上会跑到标题栏下面去 ——
+                // root 现在是竖排（标题栏 + 内容），面板会被当成第二行
+                if self.subagent_panel.is_some() {
+                    body = body.child(self.render_subagent_panel(cx));
+                }
+                body.into_any_element()
             });
-
-        // 右侧面板：看子智能体的过程
-        if self.subagent_panel.is_some() {
-            root = root.child(self.render_subagent_panel(cx));
-        }
 
         // 关窗确认：压在整界面之上，挡住所有交互
         if self.confirm_close {
@@ -4391,9 +4391,21 @@ fn main() {
                                 .update(cx, |this, cx| {
                                     if let Some(a) = this.team.first().cloned() {
                                         this.open_subagent_panel(&a.id, cx);
-                                        true
-                                    } else {
-                                        false
+                                        return true;
+                                    }
+                                    // team 只在有事件推过来时才有内容；
+                                    // 冷启动查看历史时退一步查库，别干等
+                                    let id = this
+                                        .store
+                                        .list_sub_agents()
+                                        .ok()
+                                        .and_then(|l| l.first().map(|r| r.id.clone()));
+                                    match id {
+                                        Some(id) => {
+                                            this.open_subagent_panel(&id, cx);
+                                            true
+                                        }
+                                        None => false,
                                     }
                                 })
                                 .unwrap_or(true);
