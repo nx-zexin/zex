@@ -2907,6 +2907,103 @@ impl ChatView {
             .into_any_element()
     }
 
+    /// 自绘标题栏。
+    ///
+    /// 系统标题栏已经关掉（Linux 靠 `WindowDecorations::Client`，
+    /// macOS 靠 `appears_transparent`），拖动、双击最大化、
+    /// 最小化/关闭都得自己实现。
+    fn render_titlebar(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let maxed = window.is_maximized();
+
+        let mut bar = div()
+            .flex()
+            .items_center()
+            .flex_none()
+            .h(px(38.0))
+            .w_full()
+            .bg(rgb(BG_SIDEBAR))
+            .border_b_1()
+            .border_color(rgb(BORDER))
+            // 整条都是拖动区：双击最大化，单击跟手拖走
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_this, ev: &MouseDownEvent, window, cx| {
+                    if ev.click_count == 2 {
+                        window.zoom_window();
+                    } else {
+                        window.start_window_move();
+                    }
+                    cx.stop_propagation();
+                }),
+            );
+
+        // macOS 的系统红绿灯还在左上角，给它让出位置
+        bar = if cfg!(target_os = "macos") {
+            bar.pl(px(78.0))
+        } else {
+            bar.pl(px(12.0))
+        };
+
+        // 品牌已经在侧栏顶部，这里只留一条干净的拖拽区
+        bar = bar.child(div().flex_1());
+
+        // macOS 用系统红绿灯，不重复画按钮
+        if !cfg!(target_os = "macos") {
+            let btn = |icon: IconName,
+                       danger: bool,
+                       action: fn(&mut Window),
+                       cx: &mut Context<Self>| {
+                let base = div()
+                    .w(px(34.0))
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    // 按下就吃掉：否则事件冒到标题栏，点按钮会顺带把窗口拖起来
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|_this, _e: &MouseDownEvent, _w, cx| {
+                            cx.stop_propagation();
+                        }),
+                    )
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |_this, _e: &MouseUpEvent, window, _cx| {
+                            action(window);
+                        }),
+                    );
+                // 关闭键 hover 变红，警告意味明确
+                let base = if danger {
+                    base.hover(|s| s.bg(rgb(0xE0383E)))
+                } else {
+                    base.hover(|s| s.bg(rgb(BG_HOVER)))
+                };
+                base.child(
+                    Icon::new(icon)
+                        .text_size(px(13.0))
+                        .text_color(rgb(TEXT_MUTED)),
+                )
+            };
+
+            bar = bar
+                .child(btn(IconName::Minus, false, |w| w.minimize_window(), cx))
+                .child(btn(
+                    if maxed {
+                        IconName::Minimize
+                    } else {
+                        IconName::Square
+                    },
+                    false,
+                    |w| w.zoom_window(),
+                    cx,
+                ))
+                .child(btn(IconName::Close, true, |w| w.remove_window(), cx));
+        }
+
+        bar.into_any_element()
+    }
+
     fn render_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
         let mut list = div().flex().flex_col().gap_1().px_3();
 
@@ -3764,9 +3861,10 @@ impl Render for ChatView {
                 }),
             )
             .flex()
+            .flex_col()
             .bg(rgb(BG_MAIN))
             .text_color(rgb(TEXT))
-            .child(self.render_sidebar(cx))
+            .child(self.render_titlebar(window, cx))
             .child({
                 let mut main = div()
                     .flex_1()
@@ -3786,7 +3884,13 @@ impl Render for ChatView {
                 if self.mode == ViewMode::Chat {
                     main = main.child(bottom);
                 }
-                main
+                div()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .flex()
+                    .child(self.render_sidebar(cx))
+                    .child(main)
+                    .into_any_element()
             });
 
         // 右侧面板：看子智能体的过程
@@ -4178,8 +4282,12 @@ fn main() {
             ))),
             titlebar: Some(TitlebarOptions {
                 title: Some("Zex".into()),
-                ..Default::default()
+                // 系统标题栏让位给自绘的那一条：
+                // macOS/Windows 靠 appears_transparent，Linux 靠 window_decorations
+                appears_transparent: true,
+                traffic_light_position: Some(point(px(14.0), px(12.0))),
             }),
+            window_decorations: Some(WindowDecorations::Client),
             ..Default::default()
         };
         let (handle, view) = match gpui_kit::open_window(
