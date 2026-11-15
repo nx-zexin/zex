@@ -3928,7 +3928,24 @@ fn history_to_items(msgs: &[zex_core::Message]) -> Vec<MsgItem> {
             Message::User { .. } => {
                 out.push(MsgItem { kind: MsgKind::User, text: m.text() });
             }
-            Message::Assistant { tool_calls, .. } => {
+            Message::Assistant { content, tool_calls, .. } => {
+                // 思考过程也要还原。它已经存在历史里（Part::Thinking），
+                // 只是 m.text() 只拼 Text 片段 —— 不回放的话，
+                // 重开会话就只剩结论，看不出当时是怎么想的
+                let think: String = content
+                    .iter()
+                    .filter_map(|p| match p {
+                        zex_core::Part::Thinking { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("");
+                if !think.trim().is_empty() {
+                    out.push(MsgItem {
+                        kind: MsgKind::Thinking,
+                        text: think,
+                    });
+                }
                 let t = m.text();
                 if !t.trim().is_empty() {
                     out.push(MsgItem { kind: MsgKind::Assistant, text: t });
