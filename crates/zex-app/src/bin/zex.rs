@@ -2894,7 +2894,10 @@ impl ChatView {
     /// 子智能体页：职责说明 + 消息流。
     fn render_agent_body(&self, panel: &SubAgentPanel, cx: &mut Context<Self>) -> AnyElement {
         let mut body = div()
-            .id("subagent-panel-scroll")
+            // id 带上会话：每个标签各自记住滚动位置。
+            // 共用一个 id 的话，切标签时滚动量会互相覆盖，
+            // 表现就是"切回来内容又从头开始了"
+            .id(ElementId::Name(format!("agent-scroll-{}", panel.session).into()))
             .flex_1()
             .min_h(px(0.0))
             .overflow_y_scroll()
@@ -2947,7 +2950,8 @@ impl ChatView {
     /// 文件页：路径 + 内容（超长已截断）。
     fn render_file_body(&self, f: &FilePreview) -> AnyElement {
         let mut body = div()
-            .id("file-panel-scroll")
+            // 同上：按文件路径区分滚动状态
+            .id(ElementId::Name(format!("file-scroll-{}", f.path).into()))
             .flex_1()
             .min_h(px(0.0))
             .overflow_y_scroll()
