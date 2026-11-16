@@ -143,6 +143,59 @@ struct SubAgentPanel {
     streaming: Option<String>,
 }
 
+/// 右侧面板的一个标签页。
+enum PanelTab {
+    /// 子智能体执行过程。
+    SubAgent(SubAgentPanel),
+    /// 文件预览。
+    File(FilePreview),
+}
+
+impl PanelTab {
+    /// 标签上显示的名字。
+    fn title(&self) -> String {
+        match self {
+            PanelTab::SubAgent(p) => p.id.clone(),
+            // 只取文件名：完整路径太长，三个标签一挤就全变成
+            // "crates/zex..."。真实路径在内容区顶部还写着一份
+            PanelTab::File(f) => f
+                .display
+                .rsplit('/')
+                .next()
+                .unwrap_or(f.display.as_str())
+                .to_string(),
+        }
+    }
+
+    /// 去重用的键：同一个文件/同一个 agent 只占一个标签。
+    fn key(&self) -> String {
+        match self {
+            PanelTab::SubAgent(p) => format!("agent:{}", p.session),
+            PanelTab::File(f) => format!("file:{}", f.path),
+        }
+    }
+}
+
+/// 文件预览。
+struct FilePreview {
+    /// 绝对路径：既是标签唯一键，也用于重新读取。
+    path: String,
+    /// 相对工作目录的显示名（短，适合放标签上）。
+    display: String,
+    /// 文件内容（超长会截断）。
+    content: String,
+    /// 语法高亮的语言名，空串表示不着色。
+    lang: String,
+    /// 截断/读取异常之类的说明。
+    note: Option<String>,
+}
+
+/// 右侧面板：一组标签页，当前激活其中一页。
+struct RightPanel {
+    tabs: Vec<PanelTab>,
+    active: usize,
+}
+
 /// 待发送的附件。
 ///
 /// 图片走 `Part::Image`（provider 会转成 base64 data URL），
@@ -222,7 +275,7 @@ struct ChatView {
     /// 子智能体团队。非空时在对话里显示一块团队面板。
     team: Vec<zex_core::event::SubAgentView>,
     /// 右侧面板：正在看的子智能体。
-    subagent_panel: Option<SubAgentPanel>,
+    right_panel: Option<RightPanel>,
     /// 待发送的附件。
     attachments: Vec<Attachment>,
     /// 上一次输入的长度，用来发现"粘进来一大段"。
@@ -413,7 +466,7 @@ impl ChatView {
             active_session,
             confirm_close: false,
             team: Vec::new(),
-            subagent_panel: None,
+            right_panel: None,
             attachments: Vec::new(),
             last_input_len: 0,
             recording: None,
@@ -1254,7 +1307,7 @@ impl ChatView {
         };
 
         let messages = load_session_items(&self.store, &session);
-        self.subagent_panel = Some(SubAgentPanel {
+        let tab = PanelTab::SubAgent(SubAgentPanel {
             id,
             session,
             description,
@@ -1262,6 +1315,55 @@ impl ChatView {
             messages,
             streaming: None,
         });
+        self.activate_or_push_tab(tab, cx);
+    }
+
+    /// 把标签放进来：已有同键的就切过去，没有才新建一页。
+    fn activate_or_push_tab(&mut self, tab: PanelTab, cx: &mut Context<Self>) {
+        let key = tab.key();
+        let panel = self
+            .right_panel
+            .get_or_insert_with(|| RightPanel { tabs: Vec::new(), active: 0 });
+        match panel.tabs.iter().position(|t| t.key() == key) {
+            Some(i) => panel.active = i,
+            None => {
+                panel.tabs.push(tab);
+                panel.active = panel.tabs.len() - 1;
+            }
+        }
+        cx.notify();
+    }
+
+    /// 在右侧面板打开一个文件。
+    ///
+    /// 已经开着就切过去，不重复开标签 —— 反复点同一个文件
+    /// 会攒出一排一模一样的页。
+    fn open_file_tab(&mut self, path: &str, cx: &mut Context<Self>) {
+        let abs = if path.starts_with('/') {
+            path.to_string()
+        } else {
+            format!("{}/{}", self.cwd.trim_end_matches('/'), path)
+        };
+        let tab = PanelTab::File(load_file_preview(&abs, &self.cwd));
+        self.activate_or_push_tab(tab, cx);
+    }
+
+    /// 关掉第 `i` 个标签；全关完就把面板收起来。
+    fn close_panel_tab(&mut self, i: usize, cx: &mut Context<Self>) {
+        let Some(panel) = &mut self.right_panel else {
+            return;
+        };
+        if i >= panel.tabs.len() {
+            return;
+        }
+        panel.tabs.remove(i);
+        if panel.tabs.is_empty() {
+            self.right_panel = None;
+        } else if panel.active >= panel.tabs.len() {
+            panel.active = panel.tabs.len() - 1;
+        } else if panel.active > i {
+            panel.active -= 1;
+        }
         cx.notify();
     }
 
@@ -1338,7 +1440,7 @@ impl ChatView {
     /// 返回 true 表示这个事件属于面板正在看的那个子智能体，已经消费掉，
     /// 不该再走主对话的逻辑。
     fn mirror_to_panel(&mut self, ev: &CoreEvent) -> bool {
-        let Some(panel) = &mut self.subagent_panel else {
+        let Some(rp) = &mut self.right_panel else {
             return false;
         };
         let session = match ev {
@@ -1351,9 +1453,13 @@ impl ChatView {
             | CoreEvent::ContextCompacted { session, .. } => session,
             _ => return false,
         };
-        if session.as_str() != panel.session {
+        // 面板可能是文件标签在前、agent 在后，按 session 找那个 agent 页
+        let Some(panel) = rp.tabs.iter_mut().find_map(|t| match t {
+            PanelTab::SubAgent(p) if p.session == session.as_str() => Some(p),
+            _ => None,
+        }) else {
             return false;
-        }
+        };
 
         match ev {
             CoreEvent::TurnStarted { .. } => {
@@ -1484,18 +1590,22 @@ impl ChatView {
                             cx.notify();
                         }
                     }
-                } else if self.subagent_panel.is_some() {
-                    self.subagent_panel = None;
+                } else if self.right_panel.is_some() {
+                    self.right_panel = None;
                     cx.notify();
                 }
             }
             CoreEvent::TeamUpdated { agents } => {
-                // 面板显示的那个 agent 状态要跟着团队一起变，
+                // 面板里开着的 agent 状态要跟着团队一起变，
                 // 否则会出现「面板说已完成、团队说执行中」这种自相矛盾。
-                if let Some(panel) = &mut self.subagent_panel {
-                    if let Some(a) = agents.iter().find(|a| a.id == panel.id) {
-                        panel.status = a.status.clone();
-                        panel.description = a.description.clone();
+                if let Some(rp) = &mut self.right_panel {
+                    for tab in &mut rp.tabs {
+                        if let PanelTab::SubAgent(panel) = tab {
+                            if let Some(a) = agents.iter().find(|a| a.id == panel.id) {
+                                panel.status = a.status.clone();
+                                panel.description = a.description.clone();
+                            }
+                        }
                     }
                 }
                 self.team = agents;
@@ -2161,6 +2271,33 @@ impl ChatView {
                             head = head.child(pill(step.risk.clone(), bg, fg));
                         }
 
+                        // 参数里带 path 的（读写文件的工具）给一个可点的文件名：
+                        // 点开就在右侧面板里预览，不用去终端翻
+                        if let Some(full) = path_from_args(&step.args) {
+                            let short = full
+                                .rsplit('/')
+                                .next()
+                                .unwrap_or(full.as_str())
+                                .to_string();
+                            head = head.child(
+                                div()
+                                    .flex_none()
+                                    .text_xs()
+                                    .text_color(rgb(TEXT_MUTED))
+                                    .cursor_pointer()
+                                    .hover(|s| s.text_color(rgb(BRAND)))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _: &MouseDownEvent, _w, cx| {
+                                            // 别让点击冒到分组头上把整组展开/收起
+                                            cx.stop_propagation();
+                                            this.open_file_tab(&full, cx);
+                                        }),
+                                    )
+                                    .child(short),
+                            );
+                        }
+
                         head = head
                             .child(
                                 div()
@@ -2609,87 +2746,104 @@ impl ChatView {
     /// 右侧面板：子智能体的完整过程。
     ///
     /// 独立于主对话：用户想「看一眼它在干什么」，不是「离开当前对话」。
-    fn render_subagent_panel(&self, cx: &mut Context<Self>) -> AnyElement {
-        let Some(panel) = &self.subagent_panel else {
+    /// 右侧面板：标签栏 + 当前页。
+    fn render_right_panel(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(rp) = &self.right_panel else {
             return div().into_any_element();
         };
+        if rp.tabs.is_empty() {
+            return div().into_any_element();
+        }
+        let active = rp.active.min(rp.tabs.len() - 1);
 
-        let (dot, dot_bg) = match panel.status.as_str() {
-            "执行中" => (BRAND, BRAND_SOFT),
-            "已完成" => (OK, OK_SOFT),
-            "失败" => (DANGER, DANGER_SOFT),
-            _ => (TEXT_DIM, BG_HOVER),
-        };
-
-        let header = div()
+        // ─── 标签栏 ───
+        let mut tabbar = div()
             .flex()
             .items_center()
-            .gap_2()
-            .px_4()
-            .py_3()
+            .gap_1()
+            .px_2()
+            .h(px(36.0))
+            .flex_none()
             .border_b_1()
             .border_color(rgb(BORDER_SOFT))
-            .child(div().size(px(6.0)).rounded_full().bg(rgb(dot)))
-            .child(
-                div()
-                    .text_sm()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(rgb(TEXT))
-                    .child(panel.id.clone()),
-            )
-            .child(
-                div()
-                    .px_1p5()
-                    .rounded_sm()
-                    .bg(rgb(dot_bg))
-                    .text_color(rgb(dot))
-                    .text_xs()
-                    .child(panel.status.clone()),
-            )
-            .child(div().flex_1())
-            .child(
-                Button::new("panel-close")
-                    .ghost()
-                    .icon(Icon::new(IconName::Close))
-                    .on_click(cx.listener(|this, _: &ClickEvent, _w, cx| {
-                        this.subagent_panel = None;
+            .overflow_hidden();
+
+        for (i, tab) in rp.tabs.iter().enumerate() {
+            let is_active = i == active;
+            let (dot, dot_bg) = match tab {
+                PanelTab::SubAgent(p) => match p.status.as_str() {
+                    "执行中" => (BRAND, BRAND_SOFT),
+                    "已完成" => (OK, OK_SOFT),
+                    "失败" => (DANGER, DANGER_SOFT),
+                    _ => (TEXT_DIM, BG_HOVER),
+                },
+                PanelTab::File(_) => (TEXT_DIM, BG_HOVER),
+            };
+
+            let chip = div()
+                .flex()
+                .items_center()
+                .gap_1p5()
+                .px_2()
+                .h(px(26.0))
+                .rounded(px(6.0))
+                .cursor_pointer()
+                .min_w(px(0.0))
+                // 激活页常亮，其余 hover 才亮
+                .bg(rgb(if is_active { BG_HOVER } else { BG_MAIN }))
+                .hover(|s| s.bg(rgb(BG_HOVER)))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _: &MouseDownEvent, _w, cx| {
+                        if let Some(p) = &mut this.right_panel {
+                            p.active = i;
+                        }
                         cx.notify();
-                    })),
-            );
-
-        let mut body = div()
-            .id("subagent-panel-scroll")
-            .flex_1()
-            .min_h(px(0.0))
-            .overflow_y_scroll()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .p_4();
-
-        for (i, m) in panel.messages.iter().enumerate() {
-            // 窄栏用 0.93 倍：字号小一点，行宽才不至于挤
-            body = body.child(self.render_message(m, i + 10_000, 0.93, cx));
-        }
-        // 流式中的文本：单独一块，带光标感
-        if let Some(buf) = &panel.streaming {
-            if !buf.trim().is_empty() {
-                body = body.child(
+                    }),
+                )
+                // 每页的状态点：红色=失败，橙色=跑着，绿色=完成
+                .child(div().size(px(6.0)).rounded_full().flex_none().bg(rgb(dot)))
+                .child(
+                    div()
+                        .max_w(px(170.0))
+                        .truncate()
+                        .text_xs()
+                        .text_color(rgb(if is_active { TEXT } else { TEXT_MUTED }))
+                        .child(tab.title()),
+                )
+                .child(
                     div()
                         .flex()
-                        .flex_col()
-                        .gap_2()
-                        .child(role_label("THINKING"))
+                        .items_center()
+                        .justify_center()
+                        .size(px(16.0))
+                        .rounded(px(4.0))
+                        .flex_none()
+                        .hover(|s| s.bg(rgb(dot_bg)))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _: &MouseDownEvent, _w, cx| {
+                                // 别让关闭的按下冒到 chip 上切成这一页
+                                cx.stop_propagation();
+                                this.close_panel_tab(i, cx);
+                            }),
+                        )
                         .child(
-                            div()
-                                .text_size(px(13.0))
-                                .line_height(px(21.0))
-                                .text_color(rgb(TEXT_MUTED))
-                                .child(buf.clone()),
+                            Icon::new(IconName::Close)
+                                .text_size(px(10.0))
+                                .text_color(rgb(TEXT_DIM)),
                         ),
                 );
-            }
+
+            tabbar = tabbar.child(chip);
         }
+        tabbar = tabbar.child(div().flex_1());
+
+        // ─── 当前页内容 ───
+        let body = match &rp.tabs[active] {
+            PanelTab::SubAgent(p) => self.render_agent_body(p, cx),
+            PanelTab::File(f) => self.render_file_body(f),
+        };
 
         // 左边缘的拖拽手柄：5px 宽，够点中又不占地方。
         // 真正的位置计算在根容器的 on_mouse_move 里 ——
@@ -2731,18 +2885,106 @@ impl ChatView {
                     .h_full()
                     .flex()
                     .flex_col()
-                    .child(header)
-                    .child(
-                        div()
-                            .px_4()
-                            .py_2()
-                            .text_xs()
-                            .text_color(rgb(TEXT_MUTED))
-                            .child(panel.description.clone()),
-                    )
+                    .child(tabbar)
                     .child(body),
             )
             .into_any_element()
+    }
+
+    /// 子智能体页：职责说明 + 消息流。
+    fn render_agent_body(&self, panel: &SubAgentPanel, cx: &mut Context<Self>) -> AnyElement {
+        let mut body = div()
+            .id("subagent-panel-scroll")
+            .flex_1()
+            .min_h(px(0.0))
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .p_4();
+
+        for (i, m) in panel.messages.iter().enumerate() {
+            // 窄栏用 0.93 倍：字号小一点，行宽才不至于挤
+            body = body.child(self.render_message(m, i + 10_000, 0.93, cx));
+        }
+        // 流式中的文本：单独一块
+        if let Some(buf) = &panel.streaming {
+            if !buf.trim().is_empty() {
+                body = body.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(role_label("THINKING"))
+                        .child(
+                            div()
+                                .text_size(px(13.0))
+                                .line_height(px(21.0))
+                                .text_color(rgb(TEXT_MUTED))
+                                .child(buf.clone()),
+                        ),
+                );
+            }
+        }
+
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h(px(0.0))
+            .child(
+                div()
+                    .px_4()
+                    .py_2()
+                    .text_xs()
+                    .text_color(rgb(TEXT_MUTED))
+                    .child(panel.description.clone()),
+            )
+            .child(body)
+            .into_any_element()
+    }
+
+    /// 文件页：路径 + 内容（超长已截断）。
+    fn render_file_body(&self, f: &FilePreview) -> AnyElement {
+        let mut body = div()
+            .id("file-panel-scroll")
+            .flex_1()
+            .min_h(px(0.0))
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_4()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(TEXT_MUTED))
+                    .child(f.path.clone()),
+            );
+
+        if let Some(note) = &f.note {
+            body = body.child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(DANGER))
+                    .child(note.clone()),
+            );
+        }
+
+        if !f.content.trim().is_empty() {
+            body = body.child(
+                TextView::markdown(
+                    ElementId::Name(format!("file-{}", f.path).into()),
+                    as_code_block(&f.content, &f.lang),
+                )
+                .text_size(px(12.5))
+                .line_height(px(19.0))
+                .text_color(rgb(TEXT))
+                .style(md_style_flat(1.0)),
+            );
+        }
+
+        body.into_any_element()
     }
 
     fn render_task_card(
@@ -3830,8 +4072,8 @@ impl Render for ChatView {
                 }
                 if this.streaming.is_some() {
                     this.cancel(cx);
-                } else if this.subagent_panel.is_some() {
-                    this.subagent_panel = None;
+                } else if this.right_panel.is_some() {
+                    this.right_panel = None;
                     cx.notify();
                 }
             }))
@@ -3896,8 +4138,8 @@ impl Render for ChatView {
                     .child(main);
                 // 面板是横排里的第三列。挂在 root 上会跑到标题栏下面去 ——
                 // root 现在是竖排（标题栏 + 内容），面板会被当成第二行
-                if self.subagent_panel.is_some() {
-                    body = body.child(self.render_subagent_panel(cx));
+                if self.right_panel.is_some() {
+                    body = body.child(self.render_right_panel(cx));
                 }
                 body.into_any_element()
             });
@@ -4003,6 +4245,91 @@ fn tool_display_name(name: &str) -> &str {
         "ask_user" => "询问用户",
         other => other,
     }
+}
+
+/// 读一个文件给右侧面板预览。
+///
+/// 大文件截断：面板是"扫一眼"的地方，不是编辑器，
+/// 把几十兆的日志整个塞进 TextView 只会把界面卡住。
+fn load_file_preview(abs: &str, cwd: &str) -> FilePreview {
+    const MAX_BYTES: usize = 256 * 1024;
+    let prefix = format!("{}/", cwd.trim_end_matches('/'));
+    let display = abs.strip_prefix(&prefix).unwrap_or(abs).to_string();
+    let lang = lang_from_path(abs);
+    let path = std::path::Path::new(abs);
+
+    let mut note = None;
+    let content = match std::fs::read(path) {
+        Err(e) => {
+            note = Some(format!("无法打开：{e}"));
+            String::new()
+        }
+        Ok(bytes) => {
+            let truncated = bytes.len() > MAX_BYTES;
+            let slice = &bytes[..bytes.len().min(MAX_BYTES)];
+            let text = String::from_utf8_lossy(slice).to_string();
+            if truncated {
+                note = Some(format!(
+                    "文件较大（{} KB），只显示前 {} KB",
+                    bytes.len() / 1024,
+                    MAX_BYTES / 1024
+                ));
+            } else if text.trim().is_empty() {
+                note = Some("（空文件）".to_string());
+            }
+            text
+        }
+    };
+
+    FilePreview {
+        path: abs.to_string(),
+        display,
+        content,
+        lang,
+        note,
+    }
+}
+
+/// 按扩展名猜代码块的高亮语言，猜不出就返回空串（不着色）。
+fn lang_from_path(path: &str) -> String {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    match ext.as_str() {
+        "rs" => "rust",
+        "ts" | "tsx" => "typescript",
+        "js" | "jsx" => "javascript",
+        "go" => "go",
+        "py" => "python",
+        "toml" => "toml",
+        "json" => "json",
+        "yaml" | "yml" => "yaml",
+        "md" => "markdown",
+        "sh" | "bash" => "bash",
+        "html" => "html",
+        "css" => "css",
+        "sql" => "sql",
+        "ex" | "exs" => "elixir",
+        "rb" => "ruby",
+        "php" => "php",
+        "xml" => "xml",
+        "c" | "h" => "c",
+        "cpp" | "cc" | "hpp" => "cpp",
+        "java" => "java",
+        _ => "",
+    }
+    .to_string()
+}
+
+/// 从工具参数里取文件路径。
+///
+/// README 里所有文件类工具（fs_read / fs_write / fs_edit）都用 `path`，
+/// 取不到就返回 None —— 调用方据此决定要不要显示"打开文件"的入口。
+fn path_from_args(args: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(args).ok()?;
+    v.get("path").and_then(|x| x.as_str()).map(|s| s.to_string())
 }
 
 /// 按平台选择 UI 字体。
@@ -4417,6 +4744,24 @@ fn main() {
                                 break;
                             }
                         }
+                    })
+                    .detach();
+                }
+
+                // 测试钩子：ZEX_AUTO_FILE=<路径> 时自动在右侧面板开一个文件页，
+                // 用于无人值守验证文件预览的渲染。
+                if let Ok(path) = std::env::var("ZEX_AUTO_FILE") {
+                    let weak = view.downgrade();
+                    cx.spawn(async move |cx| {
+                        cx.background_executor()
+                            .timer(std::time::Duration::from_millis(900))
+                            .await;
+                        let _ = weak.update(cx, |this, cx| {
+                            // 分号分隔可以一次开多个，用来验证标签栏
+                            for p in path.split(';').filter(|p| !p.is_empty()) {
+                                this.open_file_tab(p, cx);
+                            }
+                        });
                     })
                     .detach();
                 }
