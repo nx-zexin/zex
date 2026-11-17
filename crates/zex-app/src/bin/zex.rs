@@ -489,6 +489,14 @@ impl ChatView {
         // 打开就先看工作台：用户想知道「我不在的时候发生了什么」
         let mode = ViewMode::Dashboard;
 
+        // 跟着恢复的会话走：硬编码成 Confirm 的话，
+        // 用户上次设在"完全访问"的会话一重启就显示成"变更前确认"
+        let initial_mode = sessions
+            .iter()
+            .find(|s| s.id == active_session)
+            .map(|s| s.mode)
+            .unwrap_or_default();
+
         let mut view = ChatView {
             input,
             tasks,
@@ -533,7 +541,7 @@ impl ChatView {
             pf_base_url,
             pf_key_env,
             pf_model,
-            run_mode: zex_core::RunMode::Confirm,
+            run_mode: initial_mode,
             editing_model: false,
             model_input,
             input_history: restored_history,
@@ -5854,12 +5862,18 @@ fn main() {
                         let session = view.read_with(cx, |v, _| v.active_session.clone());
                         {
                             // 同步投递即可：内核那边是独立线程
+                            let mode = std::env::var("ZEX_AUTO_MODE").ok().map(|m| match m.as_str() {
+                                "auto_edit" => zex_core::RunMode::AutoEdit,
+                                "plan" => zex_core::RunMode::Plan,
+                                "full_access" => zex_core::RunMode::FullAccess,
+                                _ => zex_core::RunMode::Confirm,
+                            });
                             let _ = tx.try_send(UiCommand::UserPrompt {
                                 session: zex_core::SessionId::from(session),
                                 text: prompt,
                                 attachments: vec![],
                                 model: None,
-                                mode: None,
+                                mode,
                             });
                         }
                     }

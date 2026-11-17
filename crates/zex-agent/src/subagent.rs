@@ -196,9 +196,21 @@ impl AgentRegistry {
 
         // 每个子 agent 独立开一个会话：上下文互不干扰，用户也能在侧栏
         // 点进去看它到底做了什么。
-        let mut agent = Agent::new(deps.cfg.clone(), deps.tools.clone(), deps.store.clone())?
+        //
+        // 模式必须跟父会话走：用户在"完全访问"下派活，
+        // 子智能体却按启动时的默认档（Confirm）逐条问审批，
+        // 等于把用户明确的授权选项作废了。
+        let mut sub_cfg = deps.cfg.clone();
+        if let Ok(Some(parent_session)) = deps.store.get_session(&parent) {
+            sub_cfg.mode = parent_session.mode;
+        }
+        let sub_mode = sub_cfg.mode;
+        let mut agent = Agent::new(sub_cfg, deps.tools.clone(), deps.store.clone())?
             .with_shared_approvals(deps.broker.clone());
         let session = agent.session_id().clone();
+        // 把模式记在子会话上：send_message 恢复它时据此还原，
+        // 不然那条路径又会退回默认档
+        let _ = deps.store.set_session_mode(&session, sub_mode);
         let cancel = agent.cancel_flag();
         let _ = deps
             .store
@@ -273,8 +285,14 @@ impl AgentRegistry {
         // 上一轮如果是被叫停的，开关还是按下状态，得复位
         cancel.store(false, Ordering::Relaxed);
 
+        // 恢复时用子会话自己记着的模式（spawn 时从父会话继承来的），
+        // 而不是启动时的默认档
+        let mut resume_cfg = deps.cfg.clone();
+        if let Ok(Some(s)) = deps.store.get_session(&session) {
+            resume_cfg.mode = s.mode;
+        }
         let mut agent = Agent::resume(
-            deps.cfg.clone(),
+            resume_cfg,
             deps.tools.clone(),
             deps.store.clone(),
             session,
