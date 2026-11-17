@@ -96,7 +96,14 @@ impl MsgItem {
 
 #[derive(Clone)]
 enum MsgKind {
-    User,
+    /// 用户消息。
+    User {
+        /// 随消息一起提交的图片。
+        ///
+        /// 存已构造的 `gpui::Image` 而不是每帧重解 base64：
+        /// 大图每帧解码会明显掉帧，而消息一旦加进来就不再变。
+        images: Vec<std::sync::Arc<gpui::Image>>,
+    },
     Assistant,
     /// 连续的一串工具调用。
     ///
@@ -1401,12 +1408,32 @@ impl ChatView {
         }
         self.history_cursor = None;
         self.history_draft.clear();
+
+        // 图片进信息流：用户要看到自己发了什么，
+        // 而不是只剩一句"请查看附件"。必须在 clear 之前取。
+        let shown_images: Vec<std::sync::Arc<gpui::Image>> = self
+            .attachments
+            .iter()
+            .filter_map(|a| {
+                let bytes = base64_decode(a.image_b64.as_ref()?)?;
+                Some(std::sync::Arc::new(gpui::Image {
+                    id: image_id(&bytes),
+                    format: image_format_of(&a.media_type),
+                    bytes,
+                }))
+            })
+            .collect();
         self.attachments.clear();
 
         self.input.update(cx, |state, cx| state.set_value("", window, cx));
         // 派了活就要看到它跑：从工作台自动进入对话视图
         self.mode = ViewMode::Chat;
-        self.messages.push(MsgItem { kind: MsgKind::User, text: text.clone() });
+        self.messages.push(MsgItem {
+            kind: MsgKind::User {
+                images: shown_images,
+            },
+            text: text.clone(),
+        });
         self.streaming = Some(String::new());
         self.status = "思考中…".into();
 
@@ -2194,25 +2221,52 @@ impl ChatView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         match &m.kind {
-            MsgKind::User => div()
-                .flex()
-                .flex_col()
-                .gap_2()
-                .child(role_label("USER"))
-                .child(
-                    // 用 TextView 而不是裸 div：gpui 里只有 TextView 的文字
-                    // 能用鼠标选中，div 里的字符串选不了
-                    TextView::markdown(
-                        ElementId::Name(format!("md-user-{idx}").into()),
-                        m.text.clone(),
-                    )
-                    .text_size(px(USER_FONT * scale))
-                    .line_height(px(MSG_LINE * scale))
-                    .text_color(rgb(TEXT))
-                    .style(md_style(scale)),
-                )
-                .context_menu(copy_context_menu(m.text.clone()))
-                .into_any_element(),
+            MsgKind::User { images } => {
+                let mut col = div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(role_label("USER"));
+
+                // 图片排在文字上方：发图时那句话通常只是配文
+                if !images.is_empty() {
+                    let mut row = div().flex().flex_wrap().gap_2();
+                    for (i, img) in images.iter().enumerate() {
+                        row = row.child(
+                            // 固定高度、限制最大宽度：原图尺寸各异，
+                            // 按原始大小排会让信息流参差不齐
+                            gpui::img(gpui::ImageSource::Image(img.clone()))
+                                .id(ElementId::Name(
+                                    format!("user-img-{idx}-{i}").into(),
+                                ))
+                                .h(px(120.0))
+                                .max_w(px(240.0))
+                                .rounded(px(8.0))
+                                .border_1()
+                                .border_color(rgb(BORDER)),
+                        );
+                    }
+                    col = col.child(row);
+                }
+
+                // 只贴图不打字时 text 是空的，别留一段空白
+                if !m.text.trim().is_empty() {
+                    col = col.child(
+                        // 用 TextView 而不是裸 div：gpui 里只有 TextView 的文字
+                        // 能用鼠标选中，div 里的字符串选不了
+                        TextView::markdown(
+                            ElementId::Name(format!("md-user-{idx}").into()),
+                            m.text.clone(),
+                        )
+                        .text_size(px(USER_FONT * scale))
+                        .line_height(px(MSG_LINE * scale))
+                        .text_color(rgb(TEXT))
+                        .style(md_style(scale)),
+                    );
+                }
+                col.context_menu(copy_context_menu(m.text.clone()))
+                    .into_any_element()
+            }
 
             MsgKind::Assistant => {
                 // 只有工具调用、没有说话内容的轮次会留下空 assistant 消息，
@@ -5544,6 +5598,58 @@ fn estimate_tokens(text: &str) -> usize {
 /// 标准 base64 编码（带 = 填充）。
 ///
 /// 只为了把图片塞进 data URL，不需要 URL-safe 变体。
+/// base64 解码（只处理我们自己编码出来的：标准字母表、无换行）。
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    fn val(c: u8) -> Option<u32> {
+        Some(match c {
+            b'A'..=b'Z' => (c - b'A') as u32,
+            b'a'..=b'z' => (c - b'a') as u32 + 26,
+            b'0'..=b'9' => (c - b'0') as u32 + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        })
+    }
+    let s = s.trim().trim_end_matches('=');
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+    for chunk in bytes.chunks(4) {
+        let mut n = 0u32;
+        for (i, &c) in chunk.iter().enumerate() {
+            n |= val(c)? << (18 - 6 * i);
+        }
+        out.push((n >> 16) as u8);
+        if chunk.len() > 2 {
+            out.push((n >> 8) as u8);
+        }
+        if chunk.len() > 3 {
+            out.push(n as u8);
+        }
+    }
+    Some(out)
+}
+
+/// 按 MIME 类型定图片格式。认不出来按 PNG 处理。
+fn image_format_of(media_type: &str) -> gpui::ImageFormat {
+    match media_type {
+        "image/jpeg" | "image/jpg" => gpui::ImageFormat::Jpeg,
+        "image/gif" => gpui::ImageFormat::Gif,
+        "image/webp" => gpui::ImageFormat::Webp,
+        "image/bmp" => gpui::ImageFormat::Bmp,
+        _ => gpui::ImageFormat::Png,
+    }
+}
+
+/// 给图片算稳定 id，供 GPUI 做渲染缓存。
+///
+/// 同一张图必须给同一个 id、不同图必须不同 —— 用内容哈希天然满足。
+fn image_id(bytes: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    h.finish()
+}
+
 fn base64_encode(bytes: &[u8]) -> String {
     const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
@@ -5722,8 +5828,27 @@ fn history_to_items(msgs: &[zex_core::Message]) -> Vec<MsgItem> {
     let mut out = Vec::new();
     for m in msgs {
         match m {
-            Message::User { .. } => {
-                out.push(MsgItem { kind: MsgKind::User, text: m.text() });
+            Message::User { content } => {
+                // 历史里的图片也要回放：只留文字的话，
+                // 回看时完全不知道自己当时发了什么图
+                let images: Vec<std::sync::Arc<gpui::Image>> = content
+                    .iter()
+                    .filter_map(|p| match p {
+                        zex_core::Part::Image(img) => {
+                            let bytes = base64_decode(&img.blob_id)?;
+                            Some(std::sync::Arc::new(gpui::Image {
+                                id: image_id(&bytes),
+                                format: image_format_of(&img.media_type),
+                                bytes,
+                            }))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                out.push(MsgItem {
+                    kind: MsgKind::User { images },
+                    text: m.text(),
+                });
             }
             Message::Assistant { content, tool_calls, .. } => {
                 // 思考过程也要还原。它已经存在历史里（Part::Thinking），
