@@ -633,7 +633,16 @@ impl ChatView {
             }
 
             // 粘贴：剪贴板里是图片或文件就收成附件，纯文本照常插入
-            if key == "v" && event.keystroke.modifiers.platform {
+            //
+            // 修饰键不能只看 platform：GPUI 里 platform 在 macOS 是 Cmd、
+            // 在 Windows 是 Win、**在 Linux 是 Super** —— Linux 上按 Ctrl+V
+            // 根本不满足它。粘贴键在 Linux/Windows 是 Ctrl，macOS 才是 Cmd。
+            let paste_mod = if cfg!(target_os = "macos") {
+                event.keystroke.modifiers.platform
+            } else {
+                event.keystroke.modifiers.control
+            };
+            if key == "v" && paste_mod {
                 let mut took = false;
                 let _ = weak.update(cx, |this, cx| {
                     took = this.paste_attachments(cx);
@@ -1249,7 +1258,6 @@ impl ChatView {
         };
 
         let mut took = false;
-
         for entry in &item.entries {
             match entry {
                 gpui::ClipboardEntry::Image(img) => {
