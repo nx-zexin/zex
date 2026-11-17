@@ -256,6 +256,93 @@ pub fn read_file_config() -> Option<FileConfig> {
     }
 }
 
+// ─── 配置变更（纯数据操作，便于测试）───
+//
+// 这些函数只动 `FileConfig`，不碰磁盘也不碰界面。
+// 放这里而不是塞在 UI 里，是因为它们最容易出错的地方是「改名之后
+// 默认模型指向谁」这类边界，那正是单测该覆盖的。
+
+/// 新增或修改一个 provider。
+///
+/// `editing` 非空表示这是一次改名：旧名下的模型列表和默认模型指针
+/// 会一起搬到新名下 —— 不搬的话，改个名字就把整组模型弄丢了。
+pub fn upsert_provider(
+    cfg: &mut FileConfig,
+    name: &str,
+    entry: ProviderEntry,
+    editing: Option<&str>,
+) -> Result<()> {
+    if name.trim().is_empty() {
+        return Err(Error::Config("provider 名不能为空".into()));
+    }
+    if editing != Some(name) && cfg.providers.contains_key(name) {
+        return Err(Error::Config(format!("已存在名为 `{name}` 的 provider")));
+    }
+
+    let mut entry = entry;
+    if let Some(old) = editing {
+        if let Some(prev) = cfg.providers.remove(old) {
+            // 调用方没显式给模型时，继承旧的
+            if entry.models.is_empty() {
+                entry.models = prev.models;
+            }
+        }
+        // 默认模型跟着改名走
+        if let Some(dm) = &cfg.default_model {
+            if let Some(rest) = dm.strip_prefix(format!("{old}/").as_str()) {
+                cfg.default_model = Some(format!("{name}/{rest}"));
+            }
+        }
+    }
+    cfg.providers.insert(name.to_string(), entry);
+    Ok(())
+}
+
+/// 删除一个 provider，并在必要时挪走默认模型指针。
+pub fn remove_provider(cfg: &mut FileConfig, name: &str) {
+    cfg.providers.remove(name);
+    let points_here = cfg
+        .default_model
+        .as_deref()
+        .map(|d| d.starts_with(&format!("{name}/")))
+        .unwrap_or(false);
+    if points_here {
+        cfg.default_model = cfg
+            .providers
+            .iter()
+            .find_map(|(p, e)| e.models.first().map(|m| format!("{p}/{m}")));
+    }
+}
+
+/// 给某个 provider 增加一个模型。
+///
+/// 返回 false 表示已经存在（调用方据此提示用户，而不是静默跳过）。
+pub fn add_model(cfg: &mut FileConfig, provider: &str, model: &str) -> bool {
+    let Some(entry) = cfg.providers.get_mut(provider) else {
+        return false;
+    };
+    if entry.models.iter().any(|m| m == model) {
+        return false;
+    }
+    entry.models.push(model.to_string());
+    true
+}
+
+/// 移除一个模型，并在必要时改掉默认模型。
+pub fn remove_model(cfg: &mut FileConfig, provider: &str, model: &str) {
+    if let Some(entry) = cfg.providers.get_mut(provider) {
+        entry.models.retain(|m| m != model);
+    }
+    let full = format!("{provider}/{model}");
+    if cfg.default_model.as_deref() == Some(full.as_str()) {
+        cfg.default_model = cfg
+            .providers
+            .get(provider)
+            .and_then(|e| e.models.first())
+            .map(|m| format!("{provider}/{m}"));
+    }
+}
+
 /// 把配置写回 `~/.zex/config.json`。
 ///
 /// 先写临时文件再改名：写到一半崩溃会留下半截 JSON，
@@ -401,5 +488,91 @@ mod tests {
         )
         .unwrap();
         assert!(c.providers["o"].api_key_env.is_none());
+    }
+
+    fn entry(models: &[&str]) -> ProviderEntry {
+        ProviderEntry {
+            kind: "openai-compat".into(),
+            base_url: "https://example.com/v1".into(),
+            api_key_env: Some("KEY".into()),
+            headers: Default::default(),
+            models: models.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    fn cfg_with() -> FileConfig {
+        let mut c = FileConfig::default();
+        c.providers.insert("a".into(), entry(&["m1", "m2"]));
+        c.default_model = Some("a/m1".into());
+        c
+    }
+
+    #[test]
+    fn add_provider_then_read_back() {
+        let mut c = FileConfig::default();
+        upsert_provider(&mut c, "p", entry(&["x"]), None).unwrap();
+        assert_eq!(c.providers["p"].models, vec!["x"]);
+    }
+
+    #[test]
+    fn rejects_duplicate_name_on_create() {
+        let mut c = cfg_with();
+        let e = upsert_provider(&mut c, "a", entry(&["n"]), None);
+        assert!(e.is_err(), "同名新增应当被拒绝");
+    }
+
+    #[test]
+    fn rename_keeps_models_and_default() {
+        let mut c = cfg_with();
+        // 改名时调用方不给模型，应当继承旧的
+        let mut e = entry(&[]);
+        e.base_url = "https://new/v1".into();
+        upsert_provider(&mut c, "b", e, Some("a")).unwrap();
+
+        assert!(!c.providers.contains_key("a"), "旧名应当消失");
+        assert_eq!(c.providers["b"].models, vec!["m1", "m2"], "模型列表要跟过来");
+        assert_eq!(c.default_model.as_deref(), Some("b/m1"), "默认模型要跟着改名");
+        assert_eq!(c.providers["b"].base_url, "https://new/v1");
+    }
+
+    #[test]
+    fn remove_provider_moves_default_pointer() {
+        let mut c = cfg_with();
+        c.providers.insert("b".into(), entry(&["n1"]));
+        remove_provider(&mut c, "a");
+
+        assert!(!c.providers.contains_key("a"));
+        // 默认原来指向 a/m1，a 没了要挪到一个还活着的
+        assert_eq!(c.default_model.as_deref(), Some("b/n1"));
+    }
+
+    #[test]
+    fn remove_last_provider_clears_default() {
+        let mut c = cfg_with();
+        remove_provider(&mut c, "a");
+        assert!(c.default_model.is_none(), "没有 provider 时默认模型应为空");
+    }
+
+    #[test]
+    fn add_model_dedups() {
+        let mut c = cfg_with();
+        assert!(!add_model(&mut c, "a", "m1"), "已存在的模型不该重复加入");
+        assert!(add_model(&mut c, "a", "m3"));
+        assert_eq!(c.providers["a"].models, vec!["m1", "m2", "m3"]);
+    }
+
+    #[test]
+    fn remove_default_model_falls_back() {
+        let mut c = cfg_with();
+        remove_model(&mut c, "a", "m1");
+        assert_eq!(c.providers["a"].models, vec!["m2"]);
+        assert_eq!(c.default_model.as_deref(), Some("a/m2"), "默认要换成剩下的第一个");
+    }
+
+    #[test]
+    fn remove_non_default_model_keeps_default() {
+        let mut c = cfg_with();
+        remove_model(&mut c, "a", "m2");
+        assert_eq!(c.default_model.as_deref(), Some("a/m1"));
     }
 }

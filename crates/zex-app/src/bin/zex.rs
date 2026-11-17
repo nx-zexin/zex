@@ -327,6 +327,19 @@ struct ChatView {
     skills: std::sync::Arc<zex_skill::SkillRegistry>,
     /// MCP 连接结果（启动后填充）。
     mcp_status: Vec<zex_mcp::ServerStatus>,
+    /// provider 编辑表单：外层 Some 表示表单开着，内层 Some(name) 表示改现有的。
+    provider_form: Option<Option<String>>,
+    /// 等待确认删除的 provider 名。
+    provider_pending_delete: Option<String>,
+    /// 正在给哪个 provider 添加模型（provider 名）。
+    adding_model_for: Option<String>,
+    /// provider 表单的输入框。
+    pf_name: Entity<InputState>,
+    pf_kind: Entity<InputState>,
+    pf_base_url: Entity<InputState>,
+    pf_key_env: Entity<InputState>,
+    /// 新模型名。
+    pf_model: Entity<InputState>,
     /// 当前会话的运行模式。
     run_mode: zex_core::RunMode,
     /// 正在编辑模型名。
@@ -380,6 +393,13 @@ impl ChatView {
         });
         // 在 active_session 被移进结构体之前先把历史捞出来
         let restored_history = load_input_history(&store, &active_session);
+        // provider 表单的几个框：常驻，打开表单时填值
+        let pf_name = cx.new(|cx| InputState::new(window, cx).placeholder("provider 名，如 deepseek"));
+        let pf_kind = cx.new(|cx| InputState::new(window, cx).placeholder("openai-compat 或 anthropic"));
+        let pf_base_url = cx.new(|cx| InputState::new(window, cx).placeholder("https://api.example.com/v1"));
+        let pf_key_env = cx.new(|cx| InputState::new(window, cx).placeholder("环境变量名，如 DEEPSEEK_API_KEY"));
+        let pf_model = cx.new(|cx| InputState::new(window, cx).placeholder("模型名，如 gpt-4o"));
+
         let rename_input = cx.new(|cx| InputState::new(window, cx).placeholder("会话标题"));
         let model_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder("provider/model，例如 deepseek/deepseek-flash")
@@ -505,6 +525,14 @@ impl ChatView {
             config: zex_app::read_file_config().unwrap_or_default(),
             skills: zex_app::load_skills(),
             mcp_status: Vec::new(),
+            provider_form: None,
+            provider_pending_delete: None,
+            adding_model_for: None,
+            pf_name,
+            pf_kind,
+            pf_base_url,
+            pf_key_env,
+            pf_model,
             run_mode: zex_core::RunMode::Confirm,
             editing_model: false,
             model_input,
@@ -3412,21 +3440,36 @@ impl ChatView {
             )
             .into_any_element()
     }
-
-    /// 模型页：每个 provider 一张卡，列出模型并允许改默认。
+    /// 模型页：provider 增删改 + 每个 provider 下的模型增删。
     fn render_settings_model(&self, cx: &mut Context<Self>) -> AnyElement {
         let cfg_path = zex_app::config_dir().join("config.json");
         let mut col = div()
             .flex()
             .flex_col()
             .gap_4()
-            .max_w(px(780.0))
+            .max_w(px(820.0))
             .child(
                 div()
-                    .text_lg()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(rgb(TEXT))
-                    .child("模型"),
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        div()
+                            .text_lg()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(TEXT))
+                            .child("模型"),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        Button::new("add-provider")
+                            .primary()
+                            .compact()
+                            .label("添加 provider")
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                this.open_provider_form(None, window, cx);
+                            })),
+                    ),
             )
             .child(
                 div()
@@ -3435,18 +3478,72 @@ impl ChatView {
                     .child(format!("配置文件：{}", cfg_path.display())),
             );
 
-        if self.config.providers.is_empty() {
+        // 表单开着就摆在最上面：新建时它就是主任务
+        if self.provider_form.is_some() {
+            col = col.child(self.render_provider_form(cx));
+        }
+
+        // 删除确认条
+        if let Some(name) = &self.provider_pending_delete {
+            let n = name.clone();
+            col = col.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(rgb(DANGER))
+                    .bg(rgb(DANGER_SOFT))
+                    .px_4()
+                    .py_3()
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(DANGER))
+                            .child(format!("删除 provider `{n}`？它下面的模型也会一并消失。")),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        Button::new("del-cancel")
+                            .ghost()
+                            .compact()
+                            .label("取消")
+                            .on_click(cx.listener(|this, _: &ClickEvent, _w, cx| {
+                                this.provider_pending_delete = None;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("del-ok")
+                            .danger()
+                            .compact()
+                            .label("删除")
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _w, cx| {
+                                this.delete_provider(&n, cx);
+                            })),
+                    ),
+            );
+        }
+
+        if self.config.providers.is_empty() && self.provider_form.is_none() {
             return col
                 .child(
                     div()
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(rgb(BORDER))
+                        .bg(rgb(BG_TOOL))
+                        .p_4()
                         .text_sm()
                         .text_color(rgb(TEXT_MUTED))
-                        .child("配置里还没有任何 provider。"),
+                        .child("还没有任何 provider。点上面的「添加 provider」开始。"),
                 )
                 .into_any_element();
         }
 
         for (name, entry) in &self.config.providers {
+            let pname = name.clone();
             let card = div()
                 .flex()
                 .flex_col()
@@ -3471,15 +3568,42 @@ impl ChatView {
                         .child(pill(entry.kind.clone(), BG_HOVER, TEXT_MUTED))
                         .child(div().flex_1())
                         .child(
-                            div()
-                                .text_xs()
-                                .text_color(rgb(TEXT_DIM))
-                                .child(entry.base_url.clone()),
+                            Button::new(ElementId::Name(format!("edit-{name}").into()))
+                                .ghost()
+                                .compact()
+                                .icon(IconName::Pencil)
+                                .tooltip("编辑 provider")
+                                .on_click(cx.listener({
+                                    let n = pname.clone();
+                                    move |this, _: &ClickEvent, window, cx| {
+                                        this.open_provider_form(Some(n.clone()), window, cx);
+                                    }
+                                })),
+                        )
+                        .child(
+                            Button::new(ElementId::Name(format!("del-{name}").into()))
+                                .ghost()
+                                .compact()
+                                .icon(IconName::Trash)
+                                .tooltip("删除 provider")
+                                .on_click(cx.listener({
+                                    let n = pname.clone();
+                                    move |this, _: &ClickEvent, _w, cx| {
+                                        this.provider_pending_delete = Some(n.clone());
+                                        cx.notify();
+                                    }
+                                })),
                         ),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(TEXT_DIM))
+                        .child(entry.base_url.clone()),
                 )
                 .child(match &entry.api_key_env {
                     Some(env) => {
-                        // 只显示环境变量名在不在，绝不读值 —— 密钥不进界面
+                        // 只显示环境变量名在不在，绝不读值
                         let set = std::env::var(env).is_ok();
                         div()
                             .text_xs()
@@ -3496,24 +3620,40 @@ impl ChatView {
                         .child("未声明 api_key_env（适用于本地模型）"),
                 });
 
-            // 用解析后的清单：config 里没写 models 时会回退到内置表，
-            // 直接用 entry.models 的话内置模型一个都看不到
+            // 模型列表：用解析后的清单 —— config 没写 models 会回退到内置表，
+            // 直接读 entry.models 的话界面上一个模型都看不到
             let models: Vec<String> = self
                 .models_by_provider
                 .get(name)
                 .cloned()
-                .unwrap_or_default();
-            let mut list = div().flex().flex_col().gap_1();
+                .unwrap_or_else(|| entry.models.clone());
+            let mut list = div().flex().flex_col().gap_1().pt_2();
+            if models.is_empty() {
+                list = list.child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(TEXT_DIM))
+                        .child("还没有配置模型"),
+                );
+            }
             for m in &models {
                 let full = format!("{name}/{m}");
                 let is_default = self.config.default_model.as_deref() == Some(full.as_str());
                 let target = full.clone();
+                let mp = pname.clone();
+                let mm = m.clone();
                 let mut row = div()
                     .flex()
                     .items_center()
                     .gap_2()
                     .py_1()
-                    .child(div().text_sm().text_color(rgb(TEXT)).child(m.clone()))
+                    .child(
+                        div()
+                            .font_family(MONO)
+                            .text_sm()
+                            .text_color(rgb(TEXT))
+                            .child(m.clone()),
+                    )
                     .child(div().flex_1());
                 if is_default {
                     row = row.child(pill("默认".to_string(), OK_SOFT, OK));
@@ -3533,26 +3673,297 @@ impl ChatView {
                             .child("设为默认"),
                     );
                 }
-                list = list.child(row);
-            }
-            if models.is_empty() {
-                list = list.child(
+                row = row.child(
                     div()
                         .text_xs()
                         .text_color(rgb(TEXT_DIM))
-                        .child("没有可用模型，可在 config.json 的 models 里补"),
+                        .cursor_pointer()
+                        .hover(|s| s.text_color(rgb(DANGER)))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _: &MouseDownEvent, _w, cx| {
+                                this.remove_model(&mp, &mm, cx);
+                            }),
+                        )
+                        .child("移除"),
+                );
+                list = list.child(row);
+            }
+
+            // 添加模型：点按钮把输入框亮出来
+            if self.adding_model_for.as_deref() == Some(name.as_str()) {
+                let for_provider = pname.clone();
+                list = list.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .pt_2()
+                        .child(div().flex_1().child(Input::new(&self.pf_model)))
+                        .child(
+                            Button::new(ElementId::Name(format!("newmodel-ok-{name}").into()))
+                                .primary()
+                                .compact()
+                                .label("添加")
+                                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                    this.add_model(&for_provider, window, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new(ElementId::Name(format!("newmodel-no-{name}").into()))
+                                .ghost()
+                                .compact()
+                                .label("取消")
+                                .on_click(cx.listener(|this, _: &ClickEvent, _w, cx| {
+                                    this.adding_model_for = None;
+                                    cx.notify();
+                                })),
+                        ),
+                );
+            } else {
+                let for_provider = pname.clone();
+                list = list.child(
+                    div()
+                        .pt_2()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(BRAND))
+                                .cursor_pointer()
+                                .hover(|s| s.underline())
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                                        this.adding_model_for = Some(for_provider.clone());
+                                        this.pf_model.update(cx, |st, cx| {
+                                            st.set_value("", window, cx)
+                                        });
+                                        cx.notify();
+                                    }),
+                                )
+                                .child("+ 添加模型"),
+                        ),
                 );
             }
+
             col = col.child(card.child(list));
         }
 
         col.into_any_element()
     }
 
-    /// 把某个 `provider/model` 设成默认并写回配置文件。
+    /// provider 新建/编辑表单。
+    fn render_provider_form(&self, cx: &mut Context<Self>) -> AnyElement {
+        let editing = self.provider_form.clone().flatten();
+        let title = match &editing {
+            Some(n) => format!("编辑 provider · {n}"),
+            None => "添加 provider".into(),
+        };
+
+        let field = |label: &str, input: Entity<InputState>| {
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(label.to_string()))
+                .child(Input::new(&input))
+        };
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .rounded_lg()
+            .border_1()
+            .border_color(rgb(BRAND))
+            .bg(rgb(BG_MAIN))
+            .p_4()
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(TEXT))
+                    .child(title),
+            )
+            .child(field("名称", self.pf_name.clone()))
+            .child(field("协议（openai-compat / anthropic）", self.pf_kind.clone()))
+            .child(field("base_url", self.pf_base_url.clone()))
+            .child(field("api_key_env（可留空，本地模型）", self.pf_key_env.clone()))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(div().flex_1())
+                    .child(
+                        Button::new("pf-cancel")
+                            .ghost()
+                            .compact()
+                            .label("取消")
+                            .on_click(cx.listener(|this, _: &ClickEvent, _w, cx| {
+                                this.provider_form = None;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("pf-save")
+                            .primary()
+                            .compact()
+                            .label("保存")
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                this.save_provider_form(window, cx);
+                            })),
+                    ),
+            )
+            .into_any_element()
+    }
+
+
+    /// 打开 provider 表单。`Some(name)` = 编辑现有，`None` = 新增。
+    fn open_provider_form(&mut self, name: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        let (kind, base, key) = match &name {
+            Some(n) => match self.config.providers.get(n) {
+                Some(e) => (
+                    e.kind.clone(),
+                    e.base_url.clone(),
+                    e.api_key_env.clone().unwrap_or_default(),
+                ),
+                None => (String::new(), String::new(), String::new()),
+            },
+            None => ("openai-compat".to_string(), String::new(), String::new()),
+        };
+        let name_val = name.clone().unwrap_or_default();
+
+        self.pf_name
+            .update(cx, |st, cx| st.set_value(name_val, window, cx));
+        self.pf_kind
+            .update(cx, |st, cx| st.set_value(kind, window, cx));
+        self.pf_base_url
+            .update(cx, |st, cx| st.set_value(base, window, cx));
+        self.pf_key_env
+            .update(cx, |st, cx| st.set_value(key, window, cx));
+
+        self.provider_form = Some(name);
+        cx.notify();
+    }
+
+    /// 保存 provider 表单。
     ///
-    /// 只改配置不动运行时：已建立的 provider 连接是启动时建的，
-    /// 中途换默认模型容易半新半旧，不如明说"重启后生效"。
+    /// 改名会连带搬走它下面的模型列表和默认模型指针 ——
+    /// 否则改个名字就把整组模型弄丢了。
+    fn save_provider_form(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editing) = self.provider_form.clone() else {
+            return;
+        };
+        let name = self.pf_name.read(cx).value().trim().to_string();
+        let kind = self.pf_kind.read(cx).value().trim().to_string();
+        let base = self.pf_base_url.read(cx).value().trim().to_string();
+        let key = self.pf_key_env.read(cx).value().trim().to_string();
+
+        if kind != "openai-compat" && kind != "anthropic" {
+            self.status = "kind 只能是 openai-compat 或 anthropic".into();
+            cx.notify();
+            return;
+        }
+        if base.is_empty() {
+            self.status = "base_url 不能为空".into();
+            cx.notify();
+            return;
+        }
+
+        let entry = zex_app::ProviderEntry {
+            kind,
+            base_url: base,
+            api_key_env: if key.is_empty() { None } else { Some(key) },
+            headers: Default::default(),
+            // 留空：改名时由 upsert_provider 继承旧列表
+            models: Vec::new(),
+        };
+
+        match zex_app::config::upsert_provider(
+            &mut self.config,
+            &name,
+            entry,
+            editing.as_deref(),
+        ) {
+            Ok(()) => {
+                self.provider_form = None;
+                self.persist_config(format!("已保存 provider `{name}`"), cx);
+            }
+            Err(e) => {
+                self.status = e.to_string();
+                cx.notify();
+            }
+        }
+    }
+
+    /// 删除 provider（连同它下面的模型）。
+    fn delete_provider(&mut self, name: &str, cx: &mut Context<Self>) {
+        zex_app::config::remove_provider(&mut self.config, name);
+        self.provider_pending_delete = None;
+        self.persist_config(
+            if self.config.providers.is_empty() {
+                format!("已删除 `{name}`，现在没有任何 provider")
+            } else {
+                format!("已删除 `{name}`")
+            },
+            cx,
+        );
+    }
+
+    /// 把"内置回退"的模型清单固化进配置。
+    ///
+    /// 界面上显示的是解析后的清单（config 没写 models 时回退到内置表），
+    /// 但增删改只能改 `entry.models`。不先固化的话，
+    /// 用户对着内置的 `deepseek-flash` 点"移除"，配置里根本找不到它。
+    fn materialize_models(&mut self, provider: &str) {
+        let builtin = self.models_by_provider.get(provider).cloned();
+        if let Some(entry) = self.config.providers.get_mut(provider) {
+            if entry.models.is_empty() {
+                if let Some(list) = builtin {
+                    entry.models = list;
+                }
+            }
+        }
+    }
+
+    /// 往某个 provider 下加一个模型。
+    fn add_model(&mut self, provider: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let m = self.pf_model.read(cx).value().trim().to_string();
+        if m.is_empty() {
+            self.adding_model_for = None;
+            cx.notify();
+            return;
+        }
+        self.materialize_models(provider);
+        if !zex_app::config::add_model(&mut self.config, provider, &m) {
+            self.status = format!("`{provider}` 下已经有 `{m}` 了");
+            cx.notify();
+            return;
+        }
+        self.adding_model_for = None;
+        self.pf_model
+            .update(cx, |st, cx| st.set_value("", window, cx));
+        self.persist_config(format!("已给 `{provider}` 添加模型 `{m}`"), cx);
+    }
+
+    /// 从某个 provider 下移除一个模型。
+    fn remove_model(&mut self, provider: &str, model: &str, cx: &mut Context<Self>) {
+        self.materialize_models(provider);
+        zex_app::config::remove_model(&mut self.config, provider, model);
+        self.persist_config(format!("已移除 `{provider}/{model}`"), cx);
+    }
+
+    /// 把配置写回磁盘并更新状态栏。
+    fn persist_config(&mut self, ok_msg: String, cx: &mut Context<Self>) {
+        self.status = match zex_app::save_file_config(&self.config) {
+            Ok(()) => format!("{ok_msg}（重启后生效）"),
+            Err(e) => format!("保存失败：{e}"),
+        };
+        cx.notify();
+    }
+
+    /// 把某个 `provider/model` 设成默认并写回配置文件。
     fn set_default_model(&mut self, full: &str, cx: &mut Context<Self>) {
         self.config.default_model = Some(full.to_string());
         self.status = match zex_app::save_file_config(&self.config) {
