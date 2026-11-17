@@ -9,6 +9,7 @@
 #![warn(missing_docs)]
 
 pub mod config;
+pub mod models_dev;
 
 use std::path::PathBuf;
 
