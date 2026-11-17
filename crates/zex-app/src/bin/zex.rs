@@ -3125,7 +3125,9 @@ impl ChatView {
                 MouseButton::Left,
                 cx.listener(move |this, _ev, _window, cx| {
                     // 跳到那条任务所属的会话
+                    // 设置页是"盖在主区之上"的，不关掉的话切过去也看不见对话
                     this.mode = ViewMode::Chat;
+                    this.settings = None;
                     let _ = tx.try_send(UiCommand::SwitchSession {
                         session: zex_core::SessionId::from(sid.clone()),
                     });
@@ -4359,6 +4361,9 @@ impl ChatView {
                             let _ = tx.try_send(UiCommand::SwitchSession {
                                 session: zex_core::SessionId::from(id.clone()),
                             });
+                            // 设置页开着的话先收起来：用户点会话就是想看对话
+                            this.settings = None;
+                            this.mode = ViewMode::Chat;
                             this.status = "切换中…".into();
                             cx.notify();
                         }),
@@ -4420,6 +4425,8 @@ impl ChatView {
                         .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
                             let tx = this.cmd_tx.clone();
                             this.status = "新建中…".into();
+                            this.settings = None;
+                            this.mode = ViewMode::Chat;
                             cx.spawn(async move |_this, _cx| {
                                 let _ = tx.send(UiCommand::NewSession).await;
                             })
@@ -4447,6 +4454,7 @@ impl ChatView {
                         .child("工作台")
                         .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
                             this.mode = ViewMode::Dashboard;
+                            this.settings = None;
                             cx.notify();
                         })),
                 ),
@@ -5117,6 +5125,12 @@ impl Render for ChatView {
                     this.slash_open = false;
                     this.at_open = false;
                     this.history_search_open = false;
+                    cx.notify();
+                    return;
+                }
+                // 设置页优先级高于"打断任务"：用户是在浏览，不是想取消干活
+                if this.settings.is_some() {
+                    this.settings = None;
                     cx.notify();
                     return;
                 }
