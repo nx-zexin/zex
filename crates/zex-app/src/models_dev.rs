@@ -223,10 +223,7 @@ impl Catalog {
         self.providers.iter().find(|p| p.id == id)
     }
 
-    /// 模糊搜索：id、展示名、以及它带的首个模型名都参与匹配。
-    ///
-    /// 一次匹配多个字段是因为用户记的名字各不相同 ——
-    /// 有人搜 "kimi"（模型），有人搜 "moonshot"（provider）。
+    /// 按 id / 展示名搜 provider。
     pub fn search(&self, q: &str) -> Vec<&ProviderInfo> {
         let q = q.trim().to_ascii_lowercase();
         if q.is_empty() {
@@ -235,11 +232,27 @@ impl Catalog {
         self.providers
             .iter()
             .filter(|p| {
-                p.id.to_ascii_lowercase().contains(&q)
-                    || p.name.to_ascii_lowercase().contains(&q)
-                    || p.models
-                        .iter()
-                        .any(|m| m.id.to_ascii_lowercase().contains(&q))
+                p.id.to_ascii_lowercase().contains(&q) || p.name.to_ascii_lowercase().contains(&q)
+            })
+            .collect()
+    }
+
+    /// 按模型名搜 provider。
+    ///
+    /// 与 [`Catalog::search`] 分开是有意的：聚合网关（302.AI 之类）
+    /// 自带上百个模型，混在一起搜的话搜 "deepseek" 会先出来一堆
+    /// 网关 —— 用户要找的通常是官方那家。先搜名字，搜不到再看这个。
+    pub fn search_by_model(&self, q: &str) -> Vec<&ProviderInfo> {
+        let q = q.trim().to_ascii_lowercase();
+        if q.is_empty() {
+            return Vec::new();
+        }
+        self.providers
+            .iter()
+            .filter(|p| {
+                p.models
+                    .iter()
+                    .any(|m| m.id.to_ascii_lowercase().contains(&q))
             })
             .collect()
     }
@@ -368,6 +381,18 @@ pub async fn fetch_remote() -> Result<Catalog> {
     Catalog::parse(&text)
 }
 
+/// 同步版拉取：给调用方在自己的线程里直接跑。
+///
+/// UI 线程上没有 tokio reactor，而 gpui 的 executor 也不跑 IO ——
+/// 所以这里自带一个 current_thread runtime，调用方只管扔到后台线程去。
+pub fn fetch_blocking() -> Result<Catalog> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| Error::Other(format!("无法创建网络运行时: {e}")))?;
+    rt.block_on(fetch_remote())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -455,16 +480,24 @@ mod tests {
     }
 
     #[test]
-    fn search_matches_provider_and_model_name() {
+    fn search_matches_provider_name_only() {
         let c = Catalog::parse(SAMPLE).unwrap();
         // 按 provider id
         assert_eq!(c.search("deep").len(), 1);
-        // 按模型名找到所属 provider
-        let hit = c.search("claude-sonnet");
-        assert_eq!(hit.len(), 1);
-        assert_eq!(hit[0].id, "anthropic");
         // 空串 = 全量
         assert_eq!(c.search("  ").len(), 2);
+        // 模型名不走 search：它属于 search_by_model
+        assert!(c.search("claude-sonnet").is_empty());
+    }
+
+    #[test]
+    fn search_by_model_finds_owner() {
+        let c = Catalog::parse(SAMPLE).unwrap();
+        let hit = c.search_by_model("claude-sonnet");
+        assert_eq!(hit.len(), 1);
+        assert_eq!(hit[0].id, "anthropic");
+        // 空串不该把全家都倒出来
+        assert!(c.search_by_model("  ").is_empty());
     }
 
     #[test]

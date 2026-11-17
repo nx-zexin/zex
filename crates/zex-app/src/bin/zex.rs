@@ -341,6 +341,21 @@ struct ChatView {
     provider_pending_delete: Option<String>,
     /// 正在给哪个 provider 添加模型（provider 名）。
     adding_model_for: Option<String>,
+    /// models.dev 目录（`None` = 还没加载出来）。
+    ///
+    /// 用 `Arc` 是因为渲染每帧都要读它，克隆整个目录太贵；
+    /// 目录本身几 MB，也只该有一份。
+    md_catalog: Option<std::sync::Arc<zex_app::models_dev::Catalog>>,
+    /// 是否正在后台拉目录。
+    md_loading: bool,
+    /// 拉取失败的原因（`None` = 没失败过）。
+    md_error: Option<String>,
+    /// provider 表单里的目录搜索框。
+    md_provider_q: Entity<InputState>,
+    /// 添加模型面板里的搜索框。
+    md_model_q: Entity<InputState>,
+    /// 表单里选中的目录条目（provider id）。保存时据此带出模型清单。
+    md_picked: Option<String>,
     /// provider 表单的输入框。
     pf_name: Entity<InputState>,
     pf_kind: Entity<InputState>,
@@ -371,6 +386,11 @@ struct ChatView {
     /// 默认全折叠：一轮对话里工具调用经常有七八条，
     /// 全摊开会把真正要读的回复挤出屏幕。
     expanded_tools: std::collections::HashSet<String>,
+    /// 哪些 provider 的模型列表被展开了（按 provider 名记）。
+    ///
+    /// 从目录里选一家就带进十几个模型，anthropic 十八个、openrouter 四百多，
+    /// 全铺出来会把其它 provider 顶出屏幕。
+    models_expanded: std::collections::HashSet<String>,
     /// 右侧子智能体面板的宽度（像素，可拖拽）。
     subagent_panel_width: f32,
     /// 正在拖面板边框。
@@ -414,6 +434,10 @@ impl ChatView {
         let pf_base_url = cx.new(|cx| InputState::new(window, cx).placeholder("https://api.example.com/v1"));
         let pf_key_env = cx.new(|cx| InputState::new(window, cx).placeholder("环境变量名，如 DEEPSEEK_API_KEY"));
         let pf_model = cx.new(|cx| InputState::new(window, cx).placeholder("模型名，如 gpt-4o"));
+        let md_provider_q =
+            cx.new(|cx| InputState::new(window, cx).placeholder("搜索 provider，如 deepseek / kimi"));
+        let md_model_q =
+            cx.new(|cx| InputState::new(window, cx).placeholder("搜索模型，如 flash / haiku"));
         let pf_temperature =
             cx.new(|cx| InputState::new(window, cx).placeholder("温度 0–2，留空用服务端默认"));
         let pf_max_tokens =
@@ -471,6 +495,18 @@ impl ChatView {
             },
         )
         .detach();
+
+        // 目录搜索框：输入即重绘列表。
+        // gpui 里 InputState 的变化不会自动让父视图重绘，
+        // 不订阅的话筛选条件是变了、列表还是老的。
+        for q in [&md_provider_q, &md_model_q] {
+            cx.subscribe_in(q, window, |_this, _input, ev: &InputEvent, _window, cx| {
+                if matches!(ev, InputEvent::Change) {
+                    cx.notify();
+                }
+            })
+            .detach();
+        }
 
         // 重命名输入框里按回车等于点"确定"
         cx.subscribe_in(
@@ -555,6 +591,12 @@ impl ChatView {
             provider_form: None,
             provider_pending_delete: None,
             adding_model_for: None,
+            md_catalog: None,
+            md_loading: false,
+            md_error: None,
+            md_provider_q,
+            md_model_q,
+            md_picked: None,
             pf_name,
             pf_kind,
             pf_base_url,
@@ -571,6 +613,7 @@ impl ChatView {
             history_cursor: None,
             history_draft: String::new(),
             expanded_tools: std::collections::HashSet::new(),
+            models_expanded: std::collections::HashSet::new(),
             subagent_panel_width: DEFAULT_PANEL_WIDTH,
             subagent_resizing: false,
             subagent_drag_origin: (0.0, 0.0),
@@ -611,6 +654,7 @@ impl ChatView {
                 "about" => SettingsTab::About,
                 _ => SettingsTab::Model,
             });
+            view.ensure_catalog(cx);
         }
 
         // 方向键：菜单导航与历史回溯
@@ -3553,6 +3597,11 @@ impl ChatView {
                     MouseButton::Left,
                     cx.listener(move |this, _: &MouseDownEvent, _w, cx| {
                         this.settings = Some(t);
+                        // 模型页要用 models.dev 目录：换到这里才开始拉，
+                        // 不跟着启动走 —— 绝大多数会话用不上它
+                        if t == SettingsTab::Model {
+                            this.ensure_catalog(cx);
+                        }
                         cx.notify();
                     }),
                 );
@@ -3774,13 +3823,13 @@ impl ChatView {
                         .child("未声明 api_key_env（适用于本地模型）"),
                 });
 
-            // 模型列表：用解析后的清单 —— config 没写 models 会回退到内置表，
-            // 直接读 entry.models 的话界面上一个模型都看不到
-            let models: Vec<String> = self
-                .models_by_provider
-                .get(name)
-                .cloned()
-                .unwrap_or_else(|| entry.models.clone());
+            // 模型列表：以当前配置为准（加一个就该立刻多一个），
+            // 配置为空时回退到启动时解析出的清单（含内置默认）
+            let models: Vec<String> = if entry.models.is_empty() {
+                self.models_by_provider.get(name).cloned().unwrap_or_default()
+            } else {
+                entry.models.clone()
+            };
             let mut list = div().flex().flex_col().gap_1().pt_2();
             if models.is_empty() {
                 list = list.child(
@@ -3790,7 +3839,17 @@ impl ChatView {
                         .child("还没有配置模型"),
                 );
             }
-            for m in &models {
+            // 从目录选一家就能带进十几个模型，全铺出来会把其它 provider
+            // 顶出屏幕，所以默认只露前几条
+            const MODEL_SHOWN: usize = 8;
+            let expanded = self.models_expanded.contains(name);
+            let total = models.len();
+            let visible = if expanded || total <= MODEL_SHOWN {
+                total
+            } else {
+                MODEL_SHOWN
+            };
+            for m in models.iter().take(visible) {
                 let full = format!("{name}/{m}");
                 let is_default = self.config.default_model.as_deref() == Some(full.as_str());
                 let target = full.clone();
@@ -3937,38 +3996,46 @@ impl ChatView {
                 }
             }
 
-            // 添加模型：点按钮把输入框亮出来
-            if self.adding_model_for.as_deref() == Some(name.as_str()) {
-                let for_provider = pname.clone();
+            // 折叠开关：模型太多时只露前几条
+            if total > MODEL_SHOWN {
+                let pn = pname.clone();
+                let now = expanded;
                 list = list.child(
                     div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .pt_2()
-                        .child(div().flex_1().child(Input::new(&self.pf_model)))
-                        .child(
-                            Button::new(ElementId::Name(format!("newmodel-ok-{name}").into()))
-                                .primary()
-                                .compact()
-                                .label("添加")
-                                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                                    this.add_model(&for_provider, window, cx);
-                                })),
+                        .text_xs()
+                        .text_color(rgb(BRAND))
+                        .cursor_pointer()
+                        .hover(|s| s.underline())
+                        .py_1()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _: &MouseDownEvent, _w, cx| {
+                                if now {
+                                    this.models_expanded.remove(&pn);
+                                } else {
+                                    this.models_expanded.insert(pn.clone());
+                                }
+                                cx.notify();
+                            }),
                         )
-                        .child(
-                            Button::new(ElementId::Name(format!("newmodel-no-{name}").into()))
-                                .ghost()
-                                .compact()
-                                .label("取消")
-                                .on_click(cx.listener(|this, _: &ClickEvent, _w, cx| {
-                                    this.adding_model_for = None;
-                                    cx.notify();
-                                })),
-                        ),
+                        .child(if expanded {
+                            "收起".to_string()
+                        } else {
+                            format!("展开其余 {} 个", total - MODEL_SHOWN)
+                        }),
                 );
+            }
+
+            // 添加模型：能匹配上目录就点选，匹配不上就手填
+            if self.adding_model_for.as_deref() == Some(name.as_str()) {
+                list = list.child(self.render_model_add_panel(name, cx));
             } else {
                 let for_provider = pname.clone();
+                let in_catalog = self
+                    .md_catalog
+                    .as_ref()
+                    .map(|c| c.find(name).is_some())
+                    .unwrap_or(false);
                 list = list.child(
                     div()
                         .pt_2()
@@ -3985,10 +4052,17 @@ impl ChatView {
                                         this.pf_model.update(cx, |st, cx| {
                                             st.set_value("", window, cx)
                                         });
+                                        this.md_model_q.update(cx, |st, cx| {
+                                            st.set_value("", window, cx)
+                                        });
                                         cx.notify();
                                     }),
                                 )
-                                .child("+ 添加模型"),
+                                .child(if in_catalog {
+                                    "+ 从目录添加模型"
+                                } else {
+                                    "+ 添加模型"
+                                }),
                         ),
                 );
             }
@@ -3997,6 +4071,218 @@ impl ChatView {
         }
 
         col.into_any_element()
+    }
+
+    /// provider 表单里的「从 models.dev 选择」块。
+    ///
+    /// 放在手填字段上方：能搜到的人就不该去抄 base_url，
+    /// 搜不到的继续往下填，两条路并存。
+    fn render_md_picker(&self, cx: &mut Context<Self>) -> AnyElement {
+        let mut col = div().flex().flex_col().gap_2();
+
+        // 状态行：有目录就报数量，没有就说清楚是什么情况
+        let mut head = div().flex().items_center().gap_2();
+        match (&self.md_catalog, self.md_loading, &self.md_error) {
+            (Some(cat), _, _) => {
+                head = head.child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(TEXT_DIM))
+                        .child(format!("models.dev · {} 个 provider", cat.providers.len())),
+                );
+            }
+            (None, true, _) => {
+                head = head.child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(TEXT_MUTED))
+                        .child("正在拉取 models.dev 目录…"),
+                );
+            }
+            (None, false, Some(e)) => {
+                head = head.child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(DANGER))
+                        .child(format!("目录拉取失败：{e}")),
+                );
+            }
+            (None, false, None) => {
+                head = head.child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(TEXT_DIM))
+                        .child("目录未加载"),
+                );
+            }
+        }
+        head = head.child(div().flex_1());
+        if !self.md_loading {
+            head = head.child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(BRAND))
+                    .cursor_pointer()
+                    .hover(|s| s.underline())
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _: &MouseDownEvent, _w, cx| {
+                            this.refresh_catalog(cx);
+                        }),
+                    )
+                    .child("重新拉取"),
+            );
+        }
+        col = col.child(head);
+
+        // 已选提示：把"接下来会发生什么"说在前头
+        if let Some(id) = &self.md_picked {
+            if self.md_catalog.is_some() {
+                col = col.child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(OK))
+                        .child(format!("已选 `{id}`，保存时会连同它的模型一起加入")),
+                );
+            }
+        }
+
+        let Some(cat) = self.md_catalog.clone() else {
+            return col.into_any_element();
+        };
+        col = col.child(Input::new(&self.md_provider_q));
+
+        let q = self.md_provider_q.read(cx).value().to_string();
+        // 两级搜索：先找 provider 名，一个都没有再看谁能提供这个模型。
+        // 一上来就按模型名搜的话，搜 "deepseek" 会先铺满一屏聚合网关。
+        let mut hits = cat.search(&q);
+        let mut via_models = false;
+        if hits.is_empty() && !q.trim().is_empty() {
+            hits = cat.search_by_model(&q);
+            via_models = true;
+        }
+        if hits.is_empty() {
+            return col
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(TEXT_DIM))
+                        .child(format!("没有匹配 `{q}` 的 provider —— 继续手填下面的字段")),
+                )
+                .into_any_element();
+        }
+
+        // 搜索结果不展开到底：openrouter 一家就 421 个模型，
+        // 把名字相近的一堆铺满屏幕并不会更好选
+        const SHOWN: usize = 8;
+        if via_models {
+            col = col.child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(TEXT_DIM))
+                    .child(format!("没有名为 `{q}` 的 provider，以下提供包含它的模型")),
+            );
+        }
+        let mut list = div()
+            .flex()
+            .flex_col()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(BORDER_SOFT))
+            .overflow_hidden();
+        for (i, p) in hits.iter().take(SHOWN).enumerate() {
+            let pid = p.id.clone();
+            let mut row = div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_3()
+                .py_2()
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(BG_HOVER)))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                        this.pick_provider_from_catalog(&pid, window, cx);
+                    }),
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(TEXT))
+                        .child(p.name.clone()),
+                )
+                .child(
+                    div()
+                        .font_family(MONO)
+                        .text_xs()
+                        .text_color(rgb(TEXT_DIM))
+                        .child(p.id.clone()),
+                )
+                .child(pill(p.kind().to_string(), BG_HOVER, TEXT_MUTED))
+                .child(div().flex_1())
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(TEXT_DIM))
+                        .child(format!("{} 个模型", p.models.len())),
+                );
+            // 走原生 SDK 的 provider 用我们的兼容层调不通，先标出来
+            if !p.natively_supported() {
+                row = row.child(pill("需自备网关".to_string(), DANGER_SOFT, DANGER));
+            }
+            if i % 2 == 1 {
+                row = row.bg(rgb(BG_TOOL));
+            }
+            list = list.child(row);
+        }
+        col = col.child(list);
+        if hits.len() > SHOWN {
+            col = col.child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(TEXT_DIM))
+                    .child(format!(
+                        "还有 {} 个结果，继续输入以缩小范围",
+                        hits.len() - SHOWN
+                    )),
+            );
+        }
+        col.into_any_element()
+    }
+
+    /// 选中目录里的 provider：把能填的都填上。
+    ///
+    /// 只填不存 —— 用户还得看一眼协议对不对、要不要改环境变量名，
+    /// 直接落盘就把"选择"变成了"既成事实"。
+    fn pick_provider_from_catalog(
+        &mut self,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(cat) = self.md_catalog.clone() else {
+            return;
+        };
+        let Some(p) = cat.find(id) else {
+            return;
+        };
+        let (name, kind, base) = (p.id.clone(), p.kind().to_string(), p.base_url());
+        let env = p.env.first().cloned().unwrap_or_default();
+        let model_count = p.models.len();
+
+        self.pf_name
+            .update(cx, |st, cx| st.set_value(name.clone(), window, cx));
+        self.pf_kind
+            .update(cx, |st, cx| st.set_value(kind, window, cx));
+        self.pf_base_url
+            .update(cx, |st, cx| st.set_value(base, window, cx));
+        self.pf_key_env
+            .update(cx, |st, cx| st.set_value(env, window, cx));
+
+        self.md_picked = Some(id.to_string());
+        self.status = format!("已从目录填入 `{id}`（{model_count} 个模型）");
+        cx.notify();
     }
 
     /// provider 新建/编辑表单。
@@ -4032,6 +4318,8 @@ impl ChatView {
                     .text_color(rgb(TEXT))
                     .child(title),
             )
+            .child(self.render_md_picker(cx))
+            .child(div().h(px(1.0)).bg(rgb(BORDER_SOFT)))
             .child(field("名称", self.pf_name.clone()))
             .child(field("协议（openai-compat / anthropic）", self.pf_kind.clone()))
             .child(field("base_url", self.pf_base_url.clone()))
@@ -4065,6 +4353,68 @@ impl ChatView {
             .into_any_element()
     }
 
+
+    /// 确保 models.dev 目录就绪。
+    ///
+    /// 策略：有缓存先上缓存（哪怕过期），过期了再后台静默刷新 ——
+    /// 界面不该为了“最新”而白屏等网络。
+    fn ensure_catalog(&mut self, cx: &mut Context<Self>) {
+        if self.md_catalog.is_some() || self.md_loading {
+            return;
+        }
+        if let Some((cat, stale)) = zex_app::models_dev::load_cache() {
+            self.md_catalog = Some(std::sync::Arc::new(cat));
+            cx.notify();
+            if !stale {
+                return;
+            }
+        }
+        self.refresh_catalog(cx);
+    }
+
+    /// 从上游重新拉目录。
+    ///
+    /// 网络与解析都放在独立线程：gpui 的 executor 不跑 IO，
+    /// 在那儿 await reqwest 会直接 panic（没有 reactor）。
+    fn refresh_catalog(&mut self, cx: &mut Context<Self>) {
+        if self.md_loading {
+            return;
+        }
+        self.md_loading = true;
+        self.md_error = None;
+        cx.notify();
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let spawned = std::thread::Builder::new()
+            .name("models-dev".into())
+            .spawn(move || {
+                let _ = tx.send(zex_app::models_dev::fetch_blocking());
+            });
+        if let Err(e) = spawned {
+            self.md_loading = false;
+            self.md_error = Some(format!("无法启动拉取线程: {e}"));
+            cx.notify();
+            return;
+        }
+
+        cx.spawn(async move |this, cx| {
+            let res = rx.await;
+            let _ = this.update(cx, |this, cx| {
+                this.md_loading = false;
+                match res {
+                    Ok(Ok(cat)) => {
+                        zex_app::models_dev::save_cache(&cat);
+                        this.md_catalog = Some(std::sync::Arc::new(cat));
+                        this.md_error = None;
+                    }
+                    Ok(Err(e)) => this.md_error = Some(e.to_string()),
+                    Err(_) => this.md_error = Some("拉取线程异常退出".into()),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
 
     /// 打开 provider 表单。`Some(name)` = 编辑现有，`None` = 新增。
     fn open_provider_form(&mut self, name: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
@@ -4118,14 +4468,39 @@ impl ChatView {
             return;
         }
 
+        // 从目录选中的话，把它的对话模型一并带进来。
+        // 只在“新建”或原配置本来就没模型时这么做 ——
+        // 编辑一个已有清单的 provider 时擅自扩大到全量，会改掉用户显式删掉的项。
+        let from_catalog: Vec<String> = match (&self.md_picked, &self.md_catalog) {
+            (Some(id), Some(cat)) => cat
+                .find(id)
+                .map(|p| p.models.iter().map(|m| m.id.clone()).collect())
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        let existing: Vec<String> = editing
+            .as_deref()
+            .and_then(|n| self.config.providers.get(n))
+            .map(|e| e.models.clone())
+            .unwrap_or_default();
+
         let entry = zex_app::ProviderEntry {
             kind,
             base_url: base,
             api_key_env: if key.is_empty() { None } else { Some(key) },
             headers: Default::default(),
-            // 留空：改名时由 upsert_provider 继承旧列表
-            models: Vec::new(),
+            // 有旧清单就継承（传空让 upsert_provider 接），否则用目录里的
+            models: if existing.is_empty() {
+                from_catalog.clone()
+            } else {
+                Vec::new()
+            },
             params: Default::default(),
+        };
+        let added = if existing.is_empty() {
+            from_catalog.len()
+        } else {
+            0
         };
 
         match zex_app::config::upsert_provider(
@@ -4136,7 +4511,13 @@ impl ChatView {
         ) {
             Ok(()) => {
                 self.provider_form = None;
-                self.persist_config(format!("已保存 provider `{name}`"), cx);
+                self.md_picked = None;
+                let msg = if added > 0 {
+                    format!("已保存 provider `{name}`，带入 {added} 个模型")
+                } else {
+                    format!("已保存 provider `{name}`")
+                };
+                self.persist_config(msg, cx);
             }
             Err(e) => {
                 self.status = e.to_string();
@@ -4268,6 +4649,228 @@ impl ChatView {
                 }
             }
         }
+    }
+
+    /// 「添加模型」展开后的面板：上面是目录候选，下面是手填入口。
+    fn render_model_add_panel(&self, provider: &str, cx: &mut Context<Self>) -> AnyElement {
+        let for_provider = provider.to_string();
+        // 以配置文件里的清单为准：加完一个得立刻反映到候选列表，
+        // 而 models_by_provider 是启动时的快照，加完不会变。
+        // 配置里为空时才回退到快照（那意味着用的是内置清单）。
+        let configured: Vec<String> = self
+            .config
+            .providers
+            .get(provider)
+            .map(|e| e.models.clone())
+            .unwrap_or_default();
+        let existing: std::collections::HashSet<String> = if configured.is_empty() {
+            self.models_by_provider
+                .get(provider)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .collect()
+        } else {
+            configured.into_iter().collect()
+        };
+
+        let mut panel = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .mt_2()
+            .ml_6()
+            .mb_2()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(BRAND))
+            .p_3();
+
+        let catalog_hit = self.md_catalog.as_ref().and_then(|c| c.find(provider));
+        if let Some(p) = catalog_hit {
+            let q = self.md_model_q.read(cx).value().to_string();
+            let q_lower = q.trim().to_ascii_lowercase();
+            let candidates: Vec<_> = p
+                .models
+                .iter()
+                .filter(|m| !existing.contains(&m.id))
+                .filter(|m| {
+                    q_lower.is_empty()
+                        || m.id.to_ascii_lowercase().contains(&q_lower)
+                        || m.name.to_ascii_lowercase().contains(&q_lower)
+                })
+                .collect();
+
+            panel = panel.child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(TEXT_MUTED))
+                    .child(format!(
+                        "models.dev 里 `{}` 有 {} 个可用模型（已加入 {} 个）",
+                        p.id,
+                        p.models.len(),
+                        existing.len()
+                    )),
+            );
+            panel = panel.child(Input::new(&self.md_model_q));
+
+            // 同屏最多 12 条：一个 openrouter 就 421 个，铺满屏幕反而难找
+            const SHOWN: usize = 12;
+            if candidates.is_empty() {
+                panel = panel.child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(TEXT_DIM))
+                        .child(if q_lower.is_empty() {
+                            "目录里的模型都加过了".to_string()
+                        } else {
+                            format!("没有匹配 `{q}` 的模型")
+                        }),
+                );
+            } else {
+                let mut rows = div()
+                    .flex()
+                    .flex_col()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(BORDER_SOFT))
+                    .overflow_hidden();
+                for (i, m) in candidates.iter().take(SHOWN).enumerate() {
+                    let pid = for_provider.clone();
+                    let mid = m.id.clone();
+                    let summary = m.summary();
+                    // 名称 + id + 价格 一行放不下（1M 上下文 · 393k 输出 · $0.15/$0.6 …）：
+                    // 名称与 id 排一行、摘要排第二行，不靠截断硬塞
+                    let mut row = div()
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .px_3()
+                        .py_1p5()
+                        .cursor_pointer()
+                        .hover(|s| s.bg(rgb(BG_HOVER)))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _: &MouseDownEvent, _w, cx| {
+                                this.add_model_direct(&pid, &mid, cx);
+                            }),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_0p5()
+                                .min_w(px(0.0))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .min_w(px(0.0))
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .text_color(rgb(TEXT))
+                                                .truncate()
+                                                .child(m.name.clone()),
+                                        )
+                                        .child(
+                                            div()
+                                                .font_family(MONO)
+                                                .text_xs()
+                                                .text_color(rgb(TEXT_DIM))
+                                                .truncate()
+                                                .child(m.id.clone()),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(TEXT_MUTED))
+                                        .truncate()
+                                        .child(summary),
+                                ),
+                        )
+                        .child(div().flex_1())
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(BRAND))
+                                .flex_none()
+                                .child("添加"),
+                        );
+                    if i % 2 == 1 {
+                        row = row.bg(rgb(BG_TOOL));
+                    }
+                    rows = rows.child(row);
+                }
+                panel = panel.child(rows);
+                if candidates.len() > SHOWN {
+                    panel = panel.child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(TEXT_DIM))
+                            .child(format!(
+                                "还有 {} 个，输入关键词缩小范围",
+                                candidates.len() - SHOWN
+                            )),
+                    );
+                }
+            }
+            panel = panel.child(div().h(px(1.0)).bg(rgb(BORDER_SOFT)));
+        }
+
+        // 手填入口永远在：自建网关、私有部署、刚上线的新模型
+        // 都可能还没进目录
+        panel
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(TEXT_MUTED))
+                    .child(if catalog_hit.is_some() {
+                        "或手动输入模型名"
+                    } else {
+                        "输入模型名（未在 models.dev 收录）"
+                    }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(div().flex_1().child(Input::new(&self.pf_model)))
+                    .child(
+                        Button::new("newmodel-ok")
+                            .primary()
+                            .compact()
+                            .label("添加")
+                            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                this.add_model(&for_provider, window, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("newmodel-no")
+                            .ghost()
+                            .compact()
+                            .label("取消")
+                            .on_click(cx.listener(|this, _: &ClickEvent, _w, cx| {
+                                this.adding_model_for = None;
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// 从目录直接加一个模型（不经输入框）。
+    fn add_model_direct(&mut self, provider: &str, model: &str, cx: &mut Context<Self>) {
+        self.materialize_models(provider);
+        if !zex_app::config::add_model(&mut self.config, provider, model) {
+            self.status = format!("`{provider}` 下已经有 `{model}` 了");
+            cx.notify();
+            return;
+        }
+        self.persist_config(format!("已给 `{provider}` 添加模型 `{model}`"), cx);
     }
 
     /// 往某个 provider 下加一个模型。
@@ -4824,6 +5427,9 @@ impl ChatView {
                                         Some(_) => None,
                                         None => Some(SettingsTab::Model),
                                     };
+                                    if this.settings == Some(SettingsTab::Model) {
+                                        this.ensure_catalog(cx);
+                                    }
                                     cx.notify();
                                 }),
                             )
