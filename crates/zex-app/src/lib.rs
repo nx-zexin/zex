@@ -12,7 +12,9 @@ pub mod config;
 
 use std::path::PathBuf;
 
-pub use config::{ResolvedConfig, config_dir, load};
+pub use config::{
+    FileConfig, ProviderEntry, ResolvedConfig, config_dir, load, read_file_config, save_file_config,
+};
 use zex_store::Store;
 
 /// 主数据库路径 `~/.zex/zex.db`。

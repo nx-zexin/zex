@@ -227,6 +227,19 @@ enum ViewMode {
     Chat,
 }
 
+/// 设置页的分区。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SettingsTab {
+    /// 模型与 provider。
+    Model,
+    /// 技能（预留）。
+    Skill,
+    /// MCP 服务（预留）。
+    Mcp,
+    /// 版本、路径等信息。
+    About,
+}
+
 /// 会话列表项。
 #[derive(Clone)]
 struct SessionItem {
@@ -306,6 +319,10 @@ struct ChatView {
     /// keybinding 先于 key listener 执行并停掉事件，
     /// `capture_key_down` 在这里根本收不到方向键。
     _key_interceptor: Option<gpui::Subscription>,
+    /// 设置页是否打开（None = 没开），以及停在哪个分区。
+    settings: Option<SettingsTab>,
+    /// `config.json` 的原始内容：设置页要展示、也要能改。
+    config: zex_app::FileConfig,
     /// 当前会话的运行模式。
     run_mode: zex_core::RunMode,
     /// 正在编辑模型名。
@@ -480,6 +497,8 @@ impl ChatView {
             models_by_provider,
             active_provider,
             _key_interceptor: None,
+            settings: None,
+            config: zex_app::read_file_config().unwrap_or_default(),
             run_mode: zex_core::RunMode::Confirm,
             editing_model: false,
             model_input,
@@ -496,6 +515,16 @@ impl ChatView {
             model,
             usage: Usage::default(),
         };
+
+        // 测试钩子：ZEX_AUTO_SETTINGS=model|skill|mcp|about 直接打开设置页
+        if let Ok(tab) = std::env::var("ZEX_AUTO_SETTINGS") {
+            view.settings = Some(match tab.as_str() {
+                "skill" => SettingsTab::Skill,
+                "mcp" => SettingsTab::Mcp,
+                "about" => SettingsTab::About,
+                _ => SettingsTab::Model,
+            });
+        }
 
         // 方向键：菜单导航与历史回溯
         //
@@ -3279,6 +3308,324 @@ impl ChatView {
         bar.into_any_element()
     }
 
+    /// 设置页：左侧分区导航，右侧内容。
+    fn render_settings(&self, tab: SettingsTab, cx: &mut Context<Self>) -> AnyElement {
+        let items: [(SettingsTab, &str, &str); 4] = [
+            (SettingsTab::Model, "模型", "provider 与默认模型"),
+            (SettingsTab::Skill, "技能", "可复用的能力包"),
+            (SettingsTab::Mcp, "MCP", "外部工具服务"),
+            (SettingsTab::About, "关于", "版本与路径"),
+        ];
+
+        let mut nav = div()
+            .w(px(200.0))
+            .flex_none()
+            .h_full()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .p_3()
+            .border_r_1()
+            .border_color(rgb(BORDER_SOFT));
+
+        for (t, label, hint) in items {
+            let active = t == tab;
+            let mut row = div()
+                .flex()
+                .flex_col()
+                .gap_0p5()
+                .px_3()
+                .py_2()
+                .rounded(px(8.0))
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(BG_HOVER)))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _: &MouseDownEvent, _w, cx| {
+                        this.settings = Some(t);
+                        cx.notify();
+                    }),
+                );
+            if active {
+                row = row.bg(rgb(BG_HOVER));
+            }
+            nav = nav.child(
+                row.child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(if active { TEXT } else { TEXT_MUTED }))
+                        .child(label),
+                )
+                .child(div().text_xs().text_color(rgb(TEXT_DIM)).child(hint)),
+            );
+        }
+
+        let content = match tab {
+            SettingsTab::Model => self.render_settings_model(cx),
+            SettingsTab::Skill => Self::render_settings_placeholder(
+                "技能",
+                "还没有接入技能系统。",
+                &[
+                    "计划中的能力：把一段可复用的做法（提示词 + 常用工具序列）",
+                    "存成技能，在对话里按名字唤起，不用每次重新交代。",
+                    "",
+                    "后端目前只有 zex-knowledge / zex-evolve 两个空壳 crate，",
+                    "技能的定义、存储和加载都还没实现 —— 这里先留位置。",
+                ],
+            ),
+            SettingsTab::Mcp => Self::render_settings_placeholder(
+                "MCP",
+                "还没有接入 MCP（Model Context Protocol）。",
+                &[
+                    "计划中的能力：配置若干 MCP 服务（stdio / HTTP），",
+                    "启动时连上，把它们的工具并入可用工具集。",
+                    "",
+                    "当前内核的工具全部编译在二进制里（文件 / shell / 网页 / 子智能体），",
+                    "没有动态挂载通道，所以这里暂时是空的。",
+                ],
+            ),
+            SettingsTab::About => Self::render_settings_about(),
+        };
+
+        div()
+            .flex()
+            .flex_1()
+            .min_h(px(0.0))
+            .child(nav)
+            .child(
+                div()
+                    .id("settings-scroll")
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .h_full()
+                    .overflow_y_scroll()
+                    .p_8()
+                    .child(content),
+            )
+            .into_any_element()
+    }
+
+    /// 模型页：每个 provider 一张卡，列出模型并允许改默认。
+    fn render_settings_model(&self, cx: &mut Context<Self>) -> AnyElement {
+        let cfg_path = zex_app::config_dir().join("config.json");
+        let mut col = div()
+            .flex()
+            .flex_col()
+            .gap_4()
+            .max_w(px(780.0))
+            .child(
+                div()
+                    .text_lg()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(TEXT))
+                    .child("模型"),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(TEXT_DIM))
+                    .child(format!("配置文件：{}", cfg_path.display())),
+            );
+
+        if self.config.providers.is_empty() {
+            return col
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(TEXT_MUTED))
+                        .child("配置里还没有任何 provider。"),
+                )
+                .into_any_element();
+        }
+
+        for (name, entry) in &self.config.providers {
+            let card = div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .rounded_lg()
+                .border_1()
+                .border_color(rgb(BORDER))
+                .bg(rgb(BG_MAIN))
+                .p_4()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(TEXT))
+                                .child(name.clone()),
+                        )
+                        .child(pill(entry.kind.clone(), BG_HOVER, TEXT_MUTED))
+                        .child(div().flex_1())
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(TEXT_DIM))
+                                .child(entry.base_url.clone()),
+                        ),
+                )
+                .child(match &entry.api_key_env {
+                    Some(env) => {
+                        // 只显示环境变量名在不在，绝不读值 —— 密钥不进界面
+                        let set = std::env::var(env).is_ok();
+                        div()
+                            .text_xs()
+                            .text_color(rgb(if set { OK } else { DANGER }))
+                            .child(format!(
+                                "{} {}",
+                                if set { "密钥已就绪：" } else { "缺少环境变量：" },
+                                env
+                            ))
+                    }
+                    None => div()
+                        .text_xs()
+                        .text_color(rgb(TEXT_DIM))
+                        .child("未声明 api_key_env（适用于本地模型）"),
+                });
+
+            // 用解析后的清单：config 里没写 models 时会回退到内置表，
+            // 直接用 entry.models 的话内置模型一个都看不到
+            let models: Vec<String> = self
+                .models_by_provider
+                .get(name)
+                .cloned()
+                .unwrap_or_default();
+            let mut list = div().flex().flex_col().gap_1();
+            for m in &models {
+                let full = format!("{name}/{m}");
+                let is_default = self.config.default_model.as_deref() == Some(full.as_str());
+                let target = full.clone();
+                let mut row = div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .py_1()
+                    .child(div().text_sm().text_color(rgb(TEXT)).child(m.clone()))
+                    .child(div().flex_1());
+                if is_default {
+                    row = row.child(pill("默认".to_string(), OK_SOFT, OK));
+                } else {
+                    row = row.child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(BRAND))
+                            .cursor_pointer()
+                            .hover(|s| s.underline())
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _: &MouseDownEvent, _w, cx| {
+                                    this.set_default_model(&target, cx);
+                                }),
+                            )
+                            .child("设为默认"),
+                    );
+                }
+                list = list.child(row);
+            }
+            if models.is_empty() {
+                list = list.child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(TEXT_DIM))
+                        .child("没有可用模型，可在 config.json 的 models 里补"),
+                );
+            }
+            col = col.child(card.child(list));
+        }
+
+        col.into_any_element()
+    }
+
+    /// 把某个 `provider/model` 设成默认并写回配置文件。
+    ///
+    /// 只改配置不动运行时：已建立的 provider 连接是启动时建的，
+    /// 中途换默认模型容易半新半旧，不如明说"重启后生效"。
+    fn set_default_model(&mut self, full: &str, cx: &mut Context<Self>) {
+        self.config.default_model = Some(full.to_string());
+        self.status = match zex_app::save_file_config(&self.config) {
+            Ok(()) => {
+                self.model = full.to_string();
+                self.selected_model = None;
+                format!("默认模型已改为 {full}，重启后生效")
+            }
+            Err(e) => format!("保存失败：{e}"),
+        };
+        cx.notify();
+    }
+
+    /// 还没实现的分区：说清楚现状，别只放一个空框。
+    fn render_settings_placeholder(title: &str, headline: &str, lines: &[&str]) -> AnyElement {
+        let mut col = div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .max_w(px(780.0))
+            .child(
+                div()
+                    .text_lg()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(TEXT))
+                    .child(title.to_string()),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(TEXT))
+                    .child(headline.to_string()),
+            );
+        for l in lines {
+            col = col.child(
+                div()
+                    .text_xs()
+                    .line_height(px(20.0))
+                    .text_color(rgb(TEXT_MUTED))
+                    .child(l.to_string()),
+            );
+        }
+        col.into_any_element()
+    }
+
+    fn render_settings_about() -> AnyElement {
+        let rows: [(&str, String); 3] = [
+            ("版本", env!("CARGO_PKG_VERSION").to_string()),
+            ("配置目录", zex_app::config_dir().display().to_string()),
+            (
+                "工作目录",
+                std::env::current_dir()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default(),
+            ),
+        ];
+        let mut col = div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .max_w(px(780.0))
+            .child(
+                div()
+                    .text_lg()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(TEXT))
+                    .child("关于"),
+            );
+        for (k, v) in rows {
+            col = col.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(div().w(px(90.0)).text_xs().text_color(rgb(TEXT_DIM)).child(k))
+                    .child(div().text_xs().text_color(rgb(TEXT)).child(v)),
+            );
+        }
+        col.into_any_element()
+    }
+
     fn render_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
         let mut list = div().flex().flex_col().gap_1().px_3();
 
@@ -3443,10 +3790,36 @@ impl ChatView {
                     .border_t_1()
                     .border_color(rgb(BORDER_SOFT))
                     .child(
-                        div().text_lg().text_color(rgb(TEXT_MUTED)).child("⚙"),
+                        div()
+                            .cursor_pointer()
+                            .hover(|s| s.text_color(rgb(TEXT)))
+                            .text_color(rgb(if self.settings.is_some() { TEXT } else { TEXT_MUTED }))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _: &MouseDownEvent, _w, cx| {
+                                    // 再点一次收起，省得去找返回键
+                                    this.settings = match this.settings {
+                                        Some(_) => None,
+                                        None => Some(SettingsTab::Model),
+                                    };
+                                    cx.notify();
+                                }),
+                            )
+                            .child(Icon::new(IconName::Settings).text_size(px(15.0))),
                     )
                     .child(
-                        div().text_lg().text_color(rgb(TEXT_MUTED)).child("？"),
+                        div()
+                            .cursor_pointer()
+                            .hover(|s| s.text_color(rgb(TEXT)))
+                            .text_color(rgb(TEXT_MUTED))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _: &MouseDownEvent, _w, cx| {
+                                    this.settings = Some(SettingsTab::About);
+                                    cx.notify();
+                                }),
+                            )
+                            .child(Icon::new(IconName::Info).text_size(px(15.0))),
                     ),
             )
             .into_any_element()
@@ -4121,8 +4494,13 @@ impl Render for ChatView {
                     .min_w(px(0.0))
                     .h_full()
                     .flex()
-                    .flex_col()
-                    .child(match self.mode {
+                    .flex_col();
+                if let Some(tab) = self.settings {
+                    // 设置页盖住主区：它是个"离开对话"的动作，
+                    // 和消息流并排没意义
+                    main = main.child(self.render_settings(tab, cx));
+                } else {
+                    main = main.child(match self.mode {
                         ViewMode::Dashboard => self.render_dashboard(window, cx),
                         ViewMode::Chat => {
                             // 团队入口已经收进编辑器，底部不再挂卡片：
@@ -4130,9 +4508,10 @@ impl Render for ChatView {
                             feed.into_any_element()
                         }
                     });
-                // 工作台模式下不需要输入框：还没决定要干什么
-                if self.mode == ViewMode::Chat {
-                    main = main.child(bottom);
+                    // 工作台模式下不需要输入框：还没决定要干什么
+                    if self.mode == ViewMode::Chat {
+                        main = main.child(bottom);
+                    }
                 }
                 let mut body = div()
                     .flex_1()

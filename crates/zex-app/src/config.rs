@@ -237,7 +237,8 @@ fn model_list(entry: &ProviderEntry, name: &str, current: Option<&str>) -> Vec<S
     list
 }
 
-fn read_file_config() -> Option<FileConfig> {
+/// 读取 `~/.zex/config.json`（解析失败按空配置处理）。
+pub fn read_file_config() -> Option<FileConfig> {
     let path = config_dir().join("config.json");
     let text = std::fs::read_to_string(&path).ok()?;
     match serde_json::from_str(&text) {
@@ -247,6 +248,23 @@ fn read_file_config() -> Option<FileConfig> {
             None
         }
     }
+}
+
+/// 把配置写回 `~/.zex/config.json`。
+///
+/// 先写临时文件再改名：写到一半崩溃会留下半截 JSON，
+/// 下次启动就读不到配置了。
+pub fn save_file_config(cfg: &FileConfig) -> Result<()> {
+    let dir = config_dir();
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| Error::Config(format!("创建配置目录失败: {e}")))?;
+    let path = dir.join("config.json");
+    let tmp = dir.join("config.json.tmp");
+    let text = serde_json::to_string_pretty(cfg)
+        .map_err(|e| Error::Config(format!("序列化配置失败: {e}")))?;
+    std::fs::write(&tmp, text).map_err(|e| Error::Config(format!("写配置失败: {e}")))?;
+    std::fs::rename(&tmp, &path).map_err(|e| Error::Config(format!("保存配置失败: {e}")))?;
+    Ok(())
 }
 
 fn parse_kind(s: &str) -> Result<ProviderKind> {
