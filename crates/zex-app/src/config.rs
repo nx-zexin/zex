@@ -15,6 +15,20 @@ use serde::{Deserialize, Serialize};
 use zex_core::{Error, Result};
 use zex_llm::{ProviderConfig, ProviderKind};
 
+/// 单个模型的采样参数。
+///
+/// 只收"换了会让输出明显不同"的那几个。全部透传反而危险：
+/// 不同 provider 支持的字段不一样，写错了会被服务端直接拒掉。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ModelParams {
+    /// 采样温度，0–2。越低越确定。留空用服务端默认。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+    /// 单次输出 token 上限。留空用程序默认（8192）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+}
+
 /// 一个 provider 的 JSON 表示。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProviderEntry {
@@ -34,6 +48,12 @@ pub struct ProviderEntry {
     /// 不在这里硬编码全部：模型上下线比程序发版快，用户能自己写才跟得上。
     #[serde(default)]
     pub models: Vec<String>,
+    /// 按模型名索引的采样参数。
+    ///
+    /// 单开一个映射而不是把 `models` 改成对象数组：老配置里
+    /// `models` 是字符串数组，改结构会让所有现存配置失效。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub params: BTreeMap<String, ModelParams>,
 }
 
 /// `config.json` 的结构。
@@ -70,6 +90,23 @@ pub struct ResolvedConfig {
     ///
     /// 供模型菜单做二级展示：一级机构，二级模型。
     pub models: BTreeMap<String, Vec<String>>,
+    /// 当前默认模型的采样参数。
+    ///
+    /// 只有默认那个模型带参数：切换模型走的是请求级覆盖，
+    /// 那时由 `params_for` 现查，不必让 ResolvedConfig 背着全部。
+    pub model_params: ModelParams,
+}
+
+impl ResolvedConfig {
+    /// 查某个模型配置的参数（`provider/model` 或裸模型名）。
+    pub fn params_for(&self, full: &str) -> Option<ModelParams> {
+        let file = read_file_config()?;
+        let (p, m) = match full.split_once('/') {
+            Some((p, m)) => (p.to_string(), m.to_string()),
+            None => (self.provider_name.clone(), full.to_string()),
+        };
+        file.providers.get(&p)?.params.get(&m).cloned()
+    }
 }
 
 /// Zex 的配置目录 `~/.zex`。
@@ -120,6 +157,8 @@ pub fn load() -> Result<ResolvedConfig> {
             provider_name: kind_str,
             all_providers: all,
             models,
+            // 走环境变量配置时没有 provider 条目可查，用默认参数
+            model_params: ModelParams::default(),
         });
     }
 
@@ -187,6 +226,8 @@ pub fn load() -> Result<ResolvedConfig> {
         models.insert(name.clone(), model_list(e, name, cur));
     }
 
+    let model_params = entry.params.get(&model).cloned().unwrap_or_default();
+
     Ok(ResolvedConfig {
         provider: ProviderConfig {
             kind,
@@ -198,6 +239,7 @@ pub fn load() -> Result<ResolvedConfig> {
         provider_name,
         all_providers,
         models,
+        model_params,
     })
 }
 
@@ -497,6 +539,7 @@ mod tests {
             api_key_env: Some("KEY".into()),
             headers: Default::default(),
             models: models.iter().map(|s| s.to_string()).collect(),
+            params: Default::default(),
         }
     }
 
@@ -574,5 +617,47 @@ mod tests {
         let mut c = cfg_with();
         remove_model(&mut c, "a", "m2");
         assert_eq!(c.default_model.as_deref(), Some("a/m1"));
+    }
+
+    #[test]
+    fn model_params_round_trip_json() {
+        let json = r#"{
+            "kind": "openai-compat",
+            "base_url": "https://x/v1",
+            "models": ["m1"],
+            "params": { "m1": { "temperature": 0.3, "max_tokens": 2048 } }
+        }"#;
+        let e: ProviderEntry = serde_json::from_str(json).expect("应能解析");
+        let p = e.params.get("m1").expect("参数应存在");
+        assert_eq!(p.temperature, Some(0.3));
+        assert_eq!(p.max_tokens, Some(2048));
+    }
+
+    #[test]
+    fn old_config_without_params_still_loads() {
+        // 加 params 字段之前写下的配置：没有该键也要能读
+        let json = r#"{"kind":"anthropic","base_url":"https://x","models":["m"]}"#;
+        let e: ProviderEntry = serde_json::from_str(json).expect("老配置应能解析");
+        assert!(e.params.is_empty());
+    }
+
+    #[test]
+    fn empty_params_are_not_serialized() {
+        // 没配参数的 provider 不该在文件里多出一个 "params": {}
+        let e = ProviderEntry {
+            kind: "openai-compat".into(),
+            base_url: "https://x".into(),
+            ..Default::default()
+        };
+        let s = serde_json::to_string(&e).unwrap();
+        assert!(!s.contains("params"), "空参数表不应写进文件：{s}");
+    }
+
+    #[test]
+    fn params_only_hold_given_fields() {
+        let json = r#"{ "temperature": 0.7 }"#;
+        let p: ModelParams = serde_json::from_str(json).expect("应能解析");
+        assert_eq!(p.temperature, Some(0.7));
+        assert_eq!(p.max_tokens, None, "没写的字段应保持 None，而不是 0");
     }
 }

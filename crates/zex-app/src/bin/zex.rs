@@ -340,6 +340,11 @@ struct ChatView {
     pf_key_env: Entity<InputState>,
     /// 新模型名。
     pf_model: Entity<InputState>,
+    /// 正在编辑参数的模型：`(provider, model)`。
+    editing_params_for: Option<(String, String)>,
+    /// 参数表单：温度、最大输出 token。
+    pf_temperature: Entity<InputState>,
+    pf_max_tokens: Entity<InputState>,
     /// 当前会话的运行模式。
     run_mode: zex_core::RunMode,
     /// 正在编辑模型名。
@@ -399,6 +404,10 @@ impl ChatView {
         let pf_base_url = cx.new(|cx| InputState::new(window, cx).placeholder("https://api.example.com/v1"));
         let pf_key_env = cx.new(|cx| InputState::new(window, cx).placeholder("环境变量名，如 DEEPSEEK_API_KEY"));
         let pf_model = cx.new(|cx| InputState::new(window, cx).placeholder("模型名，如 gpt-4o"));
+        let pf_temperature =
+            cx.new(|cx| InputState::new(window, cx).placeholder("温度 0–2，留空用服务端默认"));
+        let pf_max_tokens =
+            cx.new(|cx| InputState::new(window, cx).placeholder("最大输出 token，留空用 8192"));
 
         let rename_input = cx.new(|cx| InputState::new(window, cx).placeholder("会话标题"));
         let model_input = cx.new(|cx| {
@@ -541,6 +550,9 @@ impl ChatView {
             pf_base_url,
             pf_key_env,
             pf_model,
+            editing_params_for: None,
+            pf_temperature,
+            pf_max_tokens,
             run_mode: initial_mode,
             editing_model: false,
             model_input,
@@ -3683,6 +3695,40 @@ impl ChatView {
                             .child("设为默认"),
                     );
                 }
+                // 已配的参数摘要：让人一眼看出改过什么
+                if let Some(p) = entry.params.get(m) {
+                    let mut bits = Vec::new();
+                    if let Some(t) = p.temperature {
+                        bits.push(format!("温度 {t:.2}"));
+                    }
+                    if let Some(mt) = p.max_tokens {
+                        bits.push(format!("上限 {mt}"));
+                    }
+                    if !bits.is_empty() {
+                        row = row.child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(TEXT_DIM))
+                                .child(bits.join(" · ")),
+                        );
+                    }
+                }
+                let params_p = pname.clone();
+                let params_m = m.clone();
+                row = row.child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(BRAND))
+                        .cursor_pointer()
+                        .hover(|s| s.underline())
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                                this.open_params_form(&params_p, &params_m, window, cx);
+                            }),
+                        )
+                        .child("参数"),
+                );
                 row = row.child(
                     div()
                         .text_xs()
@@ -3698,6 +3744,65 @@ impl ChatView {
                         .child("移除"),
                 );
                 list = list.child(row);
+
+                // 参数表单就摆在它那一行下面，改哪个模型一目了然
+                if self.editing_params_for.as_ref() == Some(&(pname.clone(), m.clone())) {
+                    list = list.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .mt_1()
+                            .ml_6()
+                            .mb_2()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(rgb(BRAND))
+                            .p_3()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(TEXT_MUTED))
+                                    .child(format!("{pname}/{m} 的参数（留空 = 用服务端默认）")),
+                            )
+                            .child(Input::new(&self.pf_temperature))
+                            .child(Input::new(&self.pf_max_tokens))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(div().flex_1())
+                                    .child(
+                                        Button::new(ElementId::Name(
+                                            format!("param-no-{m}").into(),
+                                        ))
+                                        .ghost()
+                                        .compact()
+                                        .label("取消")
+                                        .on_click(cx.listener(
+                                            |this, _: &ClickEvent, _w, cx| {
+                                                this.editing_params_for = None;
+                                                cx.notify();
+                                            },
+                                        )),
+                                    )
+                                    .child(
+                                        Button::new(ElementId::Name(
+                                            format!("param-ok-{m}").into(),
+                                        ))
+                                        .primary()
+                                        .compact()
+                                        .label("保存")
+                                        .on_click(cx.listener(
+                                            move |this, _: &ClickEvent, window, cx| {
+                                                this.save_params_form(window, cx);
+                                            },
+                                        )),
+                                    ),
+                            ),
+                    );
+                }
             }
 
             // 添加模型：点按钮把输入框亮出来
@@ -3888,6 +3993,7 @@ impl ChatView {
             headers: Default::default(),
             // 留空：改名时由 upsert_provider 继承旧列表
             models: Vec::new(),
+            params: Default::default(),
         };
 
         match zex_app::config::upsert_provider(
@@ -3919,6 +4025,101 @@ impl ChatView {
             },
             cx,
         );
+    }
+
+    /// 打开某个模型的参数表单。
+    fn open_params_form(
+        &mut self,
+        provider: &str,
+        model: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let p = self
+            .config
+            .providers
+            .get(provider)
+            .and_then(|e| e.params.get(model))
+            .cloned()
+            .unwrap_or_default();
+        // 用固定两位小数展示，避免 0.7000000001 这种浮点尾巴
+        self.pf_temperature.update(cx, |st, cx| {
+            st.set_value(
+                p.temperature.map(|t| format!("{t:.2}")).unwrap_or_default(),
+                window,
+                cx,
+            )
+        });
+        self.pf_max_tokens.update(cx, |st, cx| {
+            st.set_value(
+                p.max_tokens.map(|m| m.to_string()).unwrap_or_default(),
+                window,
+                cx,
+            )
+        });
+        self.editing_params_for = Some((provider.to_string(), model.to_string()));
+        cx.notify();
+    }
+
+    /// 保存模型参数。两个框都留空 = 清掉参数，回到服务端默认。
+    fn save_params_form(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some((provider, model)) = self.editing_params_for.clone() else {
+            return;
+        };
+        let t_raw = self.pf_temperature.read(cx).value().trim().to_string();
+        let m_raw = self.pf_max_tokens.read(cx).value().trim().to_string();
+
+        let temperature = if t_raw.is_empty() {
+            None
+        } else {
+            match t_raw.parse::<f32>() {
+                // 支持的服务端范围普遍是 0–2，超出直接拒掉，
+                // 免得发出去被 API 打回来还看不懂原因
+                Ok(v) if (0.0..=2.0).contains(&v) => Some(v),
+                Ok(v) => {
+                    self.status = format!("温度 {v} 超出范围（0–2）");
+                    cx.notify();
+                    return;
+                }
+                Err(_) => {
+                    self.status = "温度必须是数字".into();
+                    cx.notify();
+                    return;
+                }
+            }
+        };
+
+        let max_tokens = if m_raw.is_empty() {
+            None
+        } else {
+            match m_raw.parse::<u32>() {
+                Ok(v) if v > 0 => Some(v),
+                Ok(_) => {
+                    self.status = "最大输出 token 必须大于 0".into();
+                    cx.notify();
+                    return;
+                }
+                Err(_) => {
+                    self.status = "最大输出 token 必须是整数".into();
+                    cx.notify();
+                    return;
+                }
+            }
+        };
+
+        if let Some(entry) = self.config.providers.get_mut(&provider) {
+            if temperature.is_none() && max_tokens.is_none() {
+                // 全空 = 清掉这条记录，别在配置里留一个 `{}`
+                entry.params.remove(&model);
+            } else {
+                entry
+                    .params
+                    .insert(model.clone(), zex_app::config::ModelParams { temperature, max_tokens });
+            }
+        }
+
+        self.editing_params_for = None;
+        self.persist_config(format!("已更新 `{provider}/{model}` 的参数"), cx);
     }
 
     /// 把"内置回退"的模型清单固化进配置。

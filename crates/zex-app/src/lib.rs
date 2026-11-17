@@ -101,7 +101,10 @@ pub fn build_agent_resuming_with(
     }
     let skills = load_skills();
     let agent_cfg = zex_agent::AgentConfig::new(cfg.provider.clone(), cfg.model.clone(), cwd)
-        .with_extra_prompt(skills.prompt_section());
+        .with_extra_prompt(skills.prompt_section())
+        // 模型参数跟着配置走：温度决定"同样的问法给不给同样的答案"，
+        // 是用户最容易感知的一项
+        .with_model_params(cfg.model_params.temperature, cfg.model_params.max_tokens);
 
     // 跳过空会话：每次启动都会留下一个没说话的会话壳，
     // 直接恢复它会让用户以为历史丢了。
@@ -391,6 +394,18 @@ pub fn spawn_core(
                                             // 切到 1M 的，压缩阈值得跟着走
                                             task_cfg.budget =
                                                 zex_agent::context::ContextBudget::for_model(rest);
+                                            // 参数也跟着换。没配就重置成默认，
+                                            // 否则上一个模型的温度会漏到新模型上
+                                            let params = read_file_config()
+                                                .and_then(|f| {
+                                                    f.providers
+                                                        .get(p)
+                                                        .and_then(|e| e.params.get(rest).cloned())
+                                                })
+                                                .unwrap_or_default();
+                                            task_cfg.temperature = params.temperature;
+                                            task_cfg.max_tokens =
+                                                params.max_tokens.unwrap_or(task_cfg.max_tokens);
                                         }
                                     }
                                 }

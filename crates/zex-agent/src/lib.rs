@@ -58,6 +58,8 @@ pub struct AgentConfig {
     pub mode: Mode,
     /// 审批等待时长。
     pub approval_timeout: Duration,
+    /// 采样温度。None = 用服务端默认（通常是 1.0）。
+    pub temperature: Option<f32>,
     /// 追加到系统提示末尾的内容（技能清单等）。
     ///
     /// 单独一个字段而不是改 `prompt::system_prompt`：后者是产品人格，
@@ -80,6 +82,7 @@ impl AgentConfig {
             cwd,
             mode: Mode::Confirm,
             approval_timeout: approval::DEFAULT_TIMEOUT,
+            temperature: None,
             extra_prompt: String::new(),
         }
     }
@@ -87,6 +90,21 @@ impl AgentConfig {
     /// 追加一段系统提示（技能清单等）。
     pub fn with_extra_prompt(mut self, extra: impl Into<String>) -> Self {
         self.extra_prompt = extra.into();
+        self
+    }
+
+    /// 套用一组采样参数；`None` 的项保持不变。
+    pub fn with_model_params(
+        mut self,
+        temperature: Option<f32>,
+        max_tokens: Option<u32>,
+    ) -> Self {
+        if let Some(t) = temperature {
+            self.temperature = Some(t);
+        }
+        if let Some(m) = max_tokens {
+            self.max_tokens = m;
+        }
         self
     }
 }
@@ -676,6 +694,7 @@ impl Agent {
             .with_tools(self.tools.iter().map(|t| t.spec()).collect());
         ChatRequest {
             max_tokens: self.cfg.max_tokens,
+            temperature: self.cfg.temperature,
             ..req
         }
     }
