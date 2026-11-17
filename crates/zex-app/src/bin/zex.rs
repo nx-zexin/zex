@@ -632,27 +632,6 @@ impl ChatView {
                 return;
             }
 
-            // 粘贴：剪贴板里是图片或文件就收成附件，纯文本照常插入
-            //
-            // 修饰键不能只看 platform：GPUI 里 platform 在 macOS 是 Cmd、
-            // 在 Windows 是 Win、**在 Linux 是 Super** —— Linux 上按 Ctrl+V
-            // 根本不满足它。粘贴键在 Linux/Windows 是 Ctrl，macOS 才是 Cmd。
-            let paste_mod = if cfg!(target_os = "macos") {
-                event.keystroke.modifiers.platform
-            } else {
-                event.keystroke.modifiers.control
-            };
-            if key == "v" && paste_mod {
-                let mut took = false;
-                let _ = weak.update(cx, |this, cx| {
-                    took = this.paste_attachments(cx);
-                });
-                if took {
-                    cx.stop_propagation();
-                }
-                return;
-            }
-
             if key != "up" && key != "down" {
                 return;
             }
@@ -1248,16 +1227,16 @@ impl ChatView {
         cx.notify();
     }
 
-    /// 处理一次粘贴：剪贴板里有图片或文件就收成附件。
+    /// 处理一份粘贴内容：图片/文件收成附件，纯文本交给输入框。
     ///
-    /// 返回 true 表示这次粘贴被我们消费掉了，不该再让输入框插文本。
-    /// 纯文本返回 false，交回输入框 —— 那是它本来该干的活。
-    fn paste_attachments(&mut self, cx: &mut Context<Self>) -> bool {
-        let Some(item) = cx.read_from_clipboard() else {
-            return false;
-        };
-
+    /// 返回 true 表示已消费（不要再插文本）。
+    ///
+    /// 键盘 Ctrl+V 和右键菜单的 Paste 都汇集到这里 —— 组件库的
+    /// `on_paste` 钩子对两条路径一致，分开处理只会漏掉其中一条。
+    fn take_paste(&mut self, item: &gpui::ClipboardItem, cx: &mut Context<Self>) -> bool {
         let mut took = false;
+        let mut pasted_paths: Vec<std::path::PathBuf> = Vec::new();
+
         for entry in &item.entries {
             match entry {
                 gpui::ClipboardEntry::Image(img) => {
@@ -1267,7 +1246,7 @@ impl ChatView {
                 }
                 gpui::ClipboardEntry::ExternalPaths(paths) => {
                     // 文件管理器里复制文件 → 粘贴，直接当附件收下
-                    self.add_attachments(paths.paths(), cx);
+                    pasted_paths.extend(paths.paths().iter().cloned());
                     took = true;
                 }
                 gpui::ClipboardEntry::String(_) => {
@@ -1276,6 +1255,9 @@ impl ChatView {
             }
         }
 
+        if !pasted_paths.is_empty() {
+            self.add_attachments(&pasted_paths, cx);
+        }
         if took {
             cx.notify();
         }
@@ -5217,6 +5199,16 @@ impl ChatView {
                         Textarea::new(&self.input)
                             .appearance(false)
                             .bordered(false)
+                            // 图片/文件粘贴统一走这里：键盘 Ctrl+V 与
+                            // 右键菜单的 Paste 是两条路径，只有这个钩子
+                            // 能同时覆盖（输入框自己只认文本）
+                            .on_paste({
+                                let weak = cx.entity().downgrade();
+                                move |item, _window, cx| {
+                                    weak.update(cx, |this, cx| this.take_paste(item, cx))
+                                        .unwrap_or(false)
+                                }
+                            })
                             .h(px(self.composer_height(cx))),
                     ),
                 )
