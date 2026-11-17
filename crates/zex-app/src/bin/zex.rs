@@ -202,7 +202,8 @@ struct RightPanel {
 /// 其它文件以路径形式进上下文 —— 模型用 fs_read 自己读。
 #[derive(Clone)]
 struct Attachment {
-    /// 绝对路径。
+    /// 绝对路径。粘贴进来的图片没有真实路径，用一个虚拟标识代替 ——
+    /// 它只用于去重，不进模型上下文。
     path: std::path::PathBuf,
     /// 显示名（文件名）。
     name: String,
@@ -626,6 +627,18 @@ impl ChatView {
                     }
                 });
                 if picked {
+                    cx.stop_propagation();
+                }
+                return;
+            }
+
+            // 粘贴：剪贴板里是图片或文件就收成附件，纯文本照常插入
+            if key == "v" && event.keystroke.modifiers.platform {
+                let mut took = false;
+                let _ = weak.update(cx, |this, cx| {
+                    took = this.paste_attachments(cx);
+                });
+                if took {
                     cx.stop_propagation();
                 }
                 return;
@@ -1224,6 +1237,76 @@ impl ChatView {
             });
         }
         cx.notify();
+    }
+
+    /// 处理一次粘贴：剪贴板里有图片或文件就收成附件。
+    ///
+    /// 返回 true 表示这次粘贴被我们消费掉了，不该再让输入框插文本。
+    /// 纯文本返回 false，交回输入框 —— 那是它本来该干的活。
+    fn paste_attachments(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(item) = cx.read_from_clipboard() else {
+            return false;
+        };
+
+        let mut took = false;
+
+        for entry in &item.entries {
+            match entry {
+                gpui::ClipboardEntry::Image(img) => {
+                    if self.push_pasted_image(&img.bytes, img.format) {
+                        took = true;
+                    }
+                }
+                gpui::ClipboardEntry::ExternalPaths(paths) => {
+                    // 文件管理器里复制文件 → 粘贴，直接当附件收下
+                    self.add_attachments(paths.paths(), cx);
+                    took = true;
+                }
+                gpui::ClipboardEntry::String(_) => {
+                    // 文本留给输入框，不在这里抢
+                }
+            }
+        }
+
+        if took {
+            cx.notify();
+        }
+        took
+    }
+
+    /// 把一段图片字节收成附件。返回 false 表示同内容的已经在了。
+    fn push_pasted_image(&mut self, bytes: &[u8], format: gpui::ImageFormat) -> bool {
+        let (ext, media) = match format {
+            gpui::ImageFormat::Png => ("png", "image/png"),
+            gpui::ImageFormat::Jpeg => ("jpg", "image/jpeg"),
+            gpui::ImageFormat::Webp => ("webp", "image/webp"),
+            gpui::ImageFormat::Gif => ("gif", "image/gif"),
+            gpui::ImageFormat::Bmp => ("bmp", "image/bmp"),
+            // SVG 走不了多模态通道（模型看的是位图），明确跳过而不是塞进去
+            _ => return false,
+        };
+
+        let b64 = base64_encode(bytes);
+        // 同一张图连点两次粘贴很常见，按内容去重
+        if self
+            .attachments
+            .iter()
+            .any(|a| a.image_b64.as_deref() == Some(b64.as_str()))
+        {
+            return false;
+        }
+
+        // 序号取当前图片数，只是为了给个能看的名字
+        let n = self.attachments.iter().filter(|a| a.image_b64.is_some()).count() + 1;
+        let name = format!("粘贴的图片 {n}.{ext}");
+        self.attachments.push(Attachment {
+            // 虚拟路径：仅用于去重，不会出现在 prompt 里
+            path: std::path::PathBuf::from(format!("paste://{n}.{ext}")),
+            name,
+            image_b64: Some(b64),
+            media_type: media.to_string(),
+        });
+        true
     }
 
     /// ↑↓ 在历史里走。
