@@ -58,6 +58,11 @@ pub struct AgentConfig {
     pub mode: Mode,
     /// 审批等待时长。
     pub approval_timeout: Duration,
+    /// 追加到系统提示末尾的内容（技能清单等）。
+    ///
+    /// 单独一个字段而不是改 `prompt::system_prompt`：后者是产品人格，
+    /// 这里装的是运行时环境，两者的变更节奏完全不同。
+    pub extra_prompt: String,
 }
 
 impl AgentConfig {
@@ -75,7 +80,14 @@ impl AgentConfig {
             cwd,
             mode: Mode::Confirm,
             approval_timeout: approval::DEFAULT_TIMEOUT,
+            extra_prompt: String::new(),
         }
+    }
+
+    /// 追加一段系统提示（技能清单等）。
+    pub fn with_extra_prompt(mut self, extra: impl Into<String>) -> Self {
+        self.extra_prompt = extra.into();
+        self
     }
 }
 
@@ -655,7 +667,10 @@ impl Agent {
 
     /// 组装一次请求。
     fn build_request(&self) -> ChatRequest {
-        let system = prompt::system_prompt(&self.cfg.cwd);
+        let mut system = prompt::system_prompt(&self.cfg.cwd);
+        if !self.cfg.extra_prompt.trim().is_empty() {
+            system.push_str(&self.cfg.extra_prompt);
+        }
         let req = ChatRequest::new(self.history.clone())
             .with_system(system)
             .with_tools(self.tools.iter().map(|t| t.spec()).collect());

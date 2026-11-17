@@ -45,6 +45,12 @@ pub struct FileConfig {
     /// 默认模型，形如 `anthropic/claude-sonnet-4-6`。
     #[serde(default)]
     pub default_model: Option<String>,
+    /// MCP 服务端，键是服务名。
+    ///
+    /// 留空即不启用 MCP。每个服务是独立子进程，启动时会尝试连接 ——
+    /// 连不上的只是不挂工具，不影响应用启动。
+    #[serde(default)]
+    pub mcp_servers: BTreeMap<String, zex_mcp::ServerConfig>,
 }
 
 /// 解析后的运行时配置。

@@ -9103,7 +9103,9 @@ dependencies = [
  "zex-agent",
  "zex-core",
  "zex-llm",
+ "zex-mcp",
  "zex-policy",
+ "zex-skill",
  "zex-store",
  "zex-tools",
  "zex-voice",
@@ -9157,6 +9159,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "zex-mcp"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "zex-core",
+]
+
+[[package]]
 name = "zex-platform"
 version = "0.1.0"
 dependencies = [
@@ -9178,6 +9193,18 @@ dependencies = [
 name = "zex-schedule"
 version = "0.1.0"
 dependencies = [
+ "zex-core",
+]
+
+[[package]]
+name = "zex-skill"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
  "zex-core",
 ]
 

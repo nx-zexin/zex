@@ -323,6 +323,10 @@ struct ChatView {
     settings: Option<SettingsTab>,
     /// `config.json` 的原始内容：设置页要展示、也要能改。
     config: zex_app::FileConfig,
+    /// 已加载的技能库。
+    skills: std::sync::Arc<zex_skill::SkillRegistry>,
+    /// MCP 连接结果（启动后填充）。
+    mcp_status: Vec<zex_mcp::ServerStatus>,
     /// 当前会话的运行模式。
     run_mode: zex_core::RunMode,
     /// 正在编辑模型名。
@@ -499,6 +503,8 @@ impl ChatView {
             _key_interceptor: None,
             settings: None,
             config: zex_app::read_file_config().unwrap_or_default(),
+            skills: zex_app::load_skills(),
+            mcp_status: Vec::new(),
             run_mode: zex_core::RunMode::Confirm,
             editing_model: false,
             model_input,
@@ -515,6 +521,28 @@ impl ChatView {
             model,
             usage: Usage::default(),
         };
+
+        // 启动后连 MCP 服务：连接要 spawn 子进程并等握手，异步做，
+        // 不阻塞窗口显示。连上后把状态填进设置页。
+        {
+            let cfg = view.config.clone();
+            // 连接会 spawn 子进程并等握手，放到后台线程：
+            // 服务端启动慢的话不该让窗口卡住
+            let task = cx
+                .background_executor()
+                .spawn(async move { zex_app::connect_mcp_servers(&cfg) });
+            cx.spawn(async move |this, cx| {
+                let (_tools, status, _hub) = task.await;
+                if status.is_empty() {
+                    return;
+                }
+                let _ = this.update(cx, |this, cx| {
+                    this.mcp_status = status;
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
 
         // 测试钩子：ZEX_AUTO_SETTINGS=model|skill|mcp|about 直接打开设置页
         if let Ok(tab) = std::env::var("ZEX_AUTO_SETTINGS") {
@@ -3362,28 +3390,8 @@ impl ChatView {
 
         let content = match tab {
             SettingsTab::Model => self.render_settings_model(cx),
-            SettingsTab::Skill => Self::render_settings_placeholder(
-                "技能",
-                "还没有接入技能系统。",
-                &[
-                    "计划中的能力：把一段可复用的做法（提示词 + 常用工具序列）",
-                    "存成技能，在对话里按名字唤起，不用每次重新交代。",
-                    "",
-                    "后端目前只有 zex-knowledge / zex-evolve 两个空壳 crate，",
-                    "技能的定义、存储和加载都还没实现 —— 这里先留位置。",
-                ],
-            ),
-            SettingsTab::Mcp => Self::render_settings_placeholder(
-                "MCP",
-                "还没有接入 MCP（Model Context Protocol）。",
-                &[
-                    "计划中的能力：配置若干 MCP 服务（stdio / HTTP），",
-                    "启动时连上，把它们的工具并入可用工具集。",
-                    "",
-                    "当前内核的工具全部编译在二进制里（文件 / shell / 网页 / 子智能体），",
-                    "没有动态挂载通道，所以这里暂时是空的。",
-                ],
-            ),
+            SettingsTab::Skill => self.render_settings_skill(cx),
+            SettingsTab::Mcp => self.render_settings_mcp(cx),
             SettingsTab::About => Self::render_settings_about(),
         };
 
@@ -3558,8 +3566,9 @@ impl ChatView {
         cx.notify();
     }
 
-    /// 还没实现的分区：说清楚现状，别只放一个空框。
-    fn render_settings_placeholder(title: &str, headline: &str, lines: &[&str]) -> AnyElement {
+    /// 技能页：列出已加载的技能，说明怎么新增。
+    fn render_settings_skill(&self, cx: &mut Context<Self>) -> AnyElement {
+        let dir = zex_app::skills_dir();
         let mut col = div()
             .flex()
             .flex_col()
@@ -3570,24 +3579,277 @@ impl ChatView {
                     .text_lg()
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(rgb(TEXT))
-                    .child(title.to_string()),
+                    .child("技能"),
             )
             .child(
                 div()
-                    .text_sm()
-                    .text_color(rgb(TEXT))
-                    .child(headline.to_string()),
+                    .text_xs()
+                    .text_color(rgb(TEXT_DIM))
+                    .child(format!("技能目录：{}", dir.display())),
             );
-        for l in lines {
+
+        let skills = self.skills.all();
+        if skills.is_empty() {
             col = col.child(
                 div()
-                    .text_xs()
-                    .line_height(px(20.0))
-                    .text_color(rgb(TEXT_MUTED))
-                    .child(l.to_string()),
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .bg(rgb(BG_TOOL))
+                    .p_4()
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(TEXT))
+                            .child("还没有技能。"),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .line_height(px(20.0))
+                            .text_color(rgb(TEXT_MUTED))
+                            .child("在技能目录里放一个 .md 文件就会被加载，格式见下："),
+                    )
+                    .child(
+                        TextView::markdown(
+                            ElementId::Name("skill-example".into()),
+                            as_code_block(
+                                "---\nname: rust-refactor\ndescription: 重构 Rust 代码时的检查清单\n---\n\n1. 先跑 cargo check 建立基线\n2. 改完再跑一次，确认没有新增错误\n3. cargo fmt",
+                                "markdown",
+                            ),
+                        )
+                        .text_size(px(12.5))
+                        .line_height(px(19.0))
+                        .text_color(rgb(TEXT))
+                        .style(md_style_flat(1.0)),
+                    ),
             );
+        } else {
+            for sk in skills {
+                let mut card = div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .bg(rgb(BG_MAIN))
+                    .p_4()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .font_family(MONO)
+                                    .text_sm()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(TEXT))
+                                    .child(sk.name.clone()),
+                            )
+                            .child(div().flex_1())
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(TEXT_DIM))
+                                    .child(format!("{} 字", sk.body.chars().count())),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(TEXT_MUTED))
+                            .child(sk.description.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(TEXT_DIM))
+                            .child(sk.path.display().to_string()),
+                    );
+                // 正文展开看
+                let key = format!("skill-{}", sk.name);
+                let open = self.expanded_tools.contains(&key);
+                let toggle_key = key.clone();
+                card = card.child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(BRAND))
+                        .cursor_pointer()
+                        .hover(|s| s.underline())
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _: &MouseDownEvent, _w, cx| {
+                                let k = toggle_key.clone();
+                                if !this.expanded_tools.remove(&k) {
+                                    this.expanded_tools.insert(k);
+                                }
+                                cx.notify();
+                            }),
+                        )
+                        .child(if open { "收起正文" } else { "查看正文" }),
+                );
+                if open {
+                    card = card.child(
+                        div()
+                            .mt_2()
+                            .text_xs()
+                            .line_height(px(20.0))
+                            .text_color(rgb(TEXT))
+                            .child(sk.body.clone()),
+                    );
+                }
+                col = col.child(card);
+            }
         }
+
         col.into_any_element()
+    }
+
+    /// MCP 页：连接状态 + 配置示例。
+    fn render_settings_mcp(&self, cx: &mut Context<Self>) -> AnyElement {
+        let mut col = div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .max_w(px(780.0))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_lg()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(TEXT))
+                            .child("MCP 服务"),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        Button::new("mcp-reconnect")
+                            .ghost()
+                            .compact()
+                            .icon(IconName::RefreshCw)
+                            .tooltip("重新连接")
+                            .on_click(cx.listener(|this, _: &ClickEvent, _w, cx| {
+                                this.reconnect_mcp(cx);
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(TEXT_DIM))
+                    .child("在 config.json 的 mcp_servers 里声明；每个服务是独立子进程"),
+            );
+
+        if self.config.mcp_servers.is_empty() {
+            col = col
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(rgb(BORDER))
+                        .bg(rgb(BG_TOOL))
+                        .p_4()
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(rgb(TEXT))
+                                .child("还没有配置 MCP 服务。"),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .line_height(px(20.0))
+                                .text_color(rgb(TEXT_MUTED))
+                                .child("在 ~/.zex/config.json 里加一段，重启后生效："),
+                        )
+                        .child(
+                            TextView::markdown(
+                                ElementId::Name("mcp-example".into()),
+                                as_code_block(
+                                    "{\n  \"mcp_servers\": {\n    \"filesystem\": {\n      \"command\": \"npx\",\n      \"args\": [\"-y\", \"@modelcontextprotocol/server-filesystem\", \"/tmp\"]\n    }\n  }\n}",
+                                    "json",
+                                ),
+                            )
+                            .text_size(px(12.5))
+                            .line_height(px(19.0))
+                            .text_color(rgb(TEXT))
+                            .style(md_style_flat(1.0)),
+                        ),
+                );
+        } else {
+            for (name, cfg) in &self.config.mcp_servers {
+                let st = self.mcp_status.iter().find(|s| &s.name == name);
+                let (dot, label, bg) = match st {
+                    Some(s) if s.ok => (OK, s.detail.clone(), OK_SOFT),
+                    Some(s) => (DANGER, s.detail.clone(), DANGER_SOFT),
+                    None => (TEXT_DIM, "未连接".to_string(), BG_HOVER),
+                };
+                col = col.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(rgb(BORDER))
+                        .bg(rgb(BG_MAIN))
+                        .p_4()
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(div().size(px(6.0)).rounded_full().bg(rgb(dot)))
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(rgb(TEXT))
+                                        .child(name.clone()),
+                                )
+                                .child(pill(label, bg, dot)),
+                        )
+                        .child(
+                            div()
+                                .font_family(MONO)
+                                .text_xs()
+                                .text_color(rgb(TEXT_MUTED))
+                                .child(format!("{} {}", cfg.command, cfg.args.join(" "))),
+                        ),
+                );
+            }
+        }
+
+        col.into_any_element()
+    }
+
+    /// 重新连一遍 MCP 服务。
+    fn reconnect_mcp(&mut self, cx: &mut Context<Self>) {
+        let cfg = self.config.clone();
+        self.status = "重连 MCP…".into();
+        let task = cx
+            .background_executor()
+            .spawn(async move { zex_app::connect_mcp_servers(&cfg) });
+        cx.spawn(async move |this, cx| {
+            let (_tools, status, _hub) = task.await;
+            let _ = this.update(cx, |this, cx| {
+                this.mcp_status = status;
+                this.status = "MCP 已更新".into();
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn render_settings_about() -> AnyElement {
@@ -4954,7 +5216,17 @@ fn main() {
         }
     };
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let agent = match zex_app::build_agent_resuming(&cfg, cwd.clone()) {
+
+    // MCP 工具必须在 agent 构造前连好：工具集是构造时定下的，
+    // 之后再挂就得重建 agent（会丢当前会话状态）。
+    let mcp_file = zex_app::read_file_config().unwrap_or_default();
+    let (mcp_tools, mcp_status, _mcp_hub) = zex_app::connect_mcp_servers(&mcp_file);
+    if !mcp_status.is_empty() {
+        let ok = mcp_status.iter().filter(|s| s.ok).count();
+        tracing::info!(total = mcp_status.len(), ok, "MCP 服务已连接");
+    }
+
+    let agent = match zex_app::build_agent_resuming_with(&cfg, cwd.clone(), mcp_tools) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("无法初始化内核: {e}");

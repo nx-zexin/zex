@@ -15,6 +15,25 @@ use std::path::PathBuf;
 pub use config::{
     FileConfig, ProviderEntry, ResolvedConfig, config_dir, load, read_file_config, save_file_config,
 };
+
+/// 连上配置里声明的所有 MCP 服务端。
+///
+/// 放在这里而不是 `build_agent_resuming` 里：连接要 spawn 子进程
+/// 并等握手（几百毫秒到几秒），不该卡住 agent 构造。
+/// 调用方应放到后台线程执行，别阻塞 UI。
+pub fn connect_mcp_servers(
+    cfg: &FileConfig,
+) -> (
+    Vec<Arc<dyn zex_core::tool::ErasedTool>>,
+    Vec<zex_mcp::ServerStatus>,
+    Option<Arc<zex_mcp::McpHub>>,
+) {
+    if cfg.mcp_servers.is_empty() {
+        return (Vec::new(), Vec::new(), None);
+    }
+    let (tools, status, hub) = zex_mcp::connect_all(&cfg.mcp_servers);
+    (tools, status, Some(hub))
+}
 use zex_store::Store;
 
 /// 主数据库路径 `~/.zex/zex.db`。
@@ -45,7 +64,33 @@ pub fn build_agent(cfg: &ResolvedConfig, cwd: PathBuf) -> zex_core::Result<zex_a
 ///
 /// 这是"关掉再打开能接着聊"的实现：GUI 启动时恢复上次的对话，
 /// 而不是每次都开一个空白会话。
+/// 技能目录：`~/.zex/skills`。
+pub fn skills_dir() -> PathBuf {
+    config_dir().join("skills")
+}
+
+/// 加载技能库。
+pub fn load_skills() -> std::sync::Arc<zex_skill::SkillRegistry> {
+    let dir = skills_dir();
+    // 首次运行时建好目录：用户要放技能文件进去，得先有个地方放
+    let _ = std::fs::create_dir_all(&dir);
+    std::sync::Arc::new(zex_skill::SkillRegistry::load(&dir))
+}
+
+/// 打开最近一个会话（若无则新建），并加载技能。
 pub fn build_agent_resuming(cfg: &ResolvedConfig, cwd: PathBuf) -> zex_core::Result<zex_agent::Agent> {
+    build_agent_resuming_with(cfg, cwd, Vec::new())
+}
+
+/// 同上，但额外挂上一些工具（例如 MCP 服务提供的）。
+///
+/// 单独开一个函数而不是给原函数加参数：`build_agent_resuming`
+/// 已经是 CLI / GUI 共用的稳定入口，加参数会牵动所有调用点。
+pub fn build_agent_resuming_with(
+    cfg: &ResolvedConfig,
+    cwd: PathBuf,
+    extra_tools: Vec<Arc<dyn zex_core::tool::ErasedTool>>,
+) -> zex_core::Result<zex_agent::Agent> {
     let store = open_store()?;
     // 上次进程退出时还在 running 的任务已经不可能再跑了：标成失败并
     // 写明原因，否则它们会永远挂在「运行中」，dashboard 上说谎。
@@ -54,7 +99,9 @@ pub fn build_agent_resuming(cfg: &ResolvedConfig, cwd: PathBuf) -> zex_core::Res
         Ok(n) => tracing::info!(count = n, "已标记上次退出时未完成的任务"),
         Err(e) => tracing::warn!(error = %e, "清理孤儿任务失败"),
     }
-    let agent_cfg = zex_agent::AgentConfig::new(cfg.provider.clone(), cfg.model.clone(), cwd);
+    let skills = load_skills();
+    let agent_cfg = zex_agent::AgentConfig::new(cfg.provider.clone(), cfg.model.clone(), cwd)
+        .with_extra_prompt(skills.prompt_section());
 
     // 跳过空会话：每次启动都会留下一个没说话的会话壳，
     // 直接恢复它会让用户以为历史丢了。
@@ -63,18 +110,26 @@ pub fn build_agent_resuming(cfg: &ResolvedConfig, cwd: PathBuf) -> zex_core::Res
         .into_iter()
         .find(|s| !store.load_messages(&s.id).map(|m| m.is_empty()).unwrap_or(true));
 
+    let mut tools = zex_tools::default_tools();
+    if !skills.all().is_empty() {
+        tools.push(Arc::new(zex_skill::LoadSkill::new(skills.clone())));
+    }
+    // MCP 工具排在最后：它们风险等级统一是 Impactful，
+    // 排在后面能让审批界面上先看到"自己要干什么"
+    tools.extend(extra_tools);
+
     match latest {
         Some(session) => {
             // 恢复失败时退回新建，不让一次数据问题把应用卡死
-            match zex_agent::Agent::resume(agent_cfg.clone(), zex_tools::default_tools(), store.clone(), session.id) {
+            match zex_agent::Agent::resume(agent_cfg.clone(), tools.clone(), store.clone(), session.id) {
                 Ok(a) => Ok(a),
                 Err(e) => {
                     tracing::warn!(error = %e, "恢复会话失败，改为新建");
-                    zex_agent::Agent::new(agent_cfg, zex_tools::default_tools(), store)
+                    zex_agent::Agent::new(agent_cfg, tools, store)
                 }
             }
         }
-        None => zex_agent::Agent::new(agent_cfg, zex_tools::default_tools(), store),
+        None => zex_agent::Agent::new(agent_cfg, tools, store),
     }
 }
 

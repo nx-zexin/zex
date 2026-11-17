@@ -25,6 +25,8 @@ zex-evolve = { path = "crates/zex-evolve" }
 zex-schedule = { path = "crates/zex-schedule" }
 zex-app = { path = "crates/zex-app" }
 zex-voice = { path = "crates/zex-voice" }
+zex-skill = { path = "crates/zex-skill" }
+zex-mcp = { path = "crates/zex-mcp" }
 
 # ─── 序列化 ───
 serde = { version = "1", features = ["derive"] }

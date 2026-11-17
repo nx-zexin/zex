@@ -1,0 +1,17 @@
+[package]
+name = "zex-skill"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "技能：可复用的做法包"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+zex-core = { workspace = true }
+async-trait = { workspace = true }
+schemars = { workspace = true }
