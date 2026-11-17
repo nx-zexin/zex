@@ -220,6 +220,82 @@ pub struct SessionSummary {
     pub mode: RunMode,
 }
 
+/// 思考强度。
+///
+/// 三档（不含"关"），因为 provider 的实际取值就这几档：OpenAI 的
+/// `reasoning_effort` 是 low/medium/high，Anthropic 的 `budget_tokens`
+/// 没有官方档位，按同样的粒度折算。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThinkingEffort {
+    /// 不请求思考（默认）。
+    ///
+    /// 模型自带推理的仍会输出，只是我们不额外要求 ——
+    /// "关"指的是不加约束，不是禁止。
+    #[default]
+    Off,
+    /// 少量思考：改个错别字这类一眼能定的活。
+    Low,
+    /// 中等。日常用得最多的一档。
+    Medium,
+    /// 尽量多想：排查疑难、做设计。
+    High,
+}
+
+impl ThinkingEffort {
+    /// 给人看的名字（下拉菜单里显示的就是它）。
+    pub fn label(self) -> &'static str {
+        match self {
+            ThinkingEffort::Off => "不思考",
+            ThinkingEffort::Low => "轻思考",
+            ThinkingEffort::Medium => "中等",
+            ThinkingEffort::High => "深入",
+        }
+    }
+
+    /// 一句话说明，显示在名字下面。
+    pub fn description(self) -> &'static str {
+        match self {
+            ThinkingEffort::Off => "直接回答，不加思考预算。",
+            ThinkingEffort::Low => "想一点就动手。",
+            ThinkingEffort::Medium => "先理清思路再答。",
+            ThinkingEffort::High => "多想几轮，慢但更稳。",
+        }
+    }
+
+    /// OpenAI 兼容端点的 `reasoning_effort` 取值。`Off` 不发这个字段。
+    pub fn openai_effort(self) -> Option<&'static str> {
+        match self {
+            ThinkingEffort::Off => None,
+            ThinkingEffort::Low => Some("low"),
+            ThinkingEffort::Medium => Some("medium"),
+            ThinkingEffort::High => Some("high"),
+        }
+    }
+
+    /// Anthropic 的思考预算（token）。`Off` 不开启思考块。
+    ///
+    /// 官方要求 budget >= 1024，所以最低档也用 1024 打底。
+    pub fn anthropic_budget(self) -> Option<u32> {
+        match self {
+            ThinkingEffort::Off => None,
+            ThinkingEffort::Low => Some(1024),
+            ThinkingEffort::Medium => Some(4096),
+            ThinkingEffort::High => Some(16384),
+        }
+    }
+
+    /// 全部档位，由弱到强。
+    pub fn all() -> [ThinkingEffort; 4] {
+        [
+            ThinkingEffort::Off,
+            ThinkingEffort::Low,
+            ThinkingEffort::Medium,
+            ThinkingEffort::High,
+        ]
+    }
+}
+
 /// 运行模式：这一轮允许多"放得开"。
 ///
 /// 定义在 core 而不是 policy，是因为它要跨层走：
@@ -291,6 +367,11 @@ pub enum UiCommand {
         /// 和 `model` 一样走请求：模式是**每个会话**的选择，
         /// 存在进程状态里会让并行会话互相污染。
         mode: Option<RunMode>,
+        /// 本轮的思考强度。`None` 用默认（不请求思考）。
+        ///
+        /// 和 `model` / `mode` 一样是请求级的：用户调它只是想
+        /// "这一问多想一会儿"，不代表改了长期设置。
+        thinking: Option<ThinkingEffort>,
         /// 文本。
         text: String,
         /// 附件（图片等）。

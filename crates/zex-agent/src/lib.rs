@@ -60,6 +60,8 @@ pub struct AgentConfig {
     pub approval_timeout: Duration,
     /// 采样温度。None = 用服务端默认（通常是 1.0）。
     pub temperature: Option<f32>,
+    /// 思考强度。
+    pub thinking: zex_llm::ThinkingEffort,
     /// 追加到系统提示末尾的内容（技能清单等）。
     ///
     /// 单独一个字段而不是改 `prompt::system_prompt`：后者是产品人格，
@@ -83,6 +85,7 @@ impl AgentConfig {
             mode: Mode::Confirm,
             approval_timeout: approval::DEFAULT_TIMEOUT,
             temperature: None,
+            thinking: zex_llm::ThinkingEffort::Off,
             extra_prompt: String::new(),
         }
     }
@@ -314,6 +317,8 @@ impl Agent {
             // 48 会被 thinking 吃光、正文为空。留够余量。
             max_tokens: 512,
             temperature: Some(0.2),
+            // 起标题不值得思考：给个标题而已，多想只会更慢更贵
+            thinking: zex_llm::ThinkingEffort::Off,
         };
 
         let mut stream = match zex_llm::stream_chat(&self.http, &self.cfg.provider, &self.cfg.model, req).await {
@@ -695,6 +700,7 @@ impl Agent {
         ChatRequest {
             max_tokens: self.cfg.max_tokens,
             temperature: self.cfg.temperature,
+            thinking: self.cfg.thinking,
             ..req
         }
     }

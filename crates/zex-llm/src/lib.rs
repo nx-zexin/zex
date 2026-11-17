@@ -81,6 +81,8 @@ impl ProviderConfig {
     }
 }
 
+pub use zex_core::ThinkingEffort;
+
 /// 一次对话请求。
 #[derive(Debug, Clone)]
 pub struct ChatRequest {
@@ -94,6 +96,8 @@ pub struct ChatRequest {
     pub max_tokens: u32,
     /// 采样温度。
     pub temperature: Option<f32>,
+    /// 思考强度。
+    pub thinking: ThinkingEffort,
 }
 
 impl ChatRequest {
@@ -105,6 +109,7 @@ impl ChatRequest {
             tools: Vec::new(),
             max_tokens: 4096,
             temperature: None,
+            thinking: ThinkingEffort::Off,
         }
     }
 
@@ -517,4 +522,43 @@ pub async fn transcribe(
         .unwrap_or_default()
         .trim()
         .to_string())
+}
+
+#[cfg(test)]
+mod thinking_tests {
+    use super::ThinkingEffort;
+
+    #[test]
+    fn off_sends_nothing() {
+        // 选"不思考"时不该往请求里塞任何思考相关字段：
+        // 不支持思考的模型收到 reasoning_effort 会直接报错
+        assert_eq!(ThinkingEffort::Off.openai_effort(), None);
+        assert_eq!(ThinkingEffort::Off.anthropic_budget(), None);
+    }
+
+    #[test]
+    fn openai_effort_levels() {
+        assert_eq!(ThinkingEffort::Low.openai_effort(), Some("low"));
+        assert_eq!(ThinkingEffort::Medium.openai_effort(), Some("medium"));
+        assert_eq!(ThinkingEffort::High.openai_effort(), Some("high"));
+    }
+
+    #[test]
+    fn anthropic_budget_meets_minimum() {
+        // 官方下限是 1024，低档也必须是这个数，
+        // 给更低会被服务端拒掉
+        assert_eq!(ThinkingEffort::Low.anthropic_budget(), Some(1024));
+        assert!(ThinkingEffort::Medium.anthropic_budget().unwrap() > 1024);
+        assert!(ThinkingEffort::High.anthropic_budget().unwrap()
+            > ThinkingEffort::Medium.anthropic_budget().unwrap());
+    }
+
+    #[test]
+    fn labels_are_distinct() {
+        let all = ThinkingEffort::all();
+        let mut names: Vec<&str> = all.iter().map(|t| t.label()).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), all.len(), "档位名不能重复");
+    }
 }

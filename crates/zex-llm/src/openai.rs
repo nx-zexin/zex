@@ -35,6 +35,11 @@ pub fn build_body(model: &str, req: &ChatRequest) -> Value {
     if let Some(t) = req.temperature {
         body["temperature"] = json!(t);
     }
+    // 思考强度：只对支持它的端点有效（o 系列、部分兼容实现）。
+    // 不支持的端点会直接忽略这个字段，不会报错。
+    if let Some(effort) = req.thinking.openai_effort() {
+        body["reasoning_effort"] = json!(effort);
+    }
 
     if !req.tools.is_empty() {
         body["tools"] = Value::Array(
@@ -472,5 +477,31 @@ mod tests {
         let evs =
             parse_chunk(r#"{"choices":[{"delta":{"reasoning_content":"thinking..."}}]}"#).unwrap();
         assert_eq!(evs, vec![StreamEvent::Thinking("thinking...".into())]);
+    }
+}
+
+#[cfg(test)]
+mod thinking_body_tests {
+    use super::*;
+    use crate::{ChatRequest, ThinkingEffort};
+    use zex_core::Message;
+
+    fn body(thinking: ThinkingEffort) -> serde_json::Value {
+        let mut req = ChatRequest::new(vec![Message::user("hi")]);
+        req.thinking = thinking;
+        // build_body 是内部函数，这里通过它验证字段确实写进去了
+        build_body("m", &req)
+    }
+
+    #[test]
+    fn high_effort_adds_reasoning_field() {
+        let b = body(ThinkingEffort::High);
+        assert_eq!(b["reasoning_effort"], "high");
+    }
+
+    #[test]
+    fn off_omits_reasoning_field() {
+        let b = body(ThinkingEffort::Off);
+        assert!(b.get("reasoning_effort").is_none(), "选不思考时不应发该字段");
     }
 }

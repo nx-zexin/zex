@@ -363,7 +363,7 @@ pub fn spawn_core(
             rt.block_on(async move {
                 while let Some(cmd) = cmd_rx.recv().await {
                     match cmd {
-                        UiCommand::UserPrompt { session, text, attachments, model, mode } => {
+                        UiCommand::UserPrompt { session, text, attachments, model, mode, thinking } => {
                             // 派到后台执行，主循环立刻回去收下一条命令 ——
                             // 否则一个慢任务会把「切会话」「审批」全堵在队列里。
                             // 同一会话内部仍串行（run_task 里的会话锁），
@@ -384,6 +384,9 @@ pub fn spawn_core(
                                 // 否则并行会话会互相覆盖对方的模式
                                 if let Some(m) = mode {
                                     task_cfg.mode = m;
+                                }
+                                if let Some(t) = thinking {
+                                    task_cfg.thinking = t;
                                 }
                                 if let Some(m) = model.as_deref() {
                                     if let Some((p, rest)) = m.split_once('/') {

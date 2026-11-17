@@ -355,6 +355,8 @@ struct ChatView {
     pf_max_tokens: Entity<InputState>,
     /// 当前会话的运行模式。
     run_mode: zex_core::RunMode,
+    /// 思考强度（每轮随 prompt 下发，不落会话）。
+    thinking: zex_llm::ThinkingEffort,
     /// 正在编辑模型名。
     editing_model: bool,
     model_input: Entity<InputState>,
@@ -562,6 +564,7 @@ impl ChatView {
             pf_temperature,
             pf_max_tokens,
             run_mode: initial_mode,
+            thinking: zex_llm::ThinkingEffort::Off,
             editing_model: false,
             model_input,
             input_history: restored_history,
@@ -1441,6 +1444,7 @@ impl ChatView {
         let session = self.active_session.clone();
         let selected_model = self.selected_model.clone();
         let run_mode = self.run_mode;
+        let thinking = self.thinking;
         cx.spawn(async move |_this, _cx| {
             let _ = tx
                 .send(UiCommand::UserPrompt {
@@ -1449,6 +1453,7 @@ impl ChatView {
                     attachments: images,
                     model: selected_model,
                     mode: Some(run_mode),
+                    thinking: Some(thinking),
                 })
                 .await;
         })
@@ -5038,6 +5043,64 @@ impl ChatView {
 
         // 运行模式：决定这一轮工具调用的放行尺度。
         // 放在模型旁边，因为两者都是"这条消息怎么跑"的开关。
+        // 思考强度：和模式并排。它同样是"这一轮怎么干"的选择，
+        // 而不是模型本身的属性
+        let thinking_picker = {
+            let cur = self.thinking;
+            let view = cx.entity().downgrade();
+            Button::new("thinking-effort")
+                .ghost()
+                .icon(IconName::Brain)
+                .label(cur.label())
+                .dropdown_caret(true)
+                .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _window, _cx| {
+                    let mut menu = menu.min_w(px(220.0));
+                    for t in zex_core::ThinkingEffort::all() {
+                        let view = view.clone();
+                        let selected = t == cur;
+                        menu = menu.item(
+                            PopupMenuItem::element(move |_w, _c| {
+                                let mut row = div()
+                                    .flex()
+                                    .items_start()
+                                    .gap_3()
+                                    .w_full()
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .flex()
+                                            .flex_col()
+                                            .gap(px(2.0))
+                                            .child(div().text_sm().child(t.label()))
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(rgb(TEXT_DIM))
+                                                    .child(t.description()),
+                                            ),
+                                    );
+                                if selected {
+                                    row = row.child(
+                                        Icon::new(IconName::Check)
+                                            .text_size(px(14.0))
+                                            .text_color(rgb(TEXT_MUTED)),
+                                    );
+                                }
+                                row
+                            })
+                            .on_click(move |_, _w, cx| {
+                                view.update(cx, |this, cx| {
+                                    this.thinking = t;
+                                    cx.notify();
+                                })
+                                .ok();
+                            }),
+                        );
+                    }
+                    menu
+                })
+        };
+
         let mode_picker = {
             let cur = self.run_mode;
             let view = cx.entity().downgrade();
@@ -5292,7 +5355,8 @@ impl ChatView {
                         .items_center()
                         .gap_2()
                         .child(attach_btn)
-                        .child(mode_picker),
+                        .child(mode_picker)
+                        .child(thinking_picker),
                 ),
         )
             .child(
@@ -6283,6 +6347,7 @@ fn main() {
                                 attachments: vec![],
                                 model: None,
                                 mode,
+                                thinking: None,
                             });
                         }
                     }

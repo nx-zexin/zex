@@ -86,9 +86,19 @@ pub fn build_body(model: &str, req: &ChatRequest) -> Value {
     if let Some(system) = &req.system {
         body["system"] = json!(system);
     }
-    if let Some(t) = req.temperature {
+    // 思考与温度互斥：官方要求开了 extended thinking 就不能指定 temperature，
+    // 两者同时发会被拒。用户既然选了思考强度，温度让位。
+    if let Some(budget) = req.thinking.anthropic_budget() {
+        body["thinking"] = json!({"type": "enabled", "budget_tokens": budget});
+        // 预算必须小于 max_tokens，否则整套请求被拒 —— 顶高一点留出输出余量
+        let need = budget + 1024;
+        if req.max_tokens < need {
+            body["max_tokens"] = json!(need);
+        }
+    } else if let Some(t) = req.temperature {
         body["temperature"] = json!(t);
     }
+
     if !req.tools.is_empty() {
         body["tools"] = Value::Array(
             req.tools
