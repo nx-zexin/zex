@@ -4337,6 +4337,8 @@ impl ChatView {
                             .label("取消")
                             .on_click(cx.listener(|this, _: &ClickEvent, _w, cx| {
                                 this.provider_form = None;
+                                // 选中记录跟着表单走，否则下次打开会带着上次的“已选”提示
+                                this.md_picked = None;
                                 cx.notify();
                             })),
                     )
@@ -4431,6 +4433,7 @@ impl ChatView {
         };
         let name_val = name.clone().unwrap_or_default();
 
+        self.md_picked = None;
         self.pf_name
             .update(cx, |st, cx| st.set_value(name_val, window, cx));
         self.pf_kind
