@@ -27,6 +27,7 @@ zex-app = { path = "crates/zex-app" }
 zex-voice = { path = "crates/zex-voice" }
 zex-skill = { path = "crates/zex-skill" }
 zex-mcp = { path = "crates/zex-mcp" }
+zex-extension = { path = "crates/zex-extension" }
 
 # ─── 序列化 ───
 serde = { version = "1", features = ["derive"] }
@@ -91,3 +92,12 @@ todo = "deny"
 unimplemented = "deny"
 unwrap_used = "warn"
 expect_used = "warn"
+
+# ─── 扩展脚本运行时（debug 构建的加速项）───
+# gpui-shell 实测：不优化这两个包，debug 版脚本渲染 31.5ms，优化后 11.3ms
+# （release 是 11.0ms）。quickjs-jit 本身是个门面，单独优化它没用。
+[profile.dev.package.quickjs-jit-sys]
+opt-level = 3
+
+[profile.dev.package.quickjs-jit-core]
+opt-level = 3

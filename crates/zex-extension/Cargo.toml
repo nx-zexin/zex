@@ -1,0 +1,32 @@
+[package]
+name = "zex-extension"
+description = "扩展宿主：把 gpui-shell 的脚本面板接进 Zex"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = ["ui"]
+# 关掉它就不链接 QuickJS（二进制少 13.5 MiB），扩展页只剩目录列表。
+ui = ["dep:gpui-kit", "dep:gpui-shell", "dep:tokio"]
+
+[dependencies]
+zex-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tokio = { workspace = true, optional = true }
+gpui-kit = { workspace = true, optional = true }
+# 钉死版本：gpui-shell 自述 M0，脚本 API "预计会变"。
+# 用 = 而不是 ^，让升级成为一次显式动作，而不是某天 cargo update 顺手带来的。
+gpui-shell = { version = "=0.9.1", default-features = false, features = [
+    "quickjs",
+], optional = true }
+
+# 上游明说：不优化这两个包，debug 版脚本渲染慢 3 倍。
+# 必须写在 workspace 根（库不能给宿主设 profile），见根 Cargo.toml。
