@@ -7401,12 +7401,24 @@ fn load_sessions(store: &zex_store::Store) -> Vec<SessionItem> {
 }
 
 fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
-        )
-        .init();
+    // 两层：一层给人看的终端输出（受 RUST_LOG 控制），
+    // 一层给模型看的扩展日志缓冲（不受 RUST_LOG 控制）。
+    //
+    // 顺序很关键：捕获层装在过滤器**前面**。脚本的 console.log 是 info 级，
+    // 默认 `warn` 的过滤器会把它挡掉；而"点按钮没反应"往往正是靠这几行
+    // 才查得出来。缓冲自己有上限（200 条）和 target 白名单，不会失控。
+    {
+        use tracing_subscriber::Layer as _;
+        use tracing_subscriber::layer::SubscriberExt as _;
+        use tracing_subscriber::util::SubscriberInitExt as _;
+
+        let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
+        tracing_subscriber::registry()
+            .with(zex_app::ext_logs::CaptureLayer)
+            .with(tracing_subscriber::fmt::layer().with_filter(filter))
+            .init();
+    }
 
     let cfg = match zex_app::load() {
         Ok(c) => c,

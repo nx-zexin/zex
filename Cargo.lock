@@ -10660,6 +10660,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "tracing-core",
  "tracing-subscriber",
  "zex-agent",
  "zex-core",

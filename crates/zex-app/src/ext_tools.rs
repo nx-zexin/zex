@@ -77,6 +77,9 @@ impl Tool for ExtensionCheck {
             });
         }
 
+        // 先清空日志缓冲：校验引起的那批错误一定是这次的，
+        // 混着上一轮的记录，模型会去修一个已经修好的问题
+        crate::ext_logs::clear();
         let (id, ev) = zex_extension::check::request(&app_id);
         let rx = zex_extension::check::register(&id);
         if self.ev_tx.send(ev).await.is_err() {
@@ -121,5 +124,60 @@ impl Tool for ExtensionCheck {
                 meta: None,
             }),
         }
+    }
+}
+
+/// `ext_logs` 的参数。
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct LogsArgs {
+    /// 最多返回多少条（默认 40，最多 200）。返回的是最近的若干条。
+    #[serde(default)]
+    pub lines: Option<usize>,
+    /// 只看这个级别及以上：`info` / `warn` / `error`。默认不过滤。
+    #[serde(default)]
+    pub min_level: Option<String>,
+}
+
+/// 读扩展的运行期日志。
+///
+/// 和 `ext_check` 分工：`ext_check` 回答"能不能加载、第一帧长什么样"，
+/// 这里回答"跑起来之后出了什么事"。交互触发的错误（点击回调抛异常、
+/// 未处理的 Promise 拒绝）只会出现在这里。
+pub struct ExtensionLogs;
+
+#[async_trait]
+impl Tool for ExtensionLogs {
+    const NAME: &'static str = "ext_logs";
+    const RISK: Risk = Risk::ReadOnly;
+    type Args = LogsArgs;
+
+    fn description() -> &'static str {
+        "读取扩展的运行期日志：脚本里的 console.* 输出、点击/渲染回调抛的异常、\
+         未处理的 Promise 拒绝。排查「点了按钮没反应」这类问题时先看它。\
+         注意：日志是全局缓冲，不按扩展区分（上游事件里没有应用字段），\
+         同时开发多个扩展时按内容自行判断。调用 ext_check 会清空缓冲，\
+         所以那之前的历史日志看不到。"
+    }
+
+    async fn call(&self, _cx: &dyn ToolCtx, args: LogsArgs) -> Result<ToolOutput> {
+        let lines = args.lines.unwrap_or(40).clamp(1, 200);
+        let entries = crate::ext_logs::recent(lines, args.min_level.as_deref());
+        if entries.is_empty() {
+            return Ok(ToolOutput {
+                content: "没有日志。可能是：确实没输出、已经被 ext_check 清空、或日志级别被过滤掉了"
+                    .into(),
+                is_error: false,
+                meta: None,
+            });
+        }
+        let mut out = String::with_capacity(entries.len() * 80);
+        for e in &entries {
+            out.push_str(&format!("[{}] {}: {}\n", e.level, e.target, e.message));
+        }
+        Ok(ToolOutput {
+            content: out,
+            is_error: false,
+            meta: None,
+        })
     }
 }
