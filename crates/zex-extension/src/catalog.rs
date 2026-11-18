@@ -87,11 +87,18 @@ impl Extension {
 /// 就没有可见的中间态 —— 用户既不知道自己装的东西想要什么，也无从判断
 /// 一个来路不明的扩展安不安全。
 ///
-/// # 为什么现在还不生效
+/// # 哪些真的生效
 ///
-/// 当前实现是「全局一套能力」（所有扩展共享默认策略），不是「每应用一套」。
-/// 在这个结构下按清单授予，等于把 A 申请的权限递给 B —— 那比不授予更糟。
-/// 所以本版只做三件事：**解析、展示、留痕**；真正生效要等 per-app 策略。
+/// 只有 **`storage`**：宿主建运行时把 `Capabilities::new().storage(true)`
+/// 装进全局默认策略，配上 `set_storage_path` 的落盘文件。注意它是**全局**
+/// 的 —— 没在清单里申请存储的应用一样能用 `localStorage`，所有应用共享
+/// 同一个 JSON（见 [`storage_path`]）。这是当前结构（全应用共用一份
+/// `load_application` 策略）的必然结果，不是疏漏。
+///
+/// 文件、网络、剪贴板、子进程都**不生效**：它们是按应用授予才有意义的东西，
+/// 而现在是「全局一套能力」，按清单授予等于把 A 申请的权限递给 B ——
+/// 比不授予更糟。这部分仍然只做三件事：**解析、展示、留痕**，
+/// 等换成上游的 per-app `Policy` 再接上。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CapabilityRequest {
     /// 可读目录（原文，未展开 `${dataDir}` 这类占位符）。
@@ -208,6 +215,23 @@ fn config_dir() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
     home.join(".zex")
+}
+
+/// 扩展本地存储的落盘位置：`~/.zex/state/extensions-store.json`。
+///
+/// # 为什么是"一个文件"而不是"每个应用一个"
+///
+/// `set_storage_path` 和 `set_capabilities` 改的都是上游的**全局默认
+/// Policy**，而 zex 挂应用走的是 `load_application`（全应用共用一个
+/// policy）。所以在当前结构下，这个 JSON 天然被所有应用共享：
+/// 键空间共享、8 MiB / 1024 键 / 单值 1 MiB 也是全局算的。
+///
+/// 要每个应用各一个文件，得换成上游的 `plugin::Plugin::load`
+/// （它内部是 `with_storage_path(<data_dir>/<id>/store.json)`）——
+/// 那是一整套插件生命周期，不是两行能改的。先共享，等 per-app 策略
+/// 真落地了再拆。
+pub fn storage_path() -> PathBuf {
+    config_dir().join("state").join("extensions-store.json")
 }
 
 /// 扫描全部扩展，按 id 排序。

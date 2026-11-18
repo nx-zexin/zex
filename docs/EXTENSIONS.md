@@ -88,9 +88,18 @@ agent 会写 `main.js` → `ext_install` 登记 → `ext_check` 自检 → 报�
 · 未审阅
 ```
 
-**这一版不实际授予任何能力**，原因写在 `catalog.rs` 里：当前是进程级单一能力集（所有扩展共享默认策略），按清单授予等于把 A 申请的权限递给 B —— 比不给更糟。要真正开放，得换成 per-app 策略（上游的 `PluginManager`）。
+**这一版真正生效的只有 `storage`（本地存储）**，而且是全局的：
 
-现在保留的是「申请 → 审阅 → 批准」这条流程和留痕（`config.json` 的 `approved_extensions`），等策略层落地就能直接接上。**在这之前，agent 写的扩展一律零能力**，提权路径是封死的。
+| 能力 | 状态 |
+|---|---|
+| `storage` → `localStorage` | ✅ 生效，落盘在 `~/.zex/state/extensions-store.json` |
+| `fs` / `network` / `clipboard` / `execute` | ❌ 只解析、展示、留痕 |
+
+存储之所以能给，是因为它不需要"按应用隔离才有意义"：宿主建运行时调 `set_storage_path` + `set_capabilities(storage)`，两行成对就有——少任一行脚本一碰 `localStorage` 就抛错，报错还看不出另一边没配。
+
+**代价是它被所有应用共享**：`set_storage_path` 改的是全局默认 Policy，而 zex 挂应用走 `load_application`（全应用共用一个 policy）。所以键空间共享（8 MiB / 1024 键 / 单值 1 MiB 也是全局算的）、没申请存储的应用一样能用。要每应用一份文件得换成上游 `plugin::Plugin::load`，那是一整套插件生命周期，先不值当。
+
+其余四项仍然只做「申请 → 审阅 → 批准」和留痕（`config.json` 的 `approved_extensions`）：全局单能力集下按清单授予，等于把 A 申请的权限递给 B —— 比不给更糟。等 per-app 策略落地再逐个接。
 
 ## 侧边栏入口
 

@@ -87,6 +87,50 @@ grep -n "v_flex\|h_flex" ~/.zex/extensions/<id>/gpui-kit.d.ts
 - 写坏了不会报错，只是那行回到灰点 —— 所以写完用 `ext_check` 顺带确认
   目录里有这个文件，或者直接问用户看到的是不是他想要的形状。
 
+## 本地存储：能用，但要按约定用
+
+`localStorage` **是真的可用的**，重启进程后数据还在。
+（`sessionStorage` 也能用，但只在本次进程内，别拿它存要留下来的东西。）
+
+```js
+const KEY = "myapp.v1.records";        // ← 必须带前缀，见下
+
+// 读
+let rows = [];
+try { rows = JSON.parse(localStorage.getItem(KEY) || "[]"); } catch { rows = []; }
+
+// 写
+localStorage.setItem(KEY, JSON.stringify(rows));
+```
+
+### 三条必须知道的事
+
+1. **键空间是所有应用共享的。** 所有应用的 `localStorage` 落在同一个文件里
+   （`~/.zex/state/extensions-store.json`）。所以键名一律加
+   `<你的id>.v<数字>.` 前缀 —— 不撞车是你自己的责任，宿主不会加。
+2. **额度是全局算的**：总 8 MiB、最多 1024 个键、单个值 1 MiB。够存打卡记录、
+   任务清单、设置项；不够存图片或日志（那该走 `fs`，而 `fs` 目前没开放）。
+3. **写盘是异步的**，你要是需要"确定落盘了"，`await localStorage.flush()`。
+   不加也能用 —— 退出前宿主会收尾，只是没有立刻落盘的保证。
+
+### 还要不要 try/catch
+
+要。宿主当前是**全局**开存储，所以正常情况不会抛；但这个能力是按版本给的，
+将来如果收紧成"按应用授予"，没申请的应用就会抛
+`storage is not granted`。捕获住、退到内存里，界面至少还能用：
+
+```js
+try {
+  localStorage.setItem(KEY, v);
+} catch (e) {
+  this.note = "仅在本次运行内有效";   // 照实写出来，别假装存上了
+  this.memory = v;
+}
+```
+
+清单里要不要声明 `capabilities.storage`？**声明**，用户能在应用页看到你要什么。
+但别指望它当开关：现在生效与否由宿主决定，不是清单决定。
+
 ## 宿主接口
 
 ```js

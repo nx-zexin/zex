@@ -64,11 +64,36 @@ pub struct ExtensionHost {
 impl ExtensionHost {
     /// 建运行时。
     ///
-    /// 能力集是空的：不给文件、不给网络、不给剪贴板、不给子进程。
+    /// 能力集里只开 `storage`：不给文件、不给网络、不给剪贴板、不给子进程。
     /// 画界面不需要这些，要读文件的事由宿主模块代劳（那才是我们能审的地方）。
+    ///
+    /// # `set_storage_path` 和 `set_capabilities` 必须成对
+    ///
+    /// 这两行少一个都会在脚本第一次碰 `localStorage` 时抛错，而且报错
+    /// 看不出来"另一边没配"：
+    ///
+    /// - 只给能力：`localStorage has no backing file; the host must call
+    ///   set_storage_path before the application runs`
+    /// - 只给路径：`storage is not granted; set capabilities.storage to true`
+    ///
+    /// 顺带一个坑：`set_storage_path` **不建目录**。父目录不存在时它不报错，
+    /// 写盘时才 warn —— 于是脚本能用、重启就丢，而且看起来一切正常。
+    /// 所以这里自己 `create_dir_all`，失败也只 warn（存储用不了不该让
+    /// 整个扩展宿主起不来）。
     pub fn new(cx: &mut App, bridge: AgentBridge) -> Result<Self> {
         gpui_shell::init(cx);
-        gpui_shell::set_capabilities(Capabilities::new());
+        let store = crate::catalog::storage_path();
+        if let Some(dir) = store.parent() {
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                tracing::warn!(
+                    dir = %dir.display(),
+                    error = %e,
+                    "无法创建扩展存储目录，本地存储将在进程退出后丢失"
+                );
+            }
+        }
+        gpui_shell::set_storage_path(store);
+        gpui_shell::set_capabilities(Capabilities::new().storage(true));
 
         let runtime = ShellRuntime::new(cx)
             .map_err(|e| zex_core::Error::Other(format!("无法创建扩展运行时: {e}")))?;

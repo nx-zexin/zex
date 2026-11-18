@@ -5661,11 +5661,29 @@ impl ChatView {
                             // 必须摆在用户眼前，而不是埋在 JSON 里
                             .child({
                                 let req = &ext.request;
+                                // 已生效的那部分先摆出来。存储是**全局**授予的
+                                // （宿主只开这一个能力），所以不管清单要不要，
+                                // 每个应用都能用 —— 不写清楚，用户会以为
+                                // "没申请就等于用不了"。
+                                let live = div()
+                                    .text_xs()
+                                    .text_color(rgb(TEXT_MUTED))
+                                    .child(format!(
+                                        "已生效：本地存储（全部应用共享一份，{}）",
+                                        zex_extension::catalog::storage_path().display()
+                                    ));
                                 if req.is_empty() {
                                     div()
-                                        .text_xs()
-                                        .text_color(rgb(TEXT_DIM))
-                                        .child("未申请任何能力")
+                                        .flex()
+                                        .flex_col()
+                                        .gap_1()
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(rgb(TEXT_DIM))
+                                                .child("未申请任何能力"),
+                                        )
+                                        .child(live)
                                 } else {
                                     let broad = req.broad();
                                     let approved = self
@@ -5700,11 +5718,13 @@ impl ChatView {
                                             .text_xs()
                                             .text_color(rgb(if approved { OK } else { TEXT_DIM }))
                                             .child(if approved {
-                                                "· 已批准（本版不生效）"
+                                                // 只有存储真的生效了，其余仍然只是留痕
+                                                "· 已批准（存储之外本版不生效）"
                                             } else {
                                                 "· 未审阅"
                                             }),
                                     )
+                                    .child(live)
                                 }
                             }),
                     )
