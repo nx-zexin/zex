@@ -5257,7 +5257,8 @@ impl ChatView {
                     .text_color(rgb(TEXT_MUTED))
                     .child(
                         "每个扩展是一个子目录，里面放 gpui-shell.json（id / name / entry）\
-                         和脚本入口。脚本里用 `import { ask } from \"zex.<id>\"` 调用 agent。",
+                         和脚本入口。脚本里用 `import { ask } from \"zex.<id>\"` 调用 agent；\
+                         示例见仓库 examples/extensions/demo，文档见 docs/EXTENSIONS.md。",
                     ),
             );
 

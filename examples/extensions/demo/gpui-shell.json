@@ -1,0 +1,5 @@
+{
+  "id": "demo",
+  "name": "示例扩展",
+  "entry": "main.js"
+}
