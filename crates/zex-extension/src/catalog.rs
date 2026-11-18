@@ -44,6 +44,8 @@ pub struct Extension {
     pub entry: String,
     /// 扩展目录（绝对路径）。
     pub dir: PathBuf,
+    /// 清单里申请的能力。只作展示与留痕，本版不生效。
+    pub request: CapabilityRequest,
 }
 
 impl Extension {
@@ -59,6 +61,104 @@ impl Extension {
     /// 事件里加一层"这是谁的请求"字段 —— 现成的机制已经够用。
     pub fn session_id(&self) -> String {
         format!("ext-{}", self.id)
+    }
+}
+
+/// 扩展在清单里申请的能力（**只是申请**）。
+///
+/// # 为什么必须显示出来
+///
+/// 模型能写扩展，也就能写清单。如果清单一律被忽略，"申请"和"授予"之间
+/// 就没有可见的中间态 —— 用户既不知道自己装的东西想要什么，也无从判断
+/// 一个来路不明的扩展安不安全。
+///
+/// # 为什么现在还不生效
+///
+/// 当前实现是「全局一套能力」（所有扩展共享默认策略），不是「每应用一套」。
+/// 在这个结构下按清单授予，等于把 A 申请的权限递给 B —— 那比不授予更糟。
+/// 所以本版只做三件事：**解析、展示、留痕**；真正生效要等 per-app 策略。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CapabilityRequest {
+    /// 可读目录（原文，未展开 `${dataDir}` 这类占位符）。
+    pub fs_read: Vec<String>,
+    /// 可写目录。
+    pub fs_write: Vec<String>,
+    /// 可执行的命令；`Some("*")` 表示不限。
+    pub execute: Option<Vec<String>>,
+    /// 可访问的网络主机。
+    pub network_hosts: Vec<String>,
+    /// 是否要剪贴板。
+    pub clipboard: bool,
+    /// 是否要 localStorage。
+    pub storage: bool,
+    /// 是否要 `process.exit`。
+    pub exit: bool,
+}
+
+impl CapabilityRequest {
+    /// 一项都不申请。
+    pub fn is_empty(&self) -> bool {
+        self.fs_read.is_empty()
+            && self.fs_write.is_empty()
+            && self.execute.is_none()
+            && self.network_hosts.is_empty()
+            && !self.clipboard
+            && !self.storage
+            && !self.exit
+    }
+
+    /// 有没有"宽授权"。
+    ///
+    /// 三类：不限命令、把整个家目录交出去、放行任意主机。
+    /// 它们不是错，但值得在界面上单独标出来 —— 一个只需要读自己数据目录的
+    /// 扩展，没有理由申请这三样里的任何一个。
+    pub fn broad(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some(cmds) = &self.execute {
+            if cmds.iter().any(|c| c == "*") {
+                out.push("可执行任意命令".to_string());
+            }
+        }
+        for root in self.fs_read.iter().chain(self.fs_write.iter()) {
+            if root.contains("${homeDir}") || root == "/" || root == "~" {
+                out.push(format!("整个家目录：{root}"));
+            }
+        }
+        if self.network_hosts.iter().any(|h| h == "*") {
+            out.push("任意网络主机".to_string());
+        }
+        out
+    }
+
+    /// 拼成一句给人看的话，例如 `读 2 处 · 写 1 处 · 网络 1 个主机`。
+    pub fn summary(&self) -> String {
+        let mut bits = Vec::new();
+        if !self.fs_read.is_empty() {
+            bits.push(format!("读 {} 处", self.fs_read.len()));
+        }
+        if !self.fs_write.is_empty() {
+            bits.push(format!("写 {} 处", self.fs_write.len()));
+        }
+        if let Some(cmds) = &self.execute {
+            bits.push(if cmds.iter().any(|c| c == "*") {
+                "执行任意命令".to_string()
+            } else {
+                format!("执行 {} 个命令", cmds.len())
+            });
+        }
+        if !self.network_hosts.is_empty() {
+            bits.push(format!("网络 {} 个主机", self.network_hosts.len()));
+        }
+        if self.clipboard {
+            bits.push("剪贴板".to_string());
+        }
+        if self.storage {
+            bits.push("存储".to_string());
+        }
+        if self.exit {
+            bits.push("退出".to_string());
+        }
+        bits.join(" · ")
     }
 }
 
@@ -147,7 +247,63 @@ fn read_one(dir: &Path) -> Result<Option<Extension>, String> {
         name: manifest.name,
         entry,
         dir: dir.to_path_buf(),
+        request: parse_request(&text),
     }))
+}
+
+/// 从清单原文里取能力申请。
+///
+/// 单独解析一遍原始 JSON，而不是给 `ManifestFile` 加字段：上游清单
+/// `deny_unknown_fields`，字段形状偶尔会加；这里只认我们看得懂的键，
+/// 认不出就当作没申请 —— 缺省必须是"什么都不给"。
+fn parse_request(text: &str) -> CapabilityRequest {
+    let Ok(raw) = serde_json::from_str::<serde_json::Value>(text) else {
+        return CapabilityRequest::default();
+    };
+    let Some(caps) = raw.get("capabilities") else {
+        return CapabilityRequest::default();
+    };
+    let strings = |v: Option<&serde_json::Value>| -> Vec<String> {
+        v.and_then(|x| x.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|s| s.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let fs = caps.get("fs");
+    let exec = fs.and_then(|f| f.get("execute")).and_then(|e| match e {
+        // 上游两种写法：命令数组，或字符串 "*"
+        serde_json::Value::Array(_) => Some(strings(Some(e))),
+        serde_json::Value::String(s) => Some(vec![s.clone()]),
+        _ => None,
+    });
+    let network = caps.get("network");
+    CapabilityRequest {
+        fs_read: strings(fs.and_then(|f| f.get("read"))),
+        fs_write: strings(fs.and_then(|f| f.get("write"))),
+        execute: exec,
+        network_hosts: strings(network.and_then(|n| n.get("hosts"))),
+        clipboard: caps
+            .get("clipboard")
+            .map(|c| {
+                c.get("read").and_then(|v| v.as_bool()).unwrap_or(false)
+                    || c.get("write").and_then(|v| v.as_bool()).unwrap_or(false)
+            })
+            .unwrap_or(false),
+        // 上游这个字段默认给 true；这里按"没写就是没要"处理，
+        // 因为我们的实现里存储也要显式授予
+        storage: caps
+            .get("storage")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        exit: caps
+            .get("process")
+            .and_then(|p| p.get("exit"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+    }
 }
 
 /// 扫描默认位置。
@@ -249,6 +405,7 @@ mod tests {
             name: "D".into(),
             entry: "main.js".into(),
             dir: PathBuf::from("/tmp/x"),
+            request: CapabilityRequest::default(),
         };
         // 前缀让"是不是扩展的会话"一眼可判
         assert_eq!(ext.session_id(), "ext-demo");
@@ -261,5 +418,74 @@ mod tests {
         write_ext(&root, "aa", r#"{"id":"a","name":"A"}"#, "");
         let list = scan(&root);
         assert_eq!(list.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), ["a", "b"]);
+    }
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::*;
+
+    const WITH_CAPS: &str = r#"{
+      "demo": {
+        "id": "demo", "name": "D",
+        "models": {}
+      }
+    }"#;
+
+    fn parse(caps_json: &str) -> CapabilityRequest {
+        parse_request(&format!(
+            r#"{{"id":"x","name":"X","capabilities":{caps_json}}}"#
+        ))
+    }
+
+    #[test]
+    fn absent_capabilities_mean_nothing_requested() {
+        let r = parse_request(r#"{"id":"x","name":"X"}"#);
+        assert!(r.is_empty(), "没写 capabilities 就是什么都不要");
+        assert!(r.broad().is_empty());
+    }
+
+    #[test]
+    fn reads_fs_and_network_lists() {
+        let r = parse(r#"{"fs":{"read":["${dataDir}","/tmp/a"],"write":["${dataDir}"]},
+                          "network":{"hosts":["api.example.com"]}}"#);
+        assert_eq!(r.fs_read.len(), 2);
+        assert_eq!(r.fs_write.len(), 1);
+        assert_eq!(r.network_hosts, ["api.example.com"]);
+        assert!(!r.is_empty());
+        assert!(r.broad().is_empty(), "具体路径不算宽授权");
+    }
+
+    #[test]
+    fn execute_accepts_list_and_star() {
+        let listed = parse(r#"{"fs":{"execute":["git","rg"]}}"#);
+        assert_eq!(listed.execute.as_deref(), Some(&["git".to_string(), "rg".to_string()][..]));
+        assert!(listed.broad().is_empty());
+
+        let star = parse(r#"{"fs":{"execute":"*"}}"#);
+        assert!(star.broad().iter().any(|b| b.contains("任意命令")));
+    }
+
+    #[test]
+    fn flags_home_directory_and_any_host_as_broad() {
+        let r = parse(r#"{"fs":{"read":["${homeDir}"]},"network":{"hosts":["*"]}}"#);
+        let broad = r.broad();
+        assert!(broad.iter().any(|b| b.contains("家目录")), "拿到：{broad:?}");
+        assert!(broad.iter().any(|b| b.contains("任意网络主机")), "拿到：{broad:?}");
+    }
+
+    #[test]
+    fn summary_is_readable_and_empty_when_nothing_requested() {
+        assert_eq!(CapabilityRequest::default().summary(), "");
+        let r = parse(r#"{"fs":{"read":["a"],"write":["b"]},"clipboard":{"read":true}}"#);
+        let s = r.summary();
+        assert!(s.contains("读 1 处") && s.contains("写 1 处") && s.contains("剪贴板"), "{s}");
+    }
+
+    #[test]
+    fn malformed_capabilities_degrade_to_nothing() {
+        // 形状不对时宁可不给，也不要猜
+        let r = parse(r#"{"fs":{"read":"不是数组"}}"#);
+        assert!(r.fs_read.is_empty());
     }
 }

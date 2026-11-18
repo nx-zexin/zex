@@ -3416,6 +3416,22 @@ impl ChatView {
         body.into_any_element()
     }
 
+    /// 记下"用户已审阅并批准这个扩展的能力申请"。
+    ///
+    /// 不做成"授予"，因为这一版没有 per-app 能力。这个动作的意义是：
+    /// 把界面上的"未审阅"变成"已批准"，并留下痕迹给将来的 per-app 策略用。
+    fn approve_extension(&mut self, id: &str, cx: &mut Context<Self>) {
+        let approved = zex_app::config::toggle_pinned(&mut self.config.approved_extensions, id);
+        self.persist_config(
+            if approved {
+                format!("已批准 `{id}` 的能力申请（本版尚未实际授予）")
+            } else {
+                format!("已撤销对 `{id}` 的批准")
+            },
+            cx,
+        );
+    }
+
     /// 固定 / 取消固定某个扩展到侧边栏，并写回配置。
     ///
     /// 只存 id：扩展叫什么、装在哪，都以目录扫描为准。
@@ -5576,9 +5592,88 @@ impl ChatView {
                                     .text_color(rgb(TEXT_DIM))
                                     .truncate()
                                     .child(ext.dir.display().to_string()),
-                            ),
+                            )
+                            // 能力申请：模型也能写清单，所以"它想要什么"
+                            // 必须摆在用户眼前，而不是埋在 JSON 里
+                            .child({
+                                let req = &ext.request;
+                                if req.is_empty() {
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(TEXT_DIM))
+                                        .child("未申请任何能力")
+                                } else {
+                                    let broad = req.broad();
+                                    let approved = self
+                                        .config
+                                        .approved_extensions
+                                        .iter()
+                                        .any(|x| x == &ext.id);
+                                    let mut line = div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .flex_wrap()
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(rgb(if broad.is_empty() {
+                                                    TEXT_MUTED
+                                                } else {
+                                                    DANGER
+                                                }))
+                                                .child(format!("申请：{}", req.summary())),
+                                        );
+                                    if !broad.is_empty() {
+                                        line = line.child(pill(
+                                            format!("宽授权：{}", broad.join("、")),
+                                            DANGER_SOFT,
+                                            DANGER,
+                                        ));
+                                    }
+                                    line.child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(if approved { OK } else { TEXT_DIM }))
+                                            .child(if approved {
+                                                "· 已批准（本版不生效）"
+                                            } else {
+                                                "· 未审阅"
+                                            }),
+                                    )
+                                }
+                            }),
                     )
                     .child(div().flex_1())
+                    // 批准能力申请：只有真的申请了才出现，否则是废按钮
+                    .child({
+                        let id = ext.id.clone();
+                        let needs = !ext.request.is_empty();
+                        let approved = self
+                            .config
+                            .approved_extensions
+                            .iter()
+                            .any(|x| x == &ext.id);
+                        if needs {
+                            div()
+                                .text_xs()
+                                .px_2()
+                                .py_1()
+                                .rounded(px(5.0))
+                                .cursor_pointer()
+                                .text_color(rgb(if approved { OK } else { DANGER }))
+                                .hover(|st| st.bg(rgb(BG_HOVER)))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _: &MouseDownEvent, _w, cx| {
+                                        this.approve_extension(&id, cx);
+                                    }),
+                                )
+                                .child(if approved { "撤销批准" } else { "批准申请" })
+                        } else {
+                            div()
+                        }
+                    })
                     // 侧边栏占位开关。放按钮左边、用文字链的样式：
                     // 它是个"设置项"，和右边的"打开"不是一类动作
                     .child({

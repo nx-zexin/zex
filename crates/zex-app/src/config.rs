@@ -78,6 +78,13 @@ pub struct FileConfig {
     /// 所以扩展被卸掉之后，这里残留的 id 会被安静地忽略。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pinned_extensions: Vec<String>,
+    /// 用户已批准其能力申请的扩展 id。
+    ///
+    /// 只记"用户看过并同意了"，**不等于能力已生效**：当前是进程级单一能力集，
+    /// 按应用授予会串味。这一栏留给 per-app 策略落地后直接使用，
+    /// 现在的作用是留痕 + 界面区分"未审阅"与"已批准"。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub approved_extensions: Vec<String>,
 }
 
 /// 解析后的运行时配置。
