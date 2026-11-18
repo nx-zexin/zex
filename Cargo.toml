@@ -68,6 +68,13 @@ reqwest = { version = "0.13", default-features = false, features = [
     "multipart",
 ] }
 
+# 扩展的 WebSocket 客户端。版本跟 gpui-shell 依赖的 tungstenite 0.29 对齐，
+# 免得同一棵树里出现两份 tungstenite。TLS 走 rustls，和 reqwest 一致。
+tokio-tungstenite = { version = "0.29", default-features = false, features = [
+    "connect",
+    "rustls-tls-webpki-roots",
+] }
+
 # ─── 存储 ───
 rusqlite = { version = "0.41", features = ["bundled", "hooks"] }
 

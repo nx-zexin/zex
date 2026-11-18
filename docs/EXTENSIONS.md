@@ -44,6 +44,46 @@ cp -r examples/extensions/demo ~/.zex/extensions/
 实现见 `crates/zex-extension/src/store_db.rs`（纯 SQLite 逻辑，12 个测试）
 和 `host.rs`（接到 `HostModule`）。
 
+## 网络：为什么自己做，而不是打开上游能力
+
+上游 gpui-shell **已经实现了** `fetch` 和 `WebSocket`，甚至还有按 scheme /
+method / path 限定的细粒度授权。看起来只要 `set_capabilities(network_hosts(...))`
+就完事了 —— 但它的能力集是**进程级**的：`set_capabilities` 改的是全局默认
+Policy，而 zex 挂应用走 `load_application`，所有应用共用同一份。
+
+也就是说一旦全局放开 `network_hosts`，A 应用声明的域名 B 应用照样能连，
+能力申请页那句"按应用授予"就成了摆设。**存储可以接受共享**（风险低、
+坏了就是脏数据），**网络不行**：它能把用户硬盘上的东西发出去。
+
+所以 `crates/zex-extension/src/net.rs` 自己实现三个通道，白名单按应用从
+各自清单里取 —— 我们的宿主模块本来就是 `zex.<id>` 一应用一个，天生知道
+"这次是谁在调"。
+
+| 通道 | 实现 | 说明 |
+|---|---|---|
+| HTTP | `reqwest` | 不跟随重定向（否则 302 就是白名单旁路），响应体 4 MiB 上限 |
+| WebSocket | `tokio-tungstenite` | `wsConnect/wsSend/wsRecv/wsClose` |
+| TCP | `tokio::net` | 客户端 only，`tcpConnect/tcpSend/tcpRecv/tcpClose` |
+
+每个应用一个独立的 tokio runtime：宿主模块的回调跑在 gpui 的执行器上，
+那里没有 reactor，直接 `TcpStream::connect` 会 panic（"no reactor running"）。
+
+这里踩过一次：一开始 `NetHub` 只是**存着**一个 runtime，但方法体直接
+`await`，于是 `tokio::spawn` / `TcpStream::connect` 用的还是环境里的运行时
+（gpui 的），结果炸出 `Task polled after completion`。单元测试没发现，
+因为测试外面套了一层 `block_on` —— 环境里刚好有运行时。
+现在所有网络方法都是薄壳：`self.runtime.spawn(async move { ... })`，
+真活儿全在 `*_on(inner, ...)` 里跑。
+
+**闸门有两道**：清单声明白名单（`capabilities.network.hosts`）+ 用户点
+「批准申请」。后者是硬要求：模型能写清单，所以清单只能表达"我想要什么"。
+
+边界（说清楚，不假装安全）：白名单按主机名判，DNS 返回私有地址也照连
+（应用连本机开发服务器是正常需求）；只能做客户端，不能监听。
+
+实现 18 个测试，含 HTTP / TCP / WS 三个**真实往返**（本地起服务，
+不是 mock）。
+
 ## 图标
 
 `icon.svg` 出现在侧边栏和设置页的应用列表里；没有就退回一个小灰点。

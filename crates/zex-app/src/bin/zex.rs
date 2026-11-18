@@ -2269,6 +2269,11 @@ fn pill(label: String, bg: u32, fg: u32) -> impl IntoElement {
         .child(label)
 }
 
+/// 从配置里取"用户批准过哪些应用"。
+fn approvals_of(config: &zex_app::config::FileConfig) -> std::collections::HashSet<String> {
+    config.approved_extensions.iter().cloned().collect()
+}
+
 /// 一轮为什么停下来 —— 给用户看的一句话。
 ///
 /// 每种结局都要回答两件事：**做完了没有**、**我该做什么**。
@@ -3523,11 +3528,15 @@ impl ChatView {
     /// 把界面上的"未审阅"变成"已批准"，并留下痕迹给将来的 per-app 策略用。
     fn approve_extension(&mut self, id: &str, cx: &mut Context<Self>) {
         let approved = zex_app::config::toggle_pinned(&mut self.config.approved_extensions, id);
+        // 网络闸门读的就是这张表：点了立刻生效，不用重启、不用重开面板
+        if let Some(host) = &self.ext_host {
+            host.set_approvals(approvals_of(&self.config));
+        }
         self.persist_config(
             if approved {
-                format!("已批准 `{id}` 的能力申请（本版尚未实际授予）")
+                format!("已批准 `{id}`（网络访问即刻生效；文件/剪贴板仍不授予）")
             } else {
-                format!("已撤销对 `{id}` 的批准")
+                format!("已撤销对 `{id}` 的批准，它的网络访问立即停止")
             },
             cx,
         );
@@ -3668,7 +3677,11 @@ impl ChatView {
         if self.ext_host.is_none() {
             let bridge = zex_extension::AgentBridge::new(self.cmd_tx.clone());
             match zex_extension::ExtensionHost::new(cx, bridge) {
-                Ok(h) => self.ext_host = Some(std::rc::Rc::new(h)),
+                Ok(h) => {
+                    // 批准表随宿主一起交过去：网络闸门认的就是它
+                    h.set_approvals(approvals_of(&self.config));
+                    self.ext_host = Some(std::rc::Rc::new(h));
+                }
                 Err(e) => {
                     zex_extension::check::deliver(
                         req_id,
@@ -3747,7 +3760,11 @@ impl ChatView {
         if self.ext_host.is_none() {
             let bridge = zex_extension::AgentBridge::new(self.cmd_tx.clone());
             match zex_extension::ExtensionHost::new(cx, bridge) {
-                Ok(h) => self.ext_host = Some(std::rc::Rc::new(h)),
+                Ok(h) => {
+                    // 批准表随宿主一起交过去：网络闸门认的就是它
+                    h.set_approvals(approvals_of(&self.config));
+                    self.ext_host = Some(std::rc::Rc::new(h));
+                }
                 Err(e) => {
                     self.status = format!("无法初始化扩展运行时：{e}");
                     cx.notify();
@@ -5700,7 +5717,7 @@ impl ChatView {
                                     .text_xs()
                                     .text_color(rgb(TEXT_MUTED))
                                     .child(format!(
-                                        "已生效：本地存储（全局共享）+ SQLite（每个应用一份，{}）",
+                                        "已生效：本地存储（全局共享）+ SQLite（每个应用一份，{}）；网络按清单白名单，需批准",
                                         zex_extension::catalog::state_dir()
                                             .join(zex_extension::store_db::DB_DIR)
                                             .display()

@@ -20,6 +20,11 @@ zex-core.workspace = true
 # 扩展的 SQLite（见 store_db）。跟着 ui 一起编：没有 ui 就没有宿主，
 # 也就没有脚本能调它，但保留依赖让 `cargo test -p zex-extension` 始终能跑。
 rusqlite.workspace = true
+# 网络三件套：HTTP 复用 reqwest，WebSocket 用 tokio-tungstenite，
+# 裸 socket 用 tokio::net。见 store_db 旁边的 net.rs。
+reqwest.workspace = true
+tokio-tungstenite.workspace = true
+futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true

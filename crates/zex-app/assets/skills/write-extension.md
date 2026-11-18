@@ -185,6 +185,85 @@ await dbBatch([
 只有一两个设置项（主题、上次选的城市）→ 用 `localStorage`，别为了两行数据
 建一张表。
 
+## 网络：HTTP / WebSocket / TCP
+
+三个通道都能用，但**必须先申请、再让用户批准**。没批准时调用会直接抛错，
+错误里写了该去哪儿点。
+
+### 先写清单
+
+```json
+{ "capabilities": { "network": { "hosts": ["api.example.com", "*.example.org:8443"] } } }
+```
+
+| 写法 | 含义 |
+|---|---|
+| `api.example.com` | 该域名，端口不限 |
+| `*.example.org` | 子域（**不含** `example.org` 本身） |
+| `api.example.com:8080` | 限定端口 |
+| `*` | 任意主机（界面上标红，等于放弃白名单） |
+
+写完让用户在「设置 → 应用」点这个应用的**批准申请**。点完立刻生效，
+不用重启 —— 但没点之前任何请求都会被拒。
+
+### HTTP
+
+```js
+import { httpRequest } from "zex.<id>";
+
+const r = await httpRequest({
+  url: "https://api.example.com/v1/items",
+  method: "POST",
+  headers: { "content-type": "application/json" },
+  body: JSON.stringify({ q: "x" }),
+  timeout_ms: 8000,
+});
+// r = { status, ok, headers: [[k,v]], body: 字符串, truncated }
+```
+
+- 只支持 `http(s)://`，**不自动跟随重定向**（跟过去就能绕过白名单）。
+  收到 3xx 就自己决定要不要再发一次 —— 那时会重新过一遍白名单。
+- 响应体最多 4 MiB，超了 `truncated` 为 true。
+- `body` 是按 UTF-8 有损解码的字符串；二进制内容不要走这条路。
+
+### WebSocket
+
+```js
+const id = await wsConnect("wss://example.com/socket");  // ws / wss
+await wsSend(id, JSON.stringify({ type: "sub" }));
+
+while (true) {
+  const msg = await wsRecv(id, 30000);      // 30 秒没消息会抛错
+  if (msg.closed) break;
+  if (msg.type === "text") handle(JSON.parse(msg.data));
+}
+
+await wsClose(id);
+```
+
+`wsRecv` 也是"收一条"的语义，不是事件回调 —— 因为宿主模块不能反过来
+调脚本（没有跨 await 的 cx）。要持续收就在 `cx.spawn` 里循环。
+
+### TCP
+
+```js
+const id = await tcpConnect("127.0.0.1", 6379);
+await tcpSend(id, "PING
+");
+const r = await tcpRecv(id, 2000);   // { type, data, closed }
+await tcpClose(id);
+```
+
+`tcpRecv` 拿到的是**一段字节**（UTF-8 有损解码），不保证一次读满一条协议
+报文 —— 要按分隔符/长度自己拼。
+
+### 三个共用限制
+
+- 每个应用最多同时开 **8 个连接**，用完记得 `close`。
+- 单条消息上限 1 MiB。
+- 白名单按**主机名**判，不做 IP 二次校验。所以别把"申请了 A 域名"当成
+  "绝对不会连到别的 IP"；写清单时按最小范围写。
+
 ## 宿主接口
 
 ```js
@@ -202,6 +281,9 @@ import { ask, reply, busy, name, session, dbExec, dbQuery, dbBatch } from "zex.<
 | `dbExec(sql, params?)` | 写语句 → `{ changes, lastInsertId }`（详见「SQLite」） |
 | `dbQuery(sql, params?)` | 查询 → 对象数组（详见「SQLite」） |
 | `dbBatch(statements)` | 多条写语句一个事务（详见「SQLite」） |
+| `httpRequest(spec)` | HTTP 请求（详见「网络」） |
+| `wsConnect/wsSend/wsRecv/wsClose` | WebSocket（详见「网络」） |
+| `tcpConnect/tcpSend/tcpRecv/tcpClose` | 裸 TCP（详见「网络」） |
 
 另外 `window.localStorage` / `window.sessionStorage` 可用，但它们不是模块导出，
 是 `window` 上的（详见「本地存储」）。
@@ -268,12 +350,13 @@ export default class App extends View {
 | 画界面（`gpui-kit` / `gpui-base`） | 读文件（`fs` 未开放） |
 | 调 agent（`ask` / `reply`） | 联网（`network` 未开放） |
 | 本地存储（`localStorage`，全局共享一份） | 剪贴板、子进程（未开放） |
+| 网络：HTTP / WS / TCP（按清单白名单 + 用户批准） | 监听端口（只能做客户端） |
 | SQLite（`dbExec` / `dbQuery` / `dbBatch`，一应用一库） | 碰 zex 自己的库（作者器挡 `ATTACH`） |
 
-清单里的 `capabilities` **声明**可以写，用户能在应用页看到你要什么；
-但除了 `storage`，写了也不生效 —— 生效与否由宿主决定，不是清单决定。
-真要读文件或联网，现在没有路；直接告诉用户"这个能力当前不支持"，
-别绕（比如用 `ask` 让 agent 去读）。
+清单里的 `capabilities` **声明**可以写，用户能在应用页看到你要什么。
+`storage` 直接生效；`network` 要用户点「批准申请」才生效；
+`fs` / `clipboard` / `execute` 写了也不生效 —— 直接告诉用户"这个能力当前不支持"，
+别绕（比如用 `ask` 让 agent 去读文件）。
 
 ## 写完怎么验证
 

@@ -122,6 +122,18 @@ pub fn waiting() -> usize {
     }
 }
 
+/// 某个 id 是否正在等回音。
+///
+/// 给测试用：`waiting()` 数的是全局表，和别的测试并行跑时会看到它们的
+/// 记录 —— 判断"某个具体 id 有没有留下痕迹"才是并行下稳定的断言。
+#[cfg(test)]
+pub fn is_waiting(id: &str) -> bool {
+    match pending().lock() {
+        Ok(g) => g.contains_key(id),
+        Err(poisoned) => poisoned.into_inner().contains_key(id),
+    }
+}
+
 /// 构造一个校验请求事件。
 pub fn request(app_id: &str) -> (String, CoreEvent) {
     let id = zex_core::ids::ToolCallId::generate().to_string();
@@ -151,8 +163,11 @@ mod tests {
     #[test]
     fn deliver_without_waiter_is_a_noop() {
         // UI 可能因为窗口关掉而晚到一步，不能 panic
+        //
+        // 断言的是"没有增加"而不是 `== 0`：`waiting()` 数的是全局表，
+        // 和别的测试并行跑时会看到它们注册的等待者 —— 写死 0 就是 flaky
         deliver("nobody", CheckReport::failed("x"));
-        assert_eq!(waiting(), 0);
+        assert!(!is_waiting("nobody"), "投递给不存在的等待者不该凭空建一条");
     }
 
     #[test]

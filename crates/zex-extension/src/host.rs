@@ -66,10 +66,23 @@ pub struct ExtensionHost {
     /// 而一次渲染里脚本可能连着查好几次。连接带 `Mutex` 是因为
     /// `rusqlite::Connection` 不是 `Sync`，而宿主模块的回调可能并发。
     dbs: DbRegistry,
+    /// 应用 id → 网络世界（白名单 + 连接 + 独立运行时）。
+    ///
+    /// 按应用分开而不是共用：白名单来自各自的清单，共用就等于
+    /// 把 A 申请的主机递给 B。
+    nets: NetRegistry,
+    /// 用户批准过哪些应用（能力申请页上那个「批准申请」）。
+    ///
+    /// 共享一份 `Arc`：用户在设置页点批准之后，正在跑的应用**立刻**能联网，
+    /// 不用重启、也不用重新挂载。
+    approvals: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
 /// 已打开的库。
 type DbRegistry = Arc<Mutex<HashMap<String, Arc<Mutex<rusqlite::Connection>>>>>;
+
+/// 应用 id → 网络世界。
+type NetRegistry = Arc<Mutex<HashMap<String, Arc<crate::net::NetHub>>>>;
 
 impl ExtensionHost {
     /// 建运行时。
@@ -113,7 +126,19 @@ impl ExtensionHost {
             bridge,
             replies: Arc::new(Mutex::new(HashMap::new())),
             dbs: Arc::new(Mutex::new(HashMap::new())),
+            nets: Arc::new(Mutex::new(HashMap::new())),
+            approvals: Arc::new(Mutex::new(std::collections::HashSet::new())),
         })
+    }
+
+    /// 把"用户批准了哪些应用"交给宿主。
+    ///
+    /// 不传也行：那样所有应用都算未批准，网络调用会被拒并提示去批准。
+    /// UI 启动时和每次点「批准申请」之后各同步一次。
+    pub fn set_approvals(&self, approved: std::collections::HashSet<String>) {
+        if let Ok(mut guard) = self.approvals.lock() {
+            *guard = approved;
+        }
     }
 
     /// 到内核的桥（UI 侧要在 `TurnEnded` 时回调它）。
@@ -219,6 +244,8 @@ impl ExtensionHost {
             self.bridge.clone(),
             self.replies.clone(),
             self.dbs.clone(),
+            self.nets.clone(),
+            self.approvals.clone(),
         );
         module
             .validate()
@@ -243,7 +270,23 @@ fn zex_module(
     bridge: AgentBridge,
     replies: Arc<Mutex<HashMap<String, String>>>,
     dbs: DbRegistry,
+    nets: NetRegistry,
+    approvals: Arc<Mutex<std::collections::HashSet<String>>>,
 ) -> HostModule {
+    // 这个应用的网络世界：白名单来自它自己的清单。
+    // 清单写错了（比如 `*.` 这种）不该让模块注册失败——那会让应用
+    // 连界面都打不开，而错误其实只在联网时才该出现。所以退化成一个
+    // 空白名单：任何连接都会被拒，并说明原因。
+    let net = match crate::net::NetPolicy::parse(&ext.request.network_hosts) {
+        Ok(policy) => crate::net::NetHub::new(policy).ok().map(Arc::new),
+        Err(e) => {
+            tracing::warn!(app = %ext.id, error = %e, "网络白名单写法有误，按空名单处理");
+            None
+        }
+    };
+    // 每个闭包各拿一份：`HostModule` 的闭包是 `Fn`，共享一个 moved 值是拿不到的
+    let net_handle = net;
+    let app = ext.id.clone();
     let ask_bridge = bridge.clone();
     let reply_map = replies;
     let reply_session = ext.session_id();
@@ -267,6 +310,45 @@ fn zex_module(
              /** 最近一次 ask() 的回复（可同步读）。 */\n\
              export function reply(): string;\n\
              /** 是否有 ask() 还在等回包。 */\n\
+             /**\n\
+              * 发一个 HTTP 请求。只支持 http/https，不自动跟随重定向。\n\
+              * 域名必须在清单的 capabilities.network.hosts 里，且经用户批准。\n\
+              */\n\
+             export function httpRequest(spec: {{\n\
+               url: string;\n\
+               method?: string;\n\
+               headers?: [string, string][] | Record<string, string>;\n\
+               body?: string;\n\
+               timeout_ms?: number;\n\
+             }}): Promise<{{\n\
+               status: number;\n\
+               ok: boolean;\n\
+               headers: [string, string][];\n\
+               body: string;\n\
+               truncated: boolean;\n\
+             }}>;\n\
+             /** 连一个 TCP 端口，返回连接编号。 */\n\
+             export function tcpConnect(host: string, port: number): Promise<string>;\n\
+             /** 往 TCP 连接写字符串，返回写入字节数。 */\n\
+             export function tcpSend(id: string, data: string): Promise<number>;\n\
+             /** 读一条：{{ type, data, closed }}。超时会 reject。 */\n\
+             export function tcpRecv(\n\
+               id: string,\n\
+               timeout_ms?: number,\n\
+             ): Promise<{{ type: string; data: string; closed: boolean }}>;\n\
+             /** 关闭 TCP 连接。 */\n\
+             export function tcpClose(id: string): Promise<boolean>;\n\
+             /** 连一个 WebSocket（ws/wss），返回连接编号。 */\n\
+             export function wsConnect(url: string): Promise<string>;\n\
+             /** 发一条文本。 */\n\
+             export function wsSend(id: string, text: string): Promise<void>;\n\
+             /** 收一条：{{ type, data, closed }}，type 为 text/binary/close。 */\n\
+             export function wsRecv(\n\
+               id: string,\n\
+               timeout_ms?: number,\n\
+             ): Promise<{{ type: string; data: string; closed: boolean }}>;\n\
+             /** 关闭 WebSocket。 */\n\
+             export function wsClose(id: string): Promise<boolean>;\n\
              export function busy(): boolean;\n\
              /**\n\
               * 执行一条写语句（INSERT / UPDATE / DELETE / DDL）。\n\
@@ -318,6 +400,120 @@ fn zex_module(
         })
         .function("busy", move |_| {
             Ok(HostValue::from(busy_bridge.is_waiting(&busy_session)))
+        })
+        .async_function("httpRequest", {
+            let (approved, app, registry, ready) = (
+                approvals.clone(),
+                app.clone(),
+                nets.clone(),
+                net_handle.clone(),
+            );
+            move |args| {
+                let spec = http_spec(args.get(0))?;
+                gate(&approved, &app)?;
+                let hub = net_hub(&registry, &app, ready.clone())?;
+                Ok(async move {
+                    let out = hub.http(spec).await.map_err(HostError::from)?;
+                    Ok(HostValue::Object(vec![
+                        ("status".into(), HostValue::Number(f64::from(out.status))),
+                        ("ok".into(), HostValue::Bool(out.is_ok())),
+                        ("headers".into(), header_pairs(out.headers)),
+                        ("body".into(), HostValue::from(out.body)),
+                        ("truncated".into(), HostValue::Bool(out.truncated)),
+                    ]))
+                })
+            }
+        })
+        .async_function("tcpConnect", {
+            let (approved, app, registry, ready) =
+                (approvals.clone(), app.clone(), nets.clone(), net_handle.clone());
+            move |args| {
+                let host = args.string(0)?.to_string();
+                let port = args.integer(1)? as u16;
+                gate(&approved, &app)?;
+                let hub = net_hub(&registry, &app, ready.clone())?;
+                Ok(async move {
+                    let id = hub.tcp_connect(&host, port).await.map_err(HostError::from)?;
+                    Ok(HostValue::from(id))
+                })
+            }
+        })
+        .async_function("tcpSend", {
+            let (app, registry, ready) = (app.clone(), nets.clone(), net_handle.clone());
+            move |args| {
+                let id = args.string(0)?.to_string();
+                let data = args.string(1)?.to_string();
+                let hub = net_hub(&registry, &app, ready.clone())?;
+                Ok(async move {
+                    let n = hub.tcp_send(&id, &data).await.map_err(HostError::from)?;
+                    Ok(HostValue::Number(n as f64))
+                })
+            }
+        })
+        .async_function("tcpRecv", {
+            let (app, registry, ready) = (app.clone(), nets.clone(), net_handle.clone());
+            move |args| {
+                let id = args.string(0)?.to_string();
+                let wait = args.get(1).and_then(|v| v.as_number()).map(|n| n as u64);
+                let hub = net_hub(&registry, &app, ready.clone())?;
+                Ok(async move {
+                    let r = hub.tcp_recv(&id, wait).await.map_err(HostError::from)?;
+                    Ok(recv_value(r))
+                })
+            }
+        })
+        .async_function("tcpClose", {
+            let (app, registry, ready) = (app.clone(), nets.clone(), net_handle.clone());
+            move |args| {
+                let id = args.string(0)?.to_string();
+                let hub = net_hub(&registry, &app, ready.clone())?;
+                Ok(async move { Ok(HostValue::Bool(hub.tcp_close(&id).await)) })
+            }
+        })
+        .async_function("wsConnect", {
+            let (approved, app, registry, ready) =
+                (approvals.clone(), app.clone(), nets.clone(), net_handle.clone());
+            move |args| {
+                let url = args.string(0)?.to_string();
+                gate(&approved, &app)?;
+                let hub = net_hub(&registry, &app, ready.clone())?;
+                Ok(async move {
+                    let id = hub.ws_connect(&url).await.map_err(HostError::from)?;
+                    Ok(HostValue::from(id))
+                })
+            }
+        })
+        .async_function("wsSend", {
+            let (app, registry, ready) = (app.clone(), nets.clone(), net_handle.clone());
+            move |args| {
+                let id = args.string(0)?.to_string();
+                let text = args.string(1)?.to_string();
+                let hub = net_hub(&registry, &app, ready.clone())?;
+                Ok(async move {
+                    hub.ws_send(&id, &text).await.map_err(HostError::from)?;
+                    Ok(HostValue::Null)
+                })
+            }
+        })
+        .async_function("wsRecv", {
+            let (app, registry, ready) = (app.clone(), nets.clone(), net_handle.clone());
+            move |args| {
+                let id = args.string(0)?.to_string();
+                let wait = args.get(1).and_then(|v| v.as_number()).map(|n| n as u64);
+                let hub = net_hub(&registry, &app, ready.clone())?;
+                Ok(async move {
+                    let r = hub.ws_recv(&id, wait).await.map_err(HostError::from)?;
+                    Ok(recv_value(r))
+                })
+            }
+        })
+        .async_function("wsClose", {
+            let (app, registry, ready) = (app.clone(), nets.clone(), net_handle.clone());
+            move |args| {
+                let id = args.string(0)?.to_string();
+                let hub = net_hub(&registry, &app, ready.clone())?;
+                Ok(async move { Ok(HostValue::Bool(hub.ws_close(&id).await)) })
+            }
         })
         .async_function("dbExec", {
             let dbs = dbs.clone();
@@ -372,6 +568,118 @@ fn zex_module(
                 })
             }
         })
+}
+
+/// 网络闸门：这个应用的能力申请被批准了吗。
+///
+/// 批准是**用户动作**，不是清单自说自话。模型能写清单，所以清单只能
+/// 表达"我想要什么"；真正放行要人在设置页点一下。已经批准的集合放在
+/// 共享表里，点完立刻生效，不用重启。
+fn gate(
+    approved: &Arc<Mutex<std::collections::HashSet<String>>>,
+    app: &str,
+) -> std::result::Result<(), HostError> {
+    let ok = approved
+        .lock()
+        .map(|g| g.contains(app))
+        .unwrap_or(false);
+    if ok {
+        Ok(())
+    } else {
+        Err(HostError::from(format!(
+            "应用 `{app}` 的能力申请还没被批准，网络不可用。             请让用户在「设置 → 应用」里点这个应用的「批准申请」"
+        )))
+    }
+}
+
+/// 取（必要时建）某个应用的网络世界。
+fn net_hub(
+    nets: &NetRegistry,
+    app: &str,
+    ready: Option<Arc<crate::net::NetHub>>,
+) -> std::result::Result<Arc<crate::net::NetHub>, HostError> {
+    let mut map = nets
+        .lock()
+        .map_err(|_| HostError::from("网络表中毒"))?;
+    if let Some(hub) = map.get(app) {
+        return Ok(hub.clone());
+    }
+    let Some(hub) = ready else {
+        return Err(HostError::from(
+            "这个应用没有可用的网络（清单里的 network.hosts 写法有误，或运行时建不起来）",
+        ));
+    };
+    map.insert(app.to_string(), hub.clone());
+    Ok(hub)
+}
+
+/// `httpRequest({...})` 的参数。
+fn http_spec(
+    value: Option<&HostValue>,
+) -> std::result::Result<crate::net::HttpRequest, HostError> {
+    let Some(HostValue::Object(entries)) = value else {
+        return Err(HostError::from("httpRequest 需要一个对象参数"));
+    };
+    let mut spec = crate::net::HttpRequest {
+        method: "GET".into(),
+        url: String::new(),
+        headers: Vec::new(),
+        body: None,
+        timeout_ms: None,
+    };
+    for (k, v) in entries {
+        match k.as_str() {
+            "url" => spec.url = v.as_str().unwrap_or_default().to_string(),
+            "method" => {
+                spec.method = v.as_str().unwrap_or("GET").to_string();
+            }
+            "body" => spec.body = v.as_str().map(str::to_string),
+            "timeout_ms" => spec.timeout_ms = v.as_number().map(|n| n as u64),
+            "headers" => {
+                if let HostValue::Array(items) = v {
+                    // 两种写法都收：[["k","v"]] 和 [{k,v}]
+                    for item in items {
+                        if let HostValue::Array(pair) = item {
+                            if let (Some(k), Some(val)) = (
+                                pair.first().and_then(|x| x.as_str()),
+                                pair.get(1).and_then(|x| x.as_str()),
+                            ) {
+                                spec.headers.push((k.to_string(), val.to_string()));
+                            }
+                        }
+                    }
+                } else if let HostValue::Object(pairs) = v {
+                    for (k, val) in pairs {
+                        if let Some(s) = val.as_str() {
+                            spec.headers.push((k.clone(), s.to_string()));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if spec.url.trim().is_empty() {
+        return Err(HostError::from("httpRequest 缺少 url"));
+    }
+    Ok(spec)
+}
+
+fn header_pairs(headers: Vec<(String, String)>) -> HostValue {
+    HostValue::Array(
+        headers
+            .into_iter()
+            .map(|(k, v)| HostValue::Array(vec![HostValue::from(k), HostValue::from(v)]))
+            .collect(),
+    )
+}
+
+fn recv_value(r: crate::net::Recv) -> HostValue {
+    HostValue::Object(vec![
+        ("type".into(), HostValue::from(r.kind)),
+        ("data".into(), HostValue::from(r.data)),
+        ("closed".into(), HostValue::Bool(r.closed)),
+    ])
 }
 
 /// 取（必要时打开）某个应用的库。
