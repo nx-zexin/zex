@@ -70,11 +70,47 @@ pub fn skills_dir() -> PathBuf {
     config_dir().join("skills")
 }
 
+/// 随二进制带的技能。
+///
+/// 编译进二进制而不是放资源目录：技能是「怎么用这个程序」的说明书，
+/// 它必须和程序版本一致。跟着安装包走，就不会出现"程序升级了、
+/// 说明书还是旧的"那种情况。
+const BUNDLED_SKILLS: &[(&str, &str)] = &[(
+    "write-extension.md",
+    include_str!("../assets/skills/write-extension.md"),
+)];
+
+/// 把随程序带的技能铺到磁盘（已有就跳过）。
+///
+/// 用 `create_new` 而不是 `write`：用户改过的版本必须留着。
+/// 说明书是起点，不是圣旨。
+fn install_bundled_skills(dir: &std::path::Path) {
+    for (name, body) in BUNDLED_SKILLS {
+        let path = dir.join(name);
+        if path.exists() {
+            continue;
+        }
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut f) => {
+                use std::io::Write as _;
+                let _ = f.write_all(body.as_bytes());
+            }
+            // 写不进去不当错误：技能库少了这一条，其它照常
+            Err(e) => tracing::warn!(skill = name, error = %e, "无法安装内置技能"),
+        }
+    }
+}
+
 /// 加载技能库。
 pub fn load_skills() -> std::sync::Arc<zex_skill::SkillRegistry> {
     let dir = skills_dir();
     // 首次运行时建好目录：用户要放技能文件进去，得先有个地方放
     let _ = std::fs::create_dir_all(&dir);
+    install_bundled_skills(&dir);
     std::sync::Arc::new(zex_skill::SkillRegistry::load(&dir))
 }
 
@@ -776,5 +812,42 @@ mod control_panel_tests {
             }
             other => panic!("事件类型不对: {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod skills_tests {
+    use super::*;
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "zex-skills-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn bundled_skill_is_installed_once() {
+        let dir = temp_dir("install");
+        install_bundled_skills(&dir);
+        let path = dir.join("write-extension.md");
+        assert!(path.exists(), "内置技能应被铺到磁盘");
+        let once = std::fs::read_to_string(&path).unwrap();
+        assert!(once.contains("write-extension") || once.contains("给 zex 写扩展"));
+    }
+
+    #[test]
+    fn user_edited_copy_is_never_overwritten() {
+        let dir = temp_dir("keep");
+        let path = dir.join("write-extension.md");
+        // 用户改过的版本
+        std::fs::write(&path, "---\nname: mine\ndescription: 我改过的\n---\n\n别动我\n").unwrap();
+        install_bundled_skills(&dir);
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.contains("别动我"), "内置技能不该覆盖用户改过的版本");
     }
 }
