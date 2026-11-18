@@ -176,6 +176,8 @@ cargo run -p zex-app --bin zex-cli -- "看看当前目录是什么项目"
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)：分层、双世界桥接、agent loop、数据层
 - [docs/SECURITY.md](docs/SECURITY.md)：四档风险、审批、审计、提示注入
 - [docs/EXTENSIONS.md](docs/EXTENSIONS.md)：应用系统与网络授权的设计依据
+- [skills/write-extension.md](skills/write-extension.md)：写应用的说明书。编译进二进制，启动时铺到
+  `~/.zex/skills`，模型按需用 `load_skill` 读取
 - [docs/DECISIONS.md](docs/DECISIONS.md)：架构决策记录，包含被否决的方案
 - [docs/PLATFORM.md](docs/PLATFORM.md)：三平台策略与能力矩阵
 - [docs/M1-REPORT.md](docs/M1-REPORT.md)：权限、持久化、压缩与界面的实现记录与实测结果

@@ -79,7 +79,7 @@ pub fn skills_dir() -> PathBuf {
 /// 说明书还是旧的"那种情况。
 const BUNDLED_SKILLS: &[(&str, &str)] = &[(
     "write-extension.md",
-    include_str!("../assets/skills/write-extension.md"),
+    include_str!("../../../skills/write-extension.md"),
 )];
 
 /// 记录"我们上次铺下去的是什么"，用来分辨用户改没改。
