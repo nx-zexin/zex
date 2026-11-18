@@ -150,6 +150,18 @@ struct SubAgentPanel {
     streaming: Option<String>,
 }
 
+/// 校验窗口的占位根视图。
+///
+/// `ShellRuntime::check` 会把这个根换成自己的探针树，所以它长什么样无所谓 ——
+/// 只要是个合法的 `Render`。存在的意义只是让 `open_window` 有个东西可返回。
+struct CheckProbe;
+
+impl Render for CheckProbe {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+    }
+}
+
 /// 右侧面板的一个标签页。
 enum PanelTab {
     /// 子智能体执行过程。
@@ -1837,6 +1849,12 @@ impl ChatView {
     }
 
     fn handle_event(&mut self, ev: CoreEvent, cx: &mut Context<Self>) {
+        // 扩展自检请求：工具那边在等回音，必须由 UI 线程画一帧才答得出来
+        if let CoreEvent::ExtensionCheck { id, app_id } = &ev {
+            let (id, app_id) = (id.clone(), app_id.clone());
+            self.run_extension_check(&id, &app_id, cx);
+            return;
+        }
         // 扩展的会话先认领：它的事件不该进主对话，也不该进子智能体面板
         if self.mirror_to_extension(&ev, cx) {
             cx.notify();
@@ -1848,6 +1866,8 @@ impl ChatView {
             return;
         }
         match ev {
+            // 上面已经提前处理并 return，这里只是让 match 穷尽
+            CoreEvent::ExtensionCheck { .. } => {}
             CoreEvent::Transcribed { text, error } => {
                 self.transcribing = false;
                 match (text, error) {
@@ -3384,6 +3404,90 @@ impl ChatView {
             format!("已取消固定 `{id}`")
         };
         self.persist_config(msg, cx);
+    }
+
+    /// 跑一次扩展自检，把结论交回给等着的工具。
+    ///
+    /// 为什么要开一个**隐藏窗口**：`ShellRuntime::check` 内部会
+    /// `replace_root` 再 `draw` 一帧，而且用完不还原 —— 拿主窗口去调
+    /// 会把用户界面换掉。所以给它一个用完就扔的窗口。
+    fn run_extension_check(&mut self, req_id: &str, app_id: &str, cx: &mut Context<Self>) {
+        let dir = zex_extension::extensions_dir().join(app_id);
+        if !dir.is_dir() {
+            zex_extension::check::deliver(
+                req_id,
+                zex_extension::CheckReport::failed(format!(
+                    "目录不存在：{}（扩展 id 要和 ~/.zex/extensions 下的目录名一致）",
+                    dir.display()
+                )),
+            );
+            return;
+        }
+        // 校验可能比「打开」先发生（模型写完就想验），所以这里重新扫一遍：
+        // 用启动时的快照会找不到刚生成出来的目录
+        self.extensions = zex_extension::scan_default();
+        let Some(ext) = self.extensions.iter().find(|e| e.id == app_id).cloned() else {
+            zex_extension::check::deliver(
+                req_id,
+                zex_extension::CheckReport::failed(format!(
+                    "目录存在但没有解析出扩展 `{app_id}`：检查 gpui-shell.json 是否存在且 id 一致"
+                )),
+            );
+            return;
+        };
+
+        // 宿主没建就先建：校验也要有 VM 才能求值脚本
+        if self.ext_host.is_none() {
+            let bridge = zex_extension::AgentBridge::new(self.cmd_tx.clone());
+            match zex_extension::ExtensionHost::new(cx, bridge) {
+                Ok(h) => self.ext_host = Some(std::rc::Rc::new(h)),
+                Err(e) => {
+                    zex_extension::check::deliver(
+                        req_id,
+                        zex_extension::CheckReport::failed(format!("无法初始化扩展运行时：{e}")),
+                    );
+                    return;
+                }
+            }
+        }
+        let Some(host) = self.ext_host.clone() else {
+            zex_extension::check::deliver(
+                req_id,
+                zex_extension::CheckReport::failed("扩展运行时不可用"),
+            );
+            return;
+        };
+
+        let opts = WindowOptions {
+            // 不显示、不抢焦点：它只是给 check 提供一帧的载体
+            show: false,
+            focus: false,
+            window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                point(px(0.0), px(0.0)),
+                size(px(200.0), px(200.0)),
+            ))),
+            ..Default::default()
+        };
+        let opened = cx.open_window(opts, |_window, cx| cx.new(|_| CheckProbe));
+        let handle = match opened {
+            Ok(h) => h,
+            Err(e) => {
+                zex_extension::check::deliver(
+                    req_id,
+                    zex_extension::CheckReport::failed(format!("无法创建校验窗口：{e}")),
+                );
+                return;
+            }
+        };
+
+        let report = handle
+            .update(cx, |_, window, cx| host.check(&ext, window, cx))
+            .unwrap_or_else(|_| {
+                zex_extension::CheckReport::failed("校验窗口已失效")
+            });
+        // 用完立刻关掉：隐藏窗口也是窗口，留着会占资源和平台句柄
+        let _ = handle.update(cx, |_, window, _| window.remove_window());
+        zex_extension::check::deliver(req_id, report);
     }
 
     /// 打开（或切到）一个扩展面板。

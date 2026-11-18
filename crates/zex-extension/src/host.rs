@@ -131,6 +131,31 @@ impl ExtensionHost {
         }
     }
 
+    /// 校验一个扩展能否加载并物化出第一帧。
+    ///
+    /// **必须传一个隐藏窗口的 `Window`。** 上游的 `check` 内部会
+    /// `replace_root` 再 `draw` 一帧，用完不还原 —— 拿主窗口去调
+    /// 会把用户界面换成一棵探针树。
+    pub fn check(
+        &self,
+        ext: &Extension,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> crate::check::CheckReport {
+        // 先把 `zex.<id>` 模块装好再求值。
+        //
+        // 少了这一步，任何 `import { ask } from "zex.demo"` 的扩展都会
+        // 被误判成 "cannot resolve module" —— 错误看起来像扩展写坏了，
+        // 实际是校验环境缺了一块。校验要和真实加载走同一套准备。
+        if let Err(e) = self.install_module(ext) {
+            return crate::check::CheckReport::failed(e.to_string());
+        }
+        match self.runtime.check(&ext.dir, window, cx) {
+            Ok(tree) => crate::check::CheckReport::ok(tree),
+            Err(e) => crate::check::CheckReport::failed(e.to_string()),
+        }
+    }
+
     /// 给这个扩展注册 `zex.<id>` 模块。
     fn install_module(&self, ext: &Extension) -> Result<()> {
         let module = zex_module(ext, self.bridge.clone(), self.replies.clone());

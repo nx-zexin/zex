@@ -9,6 +9,7 @@
 #![warn(missing_docs)]
 
 pub mod config;
+pub mod ext_tools;
 pub mod models_dev;
 
 use std::path::PathBuf;
@@ -376,6 +377,9 @@ pub fn spawn_core(
     // 面板开关：和团队工具同一批注册，因为它俩是一件事的两半 ——
     // 派了活、看进度、把人叫出来
     tools.push(Arc::new(ControlPanel::new(ev_tx.clone())));
+    // 扩展自检：要 UI 线程画一帧才能验证脚本，所以和面板开关一样走事件通道。
+    // 只在 GUI 路径挂（CLI 没有窗口，挂上只会等超时）。
+    tools.push(Arc::new(ext_tools::ExtensionCheck::new(ev_tx.clone())));
     registry.install(
         cfg.clone(),
         tools.clone(),

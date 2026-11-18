@@ -26,11 +26,15 @@
 
 pub mod bridge;
 pub mod catalog;
+#[cfg(feature = "ui")]
+pub mod check;
 
 #[cfg(feature = "ui")]
 pub mod host;
 
 pub use bridge::{AgentBridge, Reply};
+#[cfg(feature = "ui")]
+pub use check::CheckReport;
 #[cfg(feature = "ui")]
 pub use host::ExtensionHost;
 #[cfg(feature = "ui")]
