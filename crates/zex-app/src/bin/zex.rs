@@ -3372,6 +3372,20 @@ impl ChatView {
         body.into_any_element()
     }
 
+    /// 固定 / 取消固定某个扩展到侧边栏，并写回配置。
+    ///
+    /// 只存 id：扩展叫什么、装在哪，都以目录扫描为准。
+    /// 所以这里不校验 id 是否存在 —— 固定了但没装，侧栏不显示就是了。
+    fn toggle_pin(&mut self, id: &str, cx: &mut Context<Self>) {
+        let pinned = zex_app::config::toggle_pinned(&mut self.config.pinned_extensions, id);
+        let msg = if pinned {
+            format!("已把 `{id}` 固定到侧边栏")
+        } else {
+            format!("已取消固定 `{id}`")
+        };
+        self.persist_config(msg, cx);
+    }
+
     /// 打开（或切到）一个扩展面板。
     ///
     /// 第一次调会建宿主、加载脚本；已存在的标签只切过去。
@@ -5297,6 +5311,7 @@ impl ChatView {
 
         for ext in &self.extensions {
             let id = ext.id.clone();
+            let is_pinned = self.config.pinned_extensions.iter().any(|x| x == &ext.id);
             let open = self.right_panel.as_ref().is_some_and(|rp| {
                 rp.tabs.iter().any(|t| t.key() == format!("ext:{}", ext.id))
             });
@@ -5344,6 +5359,31 @@ impl ChatView {
                             ),
                     )
                     .child(div().flex_1())
+                    // 侧边栏占位开关。放按钮左边、用文字链的样式：
+                    // 它是个"设置项"，和右边的"打开"不是一类动作
+                    .child({
+                        let id = ext.id.clone();
+                        let pinned = is_pinned;
+                        div()
+                            .text_xs()
+                            .px_2()
+                            .py_1()
+                            .rounded(px(5.0))
+                            .cursor_pointer()
+                            .text_color(rgb(if pinned { OK } else { TEXT_DIM }))
+                            .hover(|st| st.bg(rgb(BG_HOVER)).text_color(rgb(BRAND)))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _: &MouseDownEvent, _w, cx| {
+                                    this.toggle_pin(&id, cx);
+                                }),
+                            )
+                            .child(if pinned {
+                                "✓ 已固定到边栏"
+                            } else {
+                                "固定到边栏"
+                            })
+                    })
                     .child(
                         Button::new(ElementId::Name(format!("ext-open-{id}").into()))
                             .primary()
@@ -5680,6 +5720,113 @@ impl ChatView {
         col.into_any_element()
     }
 
+    /// 侧边栏底部的扩展入口：一个固定入口 + 已固定的扩展。
+    ///
+    /// 为什么放在会话列表下面而不是上面：会话是主线，扩展是工具。
+    /// 工具压在底部、只露已固定那几个，才不至于把会话标题挤走。
+    ///
+    /// 没固定任何扩展时也保留"扩展"这一行 —— 它是这个功能唯一的常驻入口，
+    /// 藏起来的话用户永远找不到第二次。
+    fn render_sidebar_extensions(&self, cx: &mut Context<Self>) -> AnyElement {
+        let mut col = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .px_3()
+            .pt_2()
+            .pb_2()
+            .border_t_1()
+            .border_color(rgb(BORDER_SOFT));
+
+        // 入口行：去扩展设置页
+        col = col.child(
+            div()
+                .w_full()
+                .h(px(32.0))
+                .rounded(px(8.0))
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_3()
+                .text_sm()
+                .text_color(rgb(TEXT_MUTED))
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(BG_HOVER)))
+                .child(
+                    Icon::new(IconName::Puzzle)
+                        .text_size(px(14.0))
+                        .text_color(rgb(TEXT_DIM)),
+                )
+                .child("扩展")
+                .child(div().flex_1())
+                // 已固定几个，就在右边标几个：一眼看出还有没有空位
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(TEXT_DIM))
+                        .child(match self.config.pinned_extensions.len() {
+                            0 => String::new(),
+                            n => format!("{n} 个"),
+                        }),
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseDownEvent, _w, cx| {
+                        this.settings = Some(SettingsTab::Extension);
+                        cx.notify();
+                    }),
+                ),
+        );
+
+        // 已固定的扩展。配置里有、目录里没了的一律跳过（卸载后残留）
+        for ext in &self.extensions {
+            if !self.config.pinned_extensions.iter().any(|x| x == &ext.id) {
+                continue;
+            }
+            let id = ext.id.clone();
+            let open = self.right_panel.as_ref().is_some_and(|rp| {
+                rp.tabs.iter().any(|t| t.key() == format!("ext:{id}"))
+            });
+            let mut row = div()
+                .w_full()
+                .h(px(32.0))
+                .rounded(px(8.0))
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_3()
+                .text_sm()
+                .cursor_pointer()
+                .text_color(rgb(if open { TEXT } else { TEXT_MUTED }));
+            // 已经开着的那一页给个底色，和会话列表的选中态一致
+            if open {
+                row = row.bg(rgb(BG_HOVER));
+            }
+            col = col.child(
+                row
+                    .hover(|s| s.bg(rgb(BG_HOVER)))
+                    .child(
+                        div()
+                            .size(px(6.0))
+                            .rounded_full()
+                            .flex_none()
+                            .bg(rgb(if open { BRAND } else { TEXT_DIM })),
+                    )
+                    .child(div().flex_1().min_w(px(0.0)).truncate().child(ext.name.clone()))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                            // 设置页开着就先收起来，否则面板被盖住、点了像没反应
+                            this.settings = None;
+                            this.open_extension(&id, window, cx);
+                        }),
+                    ),
+            );
+        }
+
+        col.into_any_element()
+    }
+
     fn render_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
         let mut list = div().flex().flex_col().gap_1().px_3();
 
@@ -5839,6 +5986,8 @@ impl ChatView {
                 ),
             )
             .child(div().flex_1().min_h(px(0.0)).child(list))
+            // 扩展入口 + 已固定的扩展
+            .child(self.render_sidebar_extensions(cx))
             // 底部图标
             .child(
                 div()

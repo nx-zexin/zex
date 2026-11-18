@@ -71,6 +71,13 @@ pub struct FileConfig {
     /// 连不上的只是不挂工具，不影响应用启动。
     #[serde(default)]
     pub mcp_servers: BTreeMap<String, zex_mcp::ServerConfig>,
+    /// 固定到侧边栏的扩展 id，按固定顺序排列。
+    ///
+    /// 存的是 id 而不是完整清单：扩展装在哪、叫什么，都以目录扫描为准。
+    /// 这里只是「用户希望它在侧边栏露头」这一条意见，
+    /// 所以扩展被卸掉之后，这里残留的 id 会被安静地忽略。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pinned_extensions: Vec<String>,
 }
 
 /// 解析后的运行时配置。
@@ -338,6 +345,23 @@ pub fn upsert_provider(
     }
     cfg.providers.insert(name.to_string(), entry);
     Ok(())
+}
+
+/// 把某个扩展 id 加进/移出固定列表，返回**操作后**是否固定。
+///
+/// 抽成纯函数是为了能单独测：固定列表是"用户偏好"，它出错的表现是
+/// 侧边栏莫名其妙多一行或少一行，光看界面很难判断是扫描的问题还是配置的问题。
+pub fn toggle_pinned(pinned: &mut Vec<String>, id: &str) -> bool {
+    match pinned.iter().position(|x| x == id) {
+        Some(i) => {
+            pinned.remove(i);
+            false
+        }
+        None => {
+            pinned.push(id.to_string());
+            true
+        }
+    }
 }
 
 /// 删除一个 provider，并在必要时挪走默认模型指针。
@@ -659,5 +683,39 @@ mod tests {
         let p: ModelParams = serde_json::from_str(json).expect("应能解析");
         assert_eq!(p.temperature, Some(0.7));
         assert_eq!(p.max_tokens, None, "没写的字段应保持 None，而不是 0");
+    }
+
+    #[test]
+    fn pinning_toggles_and_reports_new_state() {
+        let mut pinned: Vec<String> = Vec::new();
+        assert!(toggle_pinned(&mut pinned, "demo"), "第一次是固定");
+        assert_eq!(pinned, ["demo"]);
+        assert!(!toggle_pinned(&mut pinned, "demo"), "第二次是取消");
+        assert!(pinned.is_empty());
+    }
+
+    #[test]
+    fn pinning_keeps_order_and_ignores_duplicates() {
+        let mut pinned = vec!["a".to_string(), "b".to_string()];
+        // 已固定过的再 toggle 一次是取消，不会插出第二份
+        assert!(!toggle_pinned(&mut pinned, "a"));
+        assert_eq!(pinned, ["b"]);
+        assert!(toggle_pinned(&mut pinned, "c"));
+        // 顺序按固定先后，不排序 —— 用户摆的顺序就是他要的顺序
+        assert_eq!(pinned, ["b", "c"]);
+    }
+
+    #[test]
+    fn empty_pin_list_is_not_serialized() {
+        let cfg = FileConfig::default();
+        let s = serde_json::to_string(&cfg).unwrap();
+        assert!(!s.contains("pinned_extensions"), "空列表不该写进文件：{s}");
+    }
+
+    #[test]
+    fn old_config_without_pin_field_still_loads() {
+        // 老版本写的 config.json 里没有这个字段，必须能照常读
+        let cfg: FileConfig = serde_json::from_str(r#"{"default_model":"a/b"}"#).unwrap();
+        assert!(cfg.pinned_extensions.is_empty());
     }
 }
