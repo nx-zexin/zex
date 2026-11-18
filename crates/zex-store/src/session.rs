@@ -116,6 +116,8 @@ impl Store {
                     "SELECT id, title, model, cwd, created_at, updated_at, mode
                      FROM sessions
                      WHERE id NOT IN (SELECT session_id FROM sub_agents)
+                       -- 扩展面板的会话：它自己有一页界面，不必再占一行
+                       AND id NOT LIKE 'ext-%'
                      ORDER BY updated_at DESC LIMIT ?1",
                 )
                 .map_err(|e| Error::Store(e.to_string()))?;
@@ -137,6 +139,30 @@ impl Store {
                 out.push(row.map_err(|e| Error::Store(e.to_string()))?);
             }
             Ok(out)
+        })
+    }
+
+    /// 按**指定 id** 建会话，已存在则什么都不做。
+    ///
+    /// 给那些"身份由外部决定"的会话用：扩展面板的会话 id 必须可预测
+    /// （`ext-<id>`），因为 UI 拿它做事件分流。`create_session` 自己
+    /// 生成 uuid，满足不了这个要求。
+    pub fn ensure_session(
+        &self,
+        id: &SessionId,
+        title: &str,
+        model: &str,
+        cwd: &str,
+    ) -> Result<()> {
+        let ts = now();
+        self.with_conn(|c| {
+            c.execute(
+                "INSERT OR IGNORE INTO sessions (id, title, model, cwd, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+                params![id.as_str(), title, model, cwd, ts],
+            )
+            .map_err(|e| Error::Store(format!("建会话失败: {e}")))?;
+            Ok(())
         })
     }
 

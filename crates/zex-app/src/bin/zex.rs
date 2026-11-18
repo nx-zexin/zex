@@ -156,6 +156,26 @@ enum PanelTab {
     SubAgent(SubAgentPanel),
     /// 文件预览。
     File(FilePreview),
+    /// 扩展面板（gpui-shell 脚本画的界面）。
+    Extension(ExtensionPanel),
+}
+
+/// 一个已挂载的扩展面板。
+struct ExtensionPanel {
+    /// 扩展 id。
+    id: String,
+    /// 展示名，用于标签。
+    name: String,
+    /// 它专用的会话 id（`ext-<id>`）。事件按它归位。
+    session: String,
+    /// 脚本 View。`None` = 还没挂上 / 挂失败。
+    view: Option<gpui::Entity<zex_extension::ScriptView>>,
+    /// 挂载失败的原因。
+    error: Option<String>,
+    /// 正在把这个扩展的回复攒起来。
+    streaming: Option<String>,
+    /// 状态栏文字。
+    status: String,
 }
 
 impl PanelTab {
@@ -171,6 +191,7 @@ impl PanelTab {
                 .next()
                 .unwrap_or(f.display.as_str())
                 .to_string(),
+            PanelTab::Extension(e) => e.name.clone(),
         }
     }
 
@@ -179,6 +200,7 @@ impl PanelTab {
         match self {
             PanelTab::SubAgent(p) => format!("agent:{}", p.session),
             PanelTab::File(f) => format!("file:{}", f.path),
+            PanelTab::Extension(e) => format!("ext:{}", e.id),
         }
     }
 }
@@ -244,6 +266,8 @@ enum SettingsTab {
     Skill,
     /// MCP 服务（预留）。
     Mcp,
+    /// 扩展（gpui-shell 脚本面板）。
+    Extension,
     /// 版本、路径等信息。
     About,
 }
@@ -391,6 +415,15 @@ struct ChatView {
     /// 从目录里选一家就带进十几个模型，anthropic 十八个、openrouter 四百多，
     /// 全铺出来会把其它 provider 顶出屏幕。
     models_expanded: std::collections::HashSet<String>,
+    /// 已安装的扩展（目录扫描结果）。
+    ///
+    /// 只在设置页打开时刷新：扫描目录要读文件，没必要每帧做。
+    extensions: Vec<zex_extension::Extension>,
+    /// 扩展宿主（首次打开扩展时才建）。
+    ///
+    /// 建它就要起一个 QuickJS VM（十几 MiB 内存），所以不跟着启动走 ——
+    /// 绝大多数会话用不到扩展。
+    ext_host: Option<std::rc::Rc<zex_extension::ExtensionHost>>,
     /// 右侧子智能体面板的宽度（像素，可拖拽）。
     subagent_panel_width: f32,
     /// 正在拖面板边框。
@@ -539,6 +572,26 @@ impl ChatView {
             }
         }
 
+        // 测试钩子：ZEX_AUTO_EXTENSION=<id> 启动后直接把那个扩展挂进右侧面板。
+        //
+        // 扩展开、关、加载失败这几条路都得有人跑一遍。靠截图点鼠标验证
+        // 在无头环境里会卡在"点不到"上，所以给它一个确定性的入口。
+        if let Ok(id) = std::env::var("ZEX_AUTO_EXTENSION") {
+            if !id.trim().is_empty() {
+                cx.spawn_in(window, async move |this, cx| {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(800))
+                        .await;
+                    this.update_in(cx, |this, window, cx| {
+                        this.settings = None;
+                        this.open_extension(&id, window, cx);
+                    })
+                    .ok();
+                })
+                .detach();
+            }
+        }
+
         let scroller = cx.new(|cx| MessageScrollerState::new(history.len(), cx));
 
         // 打开就先看工作台：用户想知道「我不在的时候发生了什么」
@@ -614,6 +667,8 @@ impl ChatView {
             history_draft: String::new(),
             expanded_tools: std::collections::HashSet::new(),
             models_expanded: std::collections::HashSet::new(),
+            extensions: zex_extension::scan_default(),
+            ext_host: None,
             subagent_panel_width: DEFAULT_PANEL_WIDTH,
             subagent_resizing: false,
             subagent_drag_origin: (0.0, 0.0),
@@ -651,6 +706,7 @@ impl ChatView {
             view.settings = Some(match tab.as_str() {
                 "skill" => SettingsTab::Skill,
                 "mcp" => SettingsTab::Mcp,
+                "extension" | "ext" => SettingsTab::Extension,
                 "about" => SettingsTab::About,
                 _ => SettingsTab::Model,
             });
@@ -1781,6 +1837,11 @@ impl ChatView {
     }
 
     fn handle_event(&mut self, ev: CoreEvent, cx: &mut Context<Self>) {
+        // 扩展的会话先认领：它的事件不该进主对话，也不该进子智能体面板
+        if self.mirror_to_extension(&ev, cx) {
+            cx.notify();
+            return;
+        }
         // 面板正在看的那个子智能体，它的事件直接喂给面板
         if self.mirror_to_panel(&ev) {
             cx.notify();
@@ -3059,6 +3120,12 @@ impl ChatView {
                     _ => (TEXT_DIM, BG_HOVER),
                 },
                 PanelTab::File(_) => (TEXT_DIM, BG_HOVER),
+                PanelTab::Extension(e) => match e.status.as_str() {
+                    "运行中" => (BRAND, BRAND_SOFT),
+                    "就绪" => (OK, OK_SOFT),
+                    "失败" => (DANGER, DANGER_SOFT),
+                    _ => (TEXT_DIM, BG_HOVER),
+                },
             };
 
             let chip = div()
@@ -3124,6 +3191,7 @@ impl ChatView {
         let body = match &rp.tabs[active] {
             PanelTab::SubAgent(p) => self.render_agent_body(p, cx),
             PanelTab::File(f) => self.render_file_body(f),
+            PanelTab::Extension(e) => self.render_extension_body(e, cx),
         };
 
         // 左边缘的拖拽手柄：5px 宽，够点中又不占地方。
@@ -3226,6 +3294,220 @@ impl ChatView {
             )
             .child(body)
             .into_any_element()
+    }
+
+    /// 扩展页：脚本画的界面，本体直接占满。
+    ///
+    /// 挂载失败时不是白屏：错误信息摆在这里，其它面板照常工作 ——
+    /// 一个写坏的扩展不该拖垮宿主。
+    fn render_extension_body(&self, e: &ExtensionPanel, cx: &mut Context<Self>) -> AnyElement {
+        let _ = cx;
+        if let Some(err) = &e.error {
+            return div()
+                .id(ElementId::Name(format!("ext-err-{}", e.id).into()))
+                .flex_1()
+                .min_h(px(0.0))
+                .overflow_y_scroll()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .p_4()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(DANGER))
+                        .child(format!("扩展 `{}` 未能加载", e.id)),
+                )
+                .child(
+                    div()
+                        .font_family(MONO)
+                        .text_xs()
+                        .text_color(rgb(TEXT_MUTED))
+                        .child(err.clone()),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(TEXT_DIM))
+                        .child(format!(
+                            "目录：{}",
+                            zex_extension::extensions_dir().join(&e.id).display()
+                        )),
+                )
+                .into_any_element();
+        }
+
+        let Some(view) = &e.view else {
+            return div()
+                .flex_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_xs()
+                .text_color(rgb(TEXT_DIM))
+                .child("正在加载…")
+                .into_any_element();
+        };
+
+        // 脚本 View 就是一个普通元素，直接占满面板
+        let mut body = div()
+            .flex_1()
+            .min_h(px(0.0))
+            .flex()
+            .flex_col()
+            .child(div().flex_1().min_h(px(0.0)).child(view.clone()));
+        if !e.status.is_empty() {
+            body = body.child(
+                div()
+                    .border_t_1()
+                    .border_color(rgb(BORDER_SOFT))
+                    .px_3()
+                    .py_1()
+                    .text_xs()
+                    .text_color(rgb(TEXT_DIM))
+                    .child(e.status.clone()),
+            );
+        }
+        body.into_any_element()
+    }
+
+    /// 打开（或切到）一个扩展面板。
+    ///
+    /// 第一次调会建宿主、加载脚本；已存在的标签只切过去。
+    fn open_extension(
+        &mut self,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(ext) = self.extensions.iter().find(|e| e.id == id).cloned() else {
+            self.status = format!("没有名为 `{id}` 的扩展");
+            cx.notify();
+            return false;
+        };
+
+        let session = ext.session_id();
+        let key = format!("ext:{id}");
+        if let Some(rp) = &mut self.right_panel {
+            if let Some(i) = rp.tabs.iter().position(|t| t.key() == key) {
+                rp.active = i;
+                cx.notify();
+                return true;
+            }
+        }
+
+        // 会话必须先落库：tasks 表对 sessions 有外键，
+        // 没有这一行的话 create_task 会静默失败（`let _ =` 吞掉了）
+        let _ = self.store.ensure_session(
+            &zex_core::SessionId::from(session.as_str()),
+            &format!("扩展：{}", ext.name),
+            &self.model,
+            &self.cwd,
+        );
+
+        // 宿主按需建：一个 VM 是十几 MiB 常驻，不该跟着启动走
+        if self.ext_host.is_none() {
+            let bridge = zex_extension::AgentBridge::new(self.cmd_tx.clone());
+            match zex_extension::ExtensionHost::new(cx, bridge) {
+                Ok(h) => self.ext_host = Some(std::rc::Rc::new(h)),
+                Err(e) => {
+                    self.status = format!("无法初始化扩展运行时：{e}");
+                    cx.notify();
+                    return false;
+                }
+            }
+        }
+        let Some(host) = self.ext_host.clone() else {
+            return false;
+        };
+
+        // 挂载结果：成功就拿到 View，失败就把错误摆进面板
+        let (view, error) = match host.mount(&ext, window, cx) {
+            Ok(v) => (Some(v), None),
+            Err(e) => (None, Some(e.to_string())),
+        };
+        let status = if error.is_none() {
+            "就绪".to_string()
+        } else {
+            "失败".to_string()
+        };
+
+        let tab = PanelTab::Extension(ExtensionPanel {
+            id: ext.id.clone(),
+            name: ext.name.clone(),
+            session,
+            view,
+            error,
+            streaming: None,
+            status,
+        });
+        self.activate_or_push_tab(tab, cx);
+        true
+    }
+
+    /// 把扩展的流式输出/结束路由到它那个面板，并唤醒等回包的脚本。
+    ///
+    /// 返回 true 表示这个事件属于某个扩展，已经消费掉。
+    fn mirror_to_extension(&mut self, ev: &CoreEvent, cx: &mut Context<Self>) -> bool {
+        let (session, is_end) = match ev {
+            CoreEvent::TurnStarted { session, .. } => (session, false),
+            CoreEvent::Token { session, .. } => (session, false),
+            CoreEvent::TurnEnded { session, .. } => (session, true),
+            _ => return false,
+        };
+        let session = session.as_str().to_string();
+        // 只接扩展自己的会话：前缀是契约，不认前缀的会话归别处
+        if !session.starts_with("ext-") {
+            return false;
+        }
+        let Some(host) = self.ext_host.clone() else {
+            return false;
+        };
+        let Some(rp) = &mut self.right_panel else {
+            return false;
+        };
+        let Some(panel) = rp.tabs.iter_mut().find_map(|t| match t {
+            PanelTab::Extension(p) if p.session == session => Some(p),
+            _ => None,
+        }) else {
+            return false;
+        };
+
+        match ev {
+            CoreEvent::TurnStarted { .. } => {
+                panel.status = "运行中".into();
+                panel.streaming = Some(String::new());
+            }
+            CoreEvent::Token { text, .. } => {
+                if let Some(buf) = panel.streaming.as_mut() {
+                    buf.push_str(text);
+                }
+            }
+            CoreEvent::TurnEnded { reason, .. } => {
+                let text = panel.streaming.take().unwrap_or_default();
+                panel.status = "就绪".into();
+                let reply = match reason {
+                    zex_core::event::EndReason::Completed => zex_extension::Reply::ok(text.clone()),
+                    other => {
+                        zex_extension::Reply::err(format!("这一轮没有正常结束：{other:?}"))
+                    }
+                };
+                // 唤醒还在 await 的脚本；没人在等就什么也不做
+                host.bridge().complete(&session, reply);
+                // 同时把结果交给宿主持有并重跑脚本 render：
+                // 脚本可能没在 await（比如只是轮询 reply()），
+                // 而 render 只在"描述过期"时才重跑，宿主改了状态就得明说一次
+                if let Some(view) = panel.view.clone() {
+                    host.deliver(&session, &text, &mut view.clone(), cx);
+                }
+            }
+            _ => {}
+        }
+        // `is_end` 目前只用于可读性：结束的分支已在 match 里处理
+        let _ = is_end;
+        let _ = cx;
+        true
     }
 
     /// 文件页：路径 + 内容（超长已截断）。
@@ -3564,10 +3846,11 @@ impl ChatView {
 
     /// 设置页：左侧分区导航，右侧内容。
     fn render_settings(&self, tab: SettingsTab, cx: &mut Context<Self>) -> AnyElement {
-        let items: [(SettingsTab, &str, &str); 4] = [
+        let items: [(SettingsTab, &str, &str); 5] = [
             (SettingsTab::Model, "模型", "provider 与默认模型"),
             (SettingsTab::Skill, "技能", "可复用的能力包"),
             (SettingsTab::Mcp, "MCP", "外部工具服务"),
+            (SettingsTab::Extension, "扩展", "脚本面板"),
             (SettingsTab::About, "关于", "版本与路径"),
         ];
 
@@ -3623,6 +3906,7 @@ impl ChatView {
             SettingsTab::Model => self.render_settings_model(cx),
             SettingsTab::Skill => self.render_settings_skill(cx),
             SettingsTab::Mcp => self.render_settings_mcp(cx),
+            SettingsTab::Extension => self.render_settings_extension(cx),
             SettingsTab::About => Self::render_settings_about(),
         };
 
@@ -4927,6 +5211,153 @@ impl ChatView {
     }
 
     /// 技能页：列出已加载的技能，说明怎么新增。
+    /// 扩展页：列出已安装的扩展，点开就挂到右侧面板。
+    fn render_settings_extension(&self, cx: &mut Context<Self>) -> AnyElement {
+        let dir = zex_extension::extensions_dir();
+        let mut col = div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .max_w(px(820.0))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        div()
+                            .text_lg()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(TEXT))
+                            .child("扩展"),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        Button::new("ext-rescan")
+                            .ghost()
+                            .compact()
+                            .label("重新扫描")
+                            .on_click(cx.listener(|this, _: &ClickEvent, _w, cx| {
+                                this.extensions = zex_extension::scan_default();
+                                this.status =
+                                    format!("已扫描到 {} 个扩展", this.extensions.len());
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(TEXT_DIM))
+                    .child(format!("目录：{}", dir.display())),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(TEXT_MUTED))
+                    .child(
+                        "每个扩展是一个子目录，里面放 gpui-shell.json（id / name / entry）\
+                         和脚本入口。脚本里用 `import { ask } from \"zex.<id>\"` 调用 agent。",
+                    ),
+            );
+
+        if self.extensions.is_empty() {
+            return col
+                .child(
+                    div()
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(rgb(BORDER))
+                        .bg(rgb(BG_TOOL))
+                        .p_4()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(rgb(TEXT_MUTED))
+                                .child("还没有任何扩展。"),
+                        )
+                        .child(
+                            div()
+                                .font_family(MONO)
+                                .text_xs()
+                                .text_color(rgb(TEXT_DIM))
+                                .child(format!(
+                                    "mkdir -p {}/demo && cd {} && \\\n  echo '{{\"id\":\"demo\",\"name\":\"示例\"}}' > gpui-shell.json && \\\n  touch main.js",
+                                    dir.join("demo").display(),
+                                    dir.join("demo").display()
+                                )),
+                        ),
+                )
+                .into_any_element();
+        }
+
+        for ext in &self.extensions {
+            let id = ext.id.clone();
+            let open = self.right_panel.as_ref().is_some_and(|rp| {
+                rp.tabs.iter().any(|t| t.key() == format!("ext:{}", ext.id))
+            });
+            col = col.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .bg(rgb(BG_MAIN))
+                    .p_4()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .min_w(px(0.0))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(rgb(TEXT))
+                                            .child(ext.name.clone()),
+                                    )
+                                    .child(pill(
+                                        ext.id.clone(),
+                                        BG_HOVER,
+                                        TEXT_MUTED,
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .font_family(MONO)
+                                    .text_xs()
+                                    .text_color(rgb(TEXT_DIM))
+                                    .truncate()
+                                    .child(ext.dir.display().to_string()),
+                            ),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        Button::new(ElementId::Name(format!("ext-open-{id}").into()))
+                            .primary()
+                            .compact()
+                            .label(if open { "切过去" } else { "打开" })
+                            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                this.open_extension(&id, window, cx);
+                            })),
+                    ),
+            );
+        }
+
+        col.into_any_element()
+    }
+
     fn render_settings_skill(&self, cx: &mut Context<Self>) -> AnyElement {
         let dir = zex_app::skills_dir();
         let mut col = div()

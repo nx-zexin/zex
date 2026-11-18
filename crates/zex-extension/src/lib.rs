@@ -21,6 +21,8 @@
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+// 测试代码允许 unwrap/expect：断言失败就该 panic，生产代码里才禁止。
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod bridge;
 pub mod catalog;
@@ -29,6 +31,10 @@ pub mod catalog;
 pub mod host;
 
 pub use bridge::{AgentBridge, Reply};
+#[cfg(feature = "ui")]
+pub use host::ExtensionHost;
+#[cfg(feature = "ui")]
+pub use gpui_shell::ScriptView;
 pub use catalog::{Extension, extensions_dir, scan, scan_default};
 
 /// 给脚本看的宿主模块名。

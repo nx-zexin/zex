@@ -37,7 +37,9 @@
 //! 窗口的焦点恢复和 Tab 导航 —— 和 zex 自己的 Esc 中断、Ctrl+R 历史搜索、
 //! 输入框回车都会打架。所以这里不套：扩展只能画内联界面。
 
+use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use gpui_kit::*;
 use gpui_shell::{Capabilities, HostModule, HostValue, ScriptView, ShellRuntime};
@@ -50,6 +52,13 @@ use crate::catalog::Extension;
 pub struct ExtensionHost {
     runtime: Rc<ShellRuntime>,
     bridge: AgentBridge,
+    /// 会话 id → 最后一次回复。
+    ///
+    /// 为什么宿主也要存一份：脚本 await 之后拿 `cx.notify()` 会撞上
+    /// "cx 属于那一次调用"的约束（跨 await 的 cx 是失效的）。
+    /// 让宿主把结果存下来、由宿主触发重绘，脚本在 render 里同步读取 ——
+    /// 这条路不需要跨 await 的 cx。
+    replies: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl ExtensionHost {
@@ -64,7 +73,11 @@ impl ExtensionHost {
         let runtime = ShellRuntime::new(cx)
             .map_err(|e| zex_core::Error::Other(format!("无法创建扩展运行时: {e}")))?;
 
-        Ok(Self { runtime, bridge })
+        Ok(Self {
+            runtime,
+            bridge,
+            replies: Arc::new(Mutex::new(HashMap::new())),
+        })
     }
 
     /// 到内核的桥（UI 侧要在 `TurnEnded` 时回调它）。
@@ -95,9 +108,32 @@ impl ExtensionHost {
             .map_err(|e| zex_core::Error::Other(format!("挂载失败: {e}")))
     }
 
+    /// 记下某个会话的最后一次回复，并刷新对应脚本 View。
+    ///
+    /// 由 UI 线程在 `TurnEnded` 时调用。刷新是必需的：脚本的 render
+    /// 只在"描述过期"时重跑，宿主改了脚本会读的状态就得明说一次。
+    pub fn deliver(&self, session: &str, text: &str, view: &mut gpui::Entity<ScriptView>, cx: &mut gpui::App) {
+        {
+            let mut held = match self.replies.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            held.insert(session.to_string(), text.to_string());
+        }
+        view.update(cx, |v, cx| v.refresh(cx));
+    }
+
+    /// 某个会话的最后一次回复。
+    pub fn reply_for(&self, session: &str) -> String {
+        match self.replies.lock() {
+            Ok(g) => g.get(session).cloned().unwrap_or_default(),
+            Err(poisoned) => poisoned.into_inner().get(session).cloned().unwrap_or_default(),
+        }
+    }
+
     /// 给这个扩展注册 `zex.<id>` 模块。
     fn install_module(&self, ext: &Extension) -> Result<()> {
-        let module = zex_module(ext, self.bridge.clone());
+        let module = zex_module(ext, self.bridge.clone(), self.replies.clone());
         module
             .validate()
             .map_err(|e| zex_core::Error::Other(format!("宿主模块声明与实现不一致: {e}")))?;
@@ -116,8 +152,12 @@ pub fn module_name(ext_id: &str) -> String {
 /// 边界是**纯数据**：进出都只有 null/布尔/数字/字符串/数组/对象，
 /// 不传任何脚本句柄，也不传 `Entity`。这不是洁癖 —— 句柄一旦被宿主留住，
 /// 就可能在下一次脚本调用时还活着，而它所属的调用栈早就没了。
-fn zex_module(ext: &Extension, bridge: AgentBridge) -> HostModule {
+fn zex_module(ext: &Extension, bridge: AgentBridge, replies: Arc<Mutex<HashMap<String, String>>>) -> HostModule {
     let ask_bridge = bridge.clone();
+    let reply_map = replies;
+    let reply_session = ext.session_id();
+    let busy_bridge = bridge.clone();
+    let busy_session = ext.session_id();
     // 会话在注册时就固定下来：这个模块只属于这一个扩展，
     // 谁调它都只可能代表这一个扩展说话
     let ask_session = ext.session_id();
@@ -132,7 +172,11 @@ fn zex_module(ext: &Extension, bridge: AgentBridge) -> HostModule {
              /** 本扩展的会话 id。 */\n\
              export function session(): string;\n\
              /** 本扩展的显示名。 */\n\
-             export function name(): string;\n",
+             export function name(): string;\n\
+             /** 最近一次 ask() 的回复（可同步读）。 */\n\
+             export function reply(): string;\n\
+             /** 是否有 ask() 还在等回包。 */\n\
+             export function busy(): boolean;\n",
         ))
         .async_function("ask", move |args| {
             let prompt = args.string(0)?.to_string();
@@ -152,5 +196,15 @@ fn zex_module(ext: &Extension, bridge: AgentBridge) -> HostModule {
         .function("name", {
             let t = ext.name.clone();
             move |_| Ok(HostValue::from(t.clone()))
+        })
+        .function("reply", move |_| {
+            let text = match reply_map.lock() {
+                Ok(g) => g.get(&reply_session).cloned().unwrap_or_default(),
+                Err(p) => p.into_inner().get(&reply_session).cloned().unwrap_or_default(),
+            };
+            Ok(HostValue::from(text))
+        })
+        .function("busy", move |_| {
+            Ok(HostValue::from(busy_bridge.is_waiting(&busy_session)))
         })
 }

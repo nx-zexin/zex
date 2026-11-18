@@ -25,6 +25,7 @@ zex-agent.workspace = true
 zex-tools.workspace = true
 zex-skill.workspace = true
 zex-mcp.workspace = true
+zex-extension.workspace = true
 zex-store.workspace = true
 zex-policy.workspace = true
 zex-voice.workspace = true
