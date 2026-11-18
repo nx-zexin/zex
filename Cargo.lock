@@ -10648,7 +10648,7 @@ dependencies = [
 
 [[package]]
 name = "zex-agent"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "reqwest",
@@ -10666,7 +10666,7 @@ dependencies = [
 
 [[package]]
 name = "zex-app"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "gpui-kit",
@@ -10692,14 +10692,14 @@ dependencies = [
 
 [[package]]
 name = "zex-browser"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "zex-core",
 ]
 
 [[package]]
 name = "zex-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "schemars",
@@ -10712,14 +10712,14 @@ dependencies = [
 
 [[package]]
 name = "zex-evolve"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "zex-core",
 ]
 
 [[package]]
 name = "zex-extension"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "futures",
  "gpui-kit",
@@ -10736,14 +10736,14 @@ dependencies = [
 
 [[package]]
 name = "zex-knowledge"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "zex-core",
 ]
 
 [[package]]
 name = "zex-llm"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "futures",
  "reqwest",
@@ -10756,7 +10756,7 @@ dependencies = [
 
 [[package]]
 name = "zex-mcp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "schemars",
@@ -10769,14 +10769,14 @@ dependencies = [
 
 [[package]]
 name = "zex-platform"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "zex-core",
 ]
 
 [[package]]
 name = "zex-policy"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -10787,14 +10787,14 @@ dependencies = [
 
 [[package]]
 name = "zex-schedule"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "zex-core",
 ]
 
 [[package]]
 name = "zex-skill"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "schemars",
@@ -10806,7 +10806,7 @@ dependencies = [
 
 [[package]]
 name = "zex-store"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "rusqlite",
  "serde",
@@ -10818,7 +10818,7 @@ dependencies = [
 
 [[package]]
 name = "zex-tools"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "reqwest",
@@ -10833,7 +10833,7 @@ dependencies = [
 
 [[package]]
 name = "zex-voice"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "cpal",
  "tracing",
