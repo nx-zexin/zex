@@ -75,22 +75,41 @@ import { ask, name, reply, busy, session } from "zex.demo";
 模块名带 id 不是美化问题：宿主模块注册表**按名唯一**，所有扩展共用一个 `zex`
 的话，后挂的会顶掉先挂的，第一个扩展的 `ask` 就会发进第二个的会话。
 
-### 两种拿结果的写法
+### cx 只属于产出它的那一次调用
+
+这条规矩踩一次头就疼一次，所以单独说：
 
 ```js
-// 一：await（适合按钮里的一次性动作）
-Button.new("go").on_click(async () => {
-  this.answer = await ask("解释这段代码");
-  cx.notify();          // 这个 cx 已经跨了 await，可以用，但别存起来
-});
+// 错：render 的 cx 不属于点击那次调用
+render(cx) {
+  return Button.new("x").on_click(() => {
+    this.n += 1;
+    cx.notify();     // TypeError: cx is no longer valid
+  });
+}
 
-// 二：不 await，下一帧从 reply() 读（推荐）
-ask("解释这段代码").catch(() => {});
+// 对：回调自己的第二个参数才是这次的 cx
+render(cx) {
+  return Button.new("x").on_click((_event, clickCx) => {
+    this.n += 1;
+    clickCx.notify();
+  });
+}
+```
+
+跨 `await` 的 `cx` 同样失效。所以拿回包推荐不 await、下一帧读 `reply()`：
+
+```js
+// 推荐：一问一答，不碰 cx
+ask("解释这段代码").catch((e) => { this.lastError = String(e); });
 // render 里：reply() || "（还没问过）"
 ```
 
-第二种更稳：跨 `await` 的 `cx` 会失效（gpui-shell 会明确报错），而宿主在回包到达时
-会主动重跑 `render`，所以脚本只要同步读取就行。
+宿主在回包到达时会主动重跑 `render`，脚本只要同步读取就行。
+
+注意这个失效是**静默的失败**：`this.n` 确实加了，只是界面不重绘。
+所以自检面板里那行 `本地状态` 点了不动，就说明 `notify()` 没生效 ——
+错误只写进 `tracing`（默认 `warn` 级别以上会打印），界面本身不会弹提示。
 
 ## 会话
 

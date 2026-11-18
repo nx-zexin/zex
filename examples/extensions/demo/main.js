@@ -14,7 +14,9 @@
 // 2. render() 会被反复调用，别在里面做"每次都要发生一次"的事。
 //    要跑一次的用 flag 挡住（下面 autoAsked 就是）。
 //
-// 3. 跨 await 的 cx 会失效。所以拿回包推荐"不 await、下一帧读 reply()"。
+// 3. cx 只属于产出它的那一次调用。回调里要用回调自己的参数
+//    （on_click((_event, cx) => ...)），跨 await 的 cx 同样失效 ——
+//    所以拿回包推荐"不 await、下一帧读 reply()"。
 import { View, div } from "gpui-kit";
 import { v_flex, h_flex, Button } from "gpui-base";
 import { ask, name, reply, busy, session } from "zex.demo";
@@ -109,10 +111,12 @@ export default class Demo extends View {
               .px(12)
               .bg(c.primary)
               .rounded(6)
-              .on_click(() => {
-                // 只改脚本自己的变量，再要一帧
+              // 注意回调的第二个参数：那才是"这次点击"的 cx。
+              // 用 render 时抓到的 cx 会报 "cx is no longer valid"
+              // —— 它只属于产出这一帧的那次调用。
+              .on_click((_event, clickCx) => {
                 this.n += 1;
-                cx.notify();
+                clickCx.notify();
               })
               .child(
                 div()
