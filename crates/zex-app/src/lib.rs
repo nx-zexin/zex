@@ -382,6 +382,8 @@ pub fn spawn_core(
     // 只在 GUI 路径挂（CLI 没有窗口，挂上只会等超时）。
     tools.push(Arc::new(ext_tools::ExtensionCheck::new(ev_tx.clone())));
     tools.push(Arc::new(ext_tools::ExtensionLogs));
+    tools.push(Arc::new(ext_tools::ExtensionInstall));
+    tools.push(Arc::new(ext_tools::ExtensionUninstall));
     registry.install(
         cfg.clone(),
         tools.clone(),

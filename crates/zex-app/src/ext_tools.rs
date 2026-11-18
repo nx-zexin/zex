@@ -181,3 +181,195 @@ impl Tool for ExtensionLogs {
         })
     }
 }
+
+/// 扩展 id 的合法性。
+///
+/// id 会直接变成目录名拼在 `~/.zex/extensions/` 后面，所以必须挡住
+/// 任何能跳出那一层的写法 —— 否则 `ext_install` 就成了"在任意路径建目录"。
+fn check_app_id(id: &str) -> std::result::Result<(), String> {
+    if id.trim().is_empty() {
+        return Err("app_id 不能为空".into());
+    }
+    if id.contains('/') || id.contains('\\') || id.contains("..") || id.starts_with('.') {
+        return Err(format!(
+            "`{id}` 不是合法的扩展 id（不能含 / \\ .. ，也不能以 . 开头）"
+        ));
+    }
+    Ok(())
+}
+
+/// `ext_install` 的参数。
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct InstallArgs {
+    /// 扩展 id：目录名，也是清单里的 id。
+    pub app_id: String,
+    /// 可选：入口文件名，默认 `main.js`。
+    #[serde(default)]
+    pub entry: Option<String>,
+    /// 可选：显示名，默认用 id。
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+/// 把目录登记成一个扩展（写清单、重新扫描）。
+///
+/// # 它不做什么
+///
+/// **不写脚本、不生成代码。** 脚本由模型用 `fs_write` 写好后，这个工具
+/// 只负责"把目录变成 zex 认得的扩展"：补一份 `gpui-shell.json`，
+/// 然后让界面重新扫描。分开是有意的——写代码和登记是两件事，
+/// 混在一起的话，"只想改个名字"也得重写一遍脚本。
+///
+/// # 风险等级
+///
+/// `Reversible`（L1）：它只创建一个纯文本清单文件，不执行任何东西。
+/// 真正的执行发生在用户点开面板时（那一步有自己的沙箱与能力约束）。
+pub struct ExtensionInstall;
+
+#[async_trait]
+impl Tool for ExtensionInstall {
+    const NAME: &'static str = "ext_install";
+    const RISK: Risk = Risk::Reversible;
+    type Args = InstallArgs;
+
+    fn description() -> &'static str {
+        "把一个已经写好脚本的目录登记成 zex 扩展：创建/补全 gpui-shell.json 并刷新扫描。\
+         脚本本身要用 fs_write 先写好（通常放在 ~/.zex/extensions/<id>/main.js）。\
+         登记完可以用 ext_check 校验，用户在「设置 → 扩展」里点开。"
+    }
+
+    async fn call(&self, _cx: &dyn ToolCtx, args: InstallArgs) -> Result<ToolOutput> {
+        let id = args.app_id.trim();
+        check_app_id(id).map_err(|message| Error::BadArgs {
+            tool: Self::NAME.into(),
+            message,
+        })?;
+        let entry = args.entry.unwrap_or_else(|| "main.js".to_string());
+        if entry.contains('/') || entry.contains("..") {
+            return Err(Error::BadArgs {
+                tool: Self::NAME.into(),
+                message: format!("entry 必须是目录内的相对路径，收到 `{entry}`"),
+            });
+        }
+
+        let dir = zex_extension::extensions_dir().join(id);
+        std::fs::create_dir_all(&dir).map_err(|e| Error::ToolFailed {
+            tool: Self::NAME.into(),
+            message: format!("无法创建目录 {}: {e}", dir.display()),
+        })?;
+
+        // 入口不存在时明确说出来：否则用户点开只看到白屏
+        let entry_path = dir.join(&entry);
+        let entry_note = if entry_path.exists() {
+            String::new()
+        } else {
+            format!("\n注意：{entry} 还不存在，先用 fs_write 写好再打开。")
+        };
+
+        let manifest_path = dir.join(zex_extension::catalog::MANIFEST);
+        if !manifest_path.exists() {
+            let name = args.name.unwrap_or_else(|| id.to_string());
+            let manifest = serde_json::json!({
+                "id": id,
+                "name": name,
+                "entry": entry,
+            });
+            let text = serde_json::to_string_pretty(&manifest).unwrap_or_default();
+            std::fs::write(&manifest_path, text).map_err(|e| Error::ToolFailed {
+                tool: Self::NAME.into(),
+                message: format!("无法写清单 {}: {e}", manifest_path.display()),
+            })?;
+        }
+
+        let count = zex_extension::scan_default().len();
+        Ok(ToolOutput {
+            content: format!(
+                "已登记扩展 `{id}`（入口 {entry}）。当前共有 {count} 个扩展。{entry_note}\n\
+                 下一步：用 ext_check 校验；用户在「设置 → 扩展」点开，或固定到侧边栏直接点。"
+            ),
+            is_error: false,
+            meta: None,
+        })
+    }
+}
+
+/// `ext_uninstall` 的参数。
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct UninstallArgs {
+    /// 要删除的扩展 id。
+    pub app_id: String,
+    /// 必须显式传 true。删目录不可逆，默认拒绝。
+    pub confirm: bool,
+}
+
+/// 删除一个扩展的目录。
+///
+/// 风险等级刻意定成 `Destructive`（L3）：它删的是用户磁盘上的文件，
+/// 而且不进回收站。L3 不受"记住授权"影响，每次都要用户点。
+pub struct ExtensionUninstall;
+
+#[async_trait]
+impl Tool for ExtensionUninstall {
+    const NAME: &'static str = "ext_uninstall";
+    const RISK: Risk = Risk::Destructive;
+    type Args = UninstallArgs;
+
+    fn description() -> &'static str {
+        "删除一个扩展及其目录（不可恢复，不进回收站）。必须显式传 confirm=true。\
+         只删 ~/.zex/extensions/<id> 这一层，不会动别的地方。"
+    }
+
+    async fn call(&self, _cx: &dyn ToolCtx, args: UninstallArgs) -> Result<ToolOutput> {
+        if !args.confirm {
+            return Err(Error::BadArgs {
+                tool: Self::NAME.into(),
+                message: "删除扩展不可恢复，需要显式传 confirm=true".into(),
+            });
+        }
+        let id = args.app_id.trim();
+        check_app_id(id).map_err(|message| Error::BadArgs {
+            tool: Self::NAME.into(),
+            message,
+        })?;
+
+        let dir = zex_extension::extensions_dir().join(id);
+        if !dir.is_dir() {
+            return Err(Error::ToolFailed {
+                tool: Self::NAME.into(),
+                message: format!("没有这个扩展：{}", dir.display()),
+            });
+        }
+        std::fs::remove_dir_all(&dir).map_err(|e| Error::ToolFailed {
+            tool: Self::NAME.into(),
+            message: format!("删除失败 {}: {e}", dir.display()),
+        })?;
+        Ok(ToolOutput {
+            content: format!("已删除扩展 `{id}`（{}）。已固定的侧边栏入口会在下次启动时消失。", dir.display()),
+            is_error: false,
+            meta: None,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_plain_ids() {
+        assert!(check_app_id("demo").is_ok());
+        assert!(check_app_id("git-status").is_ok());
+        assert!(check_app_id("com.example.notes").is_ok());
+        assert!(check_app_id("a_b-c1").is_ok());
+    }
+
+    #[test]
+    fn rejects_anything_that_escapes_the_directory() {
+        // 这几条一旦放行，ext_install 就能在扩展目录之外建目录
+        assert!(check_app_id("../etc").is_err());
+        assert!(check_app_id("a/b").is_err());
+        assert!(check_app_id("a\\b").is_err());
+        assert!(check_app_id(".hidden").is_err());
+        assert!(check_app_id("   ").is_err());
+    }
+}

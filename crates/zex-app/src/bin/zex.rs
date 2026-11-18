@@ -4115,6 +4115,10 @@ impl ChatView {
                         if t == SettingsTab::Model {
                             this.ensure_catalog(cx);
                         }
+                        // 扩展页每次进来重扫：模型可能刚用 ext_install 装了一个
+                        if t == SettingsTab::Extension {
+                            this.extensions = zex_extension::scan_default();
+                        }
                         cx.notify();
                     }),
                 );
