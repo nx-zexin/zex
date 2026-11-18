@@ -353,6 +353,28 @@ impl RunMode {
         }
     }
 
+    /// 落进原子变量时用的编号。
+    ///
+    /// 有了它，模式才能在跑着的一轮里被改写（见 [`ModeCell`]）。
+    pub fn as_u8(self) -> u8 {
+        match self {
+            RunMode::Confirm => 0,
+            RunMode::AutoEdit => 1,
+            RunMode::Plan => 2,
+            RunMode::FullAccess => 3,
+        }
+    }
+
+    /// [`RunMode::as_u8`] 的逆运算。认不出的值按最保守的走。
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => RunMode::AutoEdit,
+            2 => RunMode::Plan,
+            3 => RunMode::FullAccess,
+            _ => RunMode::Confirm,
+        }
+    }
+
     /// 菜单里的候选，顺序即展示顺序（由严到松）。
     pub fn all() -> [RunMode; 4] {
         [
@@ -361,6 +383,40 @@ impl RunMode {
             RunMode::Plan,
             RunMode::FullAccess,
         ]
+    }
+}
+
+/// 可被外部实时改写的运行模式。
+///
+/// # 为什么不是普通字段
+///
+/// 模式原本是"跟着这一轮走"的快照：提交时取一次，之后不再变。
+/// 但用户的心智模型不是这样 —— 他把下拉切到「完全访问」，
+/// 期待的是**马上**不再被问，而不是"下一轮生效"。
+/// 一次长任务里连着弹十几个确认，切了还在弹，就是 bug（实测过）。
+///
+/// 所以让 UI 和正在跑的那一轮共享一个原子变量：UI 改写，agent 每次
+/// 判定前现读。改的是一个 `AtomicU8` 而不是把 `Agent` 锁起来 ——
+/// 工具循环在自己的任务里跑，UI 那边不该为了改一个枚举去抢锁。
+#[derive(Debug, Clone)]
+pub struct ModeCell(std::sync::Arc<std::sync::atomic::AtomicU8>);
+
+impl ModeCell {
+    /// 以某个模式为初值。
+    pub fn new(mode: RunMode) -> Self {
+        Self(std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+            mode.as_u8(),
+        )))
+    }
+
+    /// 读当前模式。
+    pub fn get(&self) -> RunMode {
+        RunMode::from_u8(self.0.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// 改当前模式。下一��工具判定立刻生效。
+    pub fn set(&self, mode: RunMode) {
+        self.0.store(mode.as_u8(), std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -391,6 +447,16 @@ pub enum UiCommand {
         text: String,
         /// 附件（图片等）。
         attachments: Vec<crate::message::ImageRef>,
+    },
+    /// 改运行模式，**对正在进行的那一轮立即生效**。
+    ///
+    /// 为什么不复用 `UserPrompt` 里的 `mode`：那个是"下一轮用什么"，
+    /// 用户在任务跑一半时切模式，走的是这条。
+    SetMode {
+        /// 哪个会话。并行时不同会话各有各的模式。
+        session: SessionId,
+        /// 新模式。
+        mode: RunMode,
     },
     /// 批准一次审批请求。
     Approve {
@@ -469,6 +535,26 @@ mod tests {
         let r = EndReason::MaxSteps { limit: 25 };
         let back: EndReason = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
         assert_eq!(r, back);
+    }
+
+    #[test]
+    fn run_mode_u8_roundtrip() {
+        for m in RunMode::all() {
+            assert_eq!(RunMode::from_u8(m.as_u8()), m);
+        }
+        // 认不出的值必须落到最保守的一档，不能默认成放行
+        assert_eq!(RunMode::from_u8(200), RunMode::Confirm);
+    }
+
+    #[test]
+    fn mode_cell_is_shared() {
+        let cell = ModeCell::new(RunMode::Confirm);
+        let mirror = cell.clone();
+        // 克隆出去的句柄看到的是同一份状态：UI 改，agent 那边立刻读到
+        mirror.set(RunMode::FullAccess);
+        assert_eq!(cell.get(), RunMode::FullAccess);
+        cell.set(RunMode::AutoEdit);
+        assert_eq!(mirror.get(), RunMode::AutoEdit);
     }
 
     #[test]

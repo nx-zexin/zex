@@ -125,6 +125,9 @@ pub struct Agent {
     compressor: Compressor,
     /// 累计 token 用量（整个会话）。只用于成本统计，**不用于压缩判断**。
     usage: Usage,
+    /// 当前运行模式。**每次判定前现读**，不是快照 —— 用户在任务跑一半
+    /// 时切到「完全访问」，下一句命令就不该再问（见 `zex_core::ModeCell`）。
+    mode: zex_core::ModeCell,
     /// 用户中断标志。
     ///
     /// 用 AtomicBool 而不是 channel：`run_turn` 的检查点是同步的，
@@ -149,6 +152,7 @@ impl Agent {
         let policy = Policy::new(store.clone());
         let compressor = Compressor::new(cfg.budget.clone());
         Ok(Agent {
+            mode: zex_core::ModeCell::new(cfg.mode),
             cfg,
             http,
             tools,
@@ -429,6 +433,17 @@ impl Agent {
     /// 切换运行模式。
     pub fn set_mode(&mut self, mode: Mode) {
         self.cfg.mode = mode;
+        self.mode.set(mode);
+    }
+
+    /// 接入外部的模式句柄。
+    ///
+    /// 内核给每个会话准备一个，`UiCommand::SetMode` 改的是同一个句柄 ——
+    /// 这样"用户切了模式"和"下一句命令要不要问"之间没有延迟。
+    pub fn with_mode_cell(mut self, cell: zex_core::ModeCell) -> Self {
+        self.cfg.mode = cell.get();
+        self.mode = cell;
+        self
     }
 
     /// 清空上下文（同时清库）。
@@ -762,6 +777,34 @@ impl Agent {
             .unwrap_or(Risk::Impactful)
     }
 
+    /// 现在这个模式会怎么处理这次调用。**模式是现读的**，不是快照。
+    ///
+    /// 直接问"会不会拦我"的入口，给 `dispatch_gated` 和测试共用 ——
+    /// 两边各抄一份判定顺序，迟早会走岔。
+    fn judge_for(&self, spec: &zex_core::tool::ToolSpec, args: &serde_json::Value) -> Verdict {
+        self.policy.evaluate(spec, args, self.mode.get())
+    }
+
+    /// 按工具名与参数问一次判定结论（不改任何状态）。
+    ///
+    /// 工具的静态 risk 只作默认值：`shell` 真正的等级取决于命令内容，
+    /// 所以这里和真正执行时一样，用 `risk_for` 覆盖后再判。
+    pub fn judge(&self, name: &str, args: &serde_json::Value) -> Verdict {
+        let mut spec = self
+            .tools
+            .iter()
+            .find(|t| t.spec().name == name)
+            .map(|t| t.spec())
+            .unwrap_or_else(|| zex_core::tool::ToolSpec {
+                name: "unknown",
+                description: "",
+                risk: Risk::Impactful,
+                input_schema: serde_json::json!({}),
+            });
+        spec.risk = self.risk_of(name, args);
+        self.judge_for(&spec, args)
+    }
+
     /// 过闸门后执行一次工具调用。
     ///
     /// 这是 `docs/SECURITY.md` §10 四步叠加的落地点。三条不变量：
@@ -786,7 +829,7 @@ impl Agent {
         // 所以用判定过的等级覆盖它再交给策略层 —— 否则 `ls` 也会被要求审批。
         let mut spec = tool.spec();
         spec.risk = risk;
-        let verdict = self.policy.evaluate(&spec, &call.arguments, self.cfg.mode);
+        let verdict = self.judge_for(&spec, &call.arguments);
 
         let approved_by = match verdict {
             Verdict::Deny { reason } => {
@@ -1053,6 +1096,56 @@ mod tests {
             "test-model",
             PathBuf::from("/tmp"),
         )
+    }
+
+    #[test]
+    fn switching_mode_mid_turn_stops_asking() {
+        // 这条锁的是一个真实的用户路径：任务跑一半，用户把下拉切到
+        // 「完全访问」，后面那些命令就不该再弹确认。以前模式是提交时的
+        // 快照，切了也还是问 —— 用户连着点了十几次"批准"。
+        let store = Store::in_memory().unwrap();
+        let mut cfg = test_cfg();
+        cfg.mode = Mode::Confirm;
+        let cell = zex_core::ModeCell::new(Mode::Confirm);
+        let agent = Agent::new(cfg, vec![], store)
+            .unwrap()
+            .with_mode_cell(cell.clone());
+
+        let args = serde_json::json!({"command": "ls"});
+        assert!(
+            matches!(agent.judge("shell", &args), Verdict::Ask { .. }),
+            "确认模式下跑命令应先问"
+        );
+
+        // 用户切了模式 —— 不重启、不重开一轮
+        cell.set(Mode::FullAccess);
+        assert!(
+            matches!(agent.judge("shell", &args), Verdict::Allow { .. }),
+            "切到完全访问后，同一轮里的下一句命令必须直接放行"
+        );
+    }
+
+    #[test]
+    fn full_access_still_asks_for_destructive() {
+        let store = Store::in_memory().unwrap();
+        let cell = zex_core::ModeCell::new(Mode::FullAccess);
+        let agent = Agent::new(test_cfg(), vec![], store)
+            .unwrap()
+            .with_mode_cell(cell);
+        // 认不出的工具按最保守的等级处理，不可逆操作永远要问
+        let spec = zex_core::tool::ToolSpec {
+            name: "unknown",
+            description: "",
+            risk: Risk::Destructive,
+            input_schema: serde_json::json!({}),
+        };
+        assert!(
+            matches!(
+                agent.judge_for(&spec, &serde_json::json!({})),
+                Verdict::Ask { .. }
+            ),
+            "完全访问也不该自动放行不可逆操作"
+        );
     }
 
     #[test]

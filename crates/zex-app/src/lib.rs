@@ -482,6 +482,7 @@ pub fn spawn_core(
     // 把上次的团队捞回来。必须在 install 之后、开始收命令之前。
     registry.restore();
     let session_locks: SessionLocks = Arc::new(Mutex::new(HashMap::new()));
+    let mode_cells: ModeCells = Arc::new(Mutex::new(HashMap::new()));
 
     let spawn_result = std::thread::Builder::new()
         .name("zex-core".into())
@@ -501,7 +502,7 @@ pub fn spawn_core(
                             // 否则一个慢任务会把「切会话」「审批」全堵在队列里。
                             // 同一会话内部仍串行（run_task 里的会话锁），
                             // 避免两个任务同时往同一条 history 追加。
-                            let (cfg, tools, store, ev, locks, broker, providers) = (
+                            let (cfg, tools, store, ev, locks, broker, providers, cells) = (
                                 cfg.clone(),
                                 tools.clone(),
                                 store.clone(),
@@ -509,15 +510,18 @@ pub fn spawn_core(
                                 session_locks.clone(),
                                 broker.clone(),
                                 providers.clone(),
+                                mode_cells.clone(),
                             );
                             tokio::spawn(async move {
                                 // 请求级模型覆盖：换了模型不必重启内核
                                 let mut task_cfg = cfg.clone();
-                                // 运行模式同理：跟着这一轮走，不改进程状态，
-                                // 否则并行会话会互相覆盖对方的模式
+                                // 运行模式走句柄：登录态是"每会话一个"，
+                                // 不改进程状态，否则并行会话会互相覆盖
+                                let cell = mode_cell_for(&cells, &session, task_cfg.mode);
                                 if let Some(m) = mode {
-                                    task_cfg.mode = m;
+                                    cell.set(m);
                                 }
+                                task_cfg.mode = cell.get();
                                 if let Some(t) = thinking {
                                     task_cfg.thinking = t;
                                 }
@@ -547,10 +551,17 @@ pub fn spawn_core(
                                 }
                                 run_task(
                                     task_cfg, tools, store, session, text, attachments, ev,
-                                    locks, broker,
+                                    locks, broker, cell,
                                 )
                                 .await;
                             });
+                        }
+                        UiCommand::SetMode { session, mode } => {
+                            // 只改句柄：正在跑的那一轮下一次判定就会读到新值，
+                            // 不需要等它结束、也不需要重启内核
+                            let cell = mode_cell_for(&mode_cells, &session, mode);
+                            cell.set(mode);
+                            tracing::debug!(session = %session, mode = ?mode, "运行模式已切换");
                         }
                         UiCommand::Transcribe { audio } => {
                             // 转写不走对话模型，直接调 provider 的 ASR 端点
@@ -732,6 +743,26 @@ pub fn spawn_core(
 /// 每个会话一把锁：同一会话的任务排队，不同会话并行。
 type SessionLocks = Arc<Mutex<HashMap<SessionId, Arc<tokio::sync::Mutex<()>>>>>;
 
+/// 每个会话一个模式句柄，UI 与正在跑的那一轮共享。
+///
+/// 单独一张表而不是塞进 `AgentConfig`：UI 必须能在任务跑着的时候
+/// 改模式，而那时 `Agent` 在它自己的任务里，UI 够不着它。
+type ModeCells = Arc<Mutex<HashMap<SessionId, zex_core::ModeCell>>>;
+
+/// 取（必要时建）某个会话的模式句柄。
+fn mode_cell_for(
+    cells: &ModeCells,
+    session: &SessionId,
+    fallback: zex_core::RunMode,
+) -> zex_core::ModeCell {
+    // std 锁：这张表只在"取句柄"时碰一下，不跨 await 持有
+    let mut guard = cells.lock().expect("模式句柄表中毒");
+    guard
+        .entry(session.clone())
+        .or_insert_with(|| zex_core::ModeCell::new(fallback))
+        .clone()
+}
+
 /// 一次任务执行。
 ///
 /// 这是并行化的核心：任务不再依附于某个长期存在的 `Agent`，而是
@@ -748,6 +779,7 @@ async fn run_task(
     ev_tx: mpsc::Sender<CoreEvent>,
     locks: SessionLocks,
     broker: Arc<ApprovalBroker>,
+    mode_cell: zex_core::ModeCell,
 ) {
     // 先落一条 queued 记录，再去等锁。
     //
@@ -771,7 +803,7 @@ async fn run_task(
     let _ = store.start_task(&task_id);
 
     let mut agent = match Agent::resume(cfg, tools, store.clone(), session.clone()) {
-        Ok(agent) => agent.with_shared_approvals(broker),
+        Ok(agent) => agent.with_shared_approvals(broker).with_mode_cell(mode_cell),
         Err(e) => {
             let _ = store.finish_task(
                 &task_id,

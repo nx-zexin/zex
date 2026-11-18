@@ -1761,6 +1761,35 @@ impl ChatView {
         cx.notify();
     }
 
+    /// 把运行模式推给内核，并处理"正挂着的那条审批"。
+    ///
+    /// 只改界面状态是不够的：模式是**按轮**取快照的，任务跑一半时切到
+    /// 完全访问，那一轮手里还是老模式，于是继续弹确认。用户看到的就是
+    /// "我都切完全访问了，怎么还问我"。所以这里多走两步：
+    ///
+    /// 1. 发 `SetMode` 给内核，改掉那一轮共享的那个句柄 —— 下一句命令起效；
+    /// 2. 已经弹出来的那条，按新模式重新判一次，能放行就直接放行，
+    ///    不然用户还得为"切模式之前问的那一句"再点一次。
+    ///
+    /// 第 2 步**绝不碰不可逆操作**：L3 永远逐次确认，这是底线，
+    /// 切什么模式都不豁免。
+    fn push_mode_to_kernel(&mut self, mode: zex_core::RunMode, cx: &mut Context<Self>) {
+        let session = zex_core::SessionId::from(self.active_session.clone());
+        let _ = self
+            .cmd_tx
+            .try_send(UiCommand::SetMode { session, mode });
+
+        // 判据不在这里手写：问策略层"这个模式会不会放行这一档风险"，
+        // 免得矩阵抄两份、抄漏一格就退化成"切了还问"
+        let Some(req) = self.approval.as_ref() else {
+            return;
+        };
+        if zex_policy::auto_allows(mode, req.risk) {
+            // 复用正常审批路径：一样的落库、一样的"处理下一个"
+            self.respond(true, false, cx);
+        }
+    }
+
     fn respond(&mut self, approve: bool, remember: bool, cx: &mut Context<Self>) {
         let Some(req) = self.approval.take() else { return };
         let broker = self.broker.clone();
@@ -6712,6 +6741,7 @@ impl ChatView {
                                     {
                                         item.mode = m;
                                     }
+                                    this.push_mode_to_kernel(m, cx);
                                     cx.notify();
                                 })
                                 .ok();
@@ -7882,6 +7912,40 @@ fn main() {
                             for p in path.split(';').filter(|p| !p.is_empty()) {
                                 this.open_file_tab(p, cx);
                             }
+                        });
+                    })
+                    .detach();
+                }
+
+                // 测试钩子：ZEX_AUTO_SWITCH=<mode>:<毫秒> —— 延迟切一次运行模式，
+                // 走的是下拉菜单**同一条**路径（含"把挂着的审批按新模式结掉"）。
+                //
+                // 为什么需要它：这个 bug 的形态是"任务跑一半时切模式不生效"，
+                // 而 Wayland 下没法注入鼠标去点下拉。不给一个确定性入口，
+                // 这条路径就只能靠人肉点，回归了也发现不了。
+                if let Ok(spec) = std::env::var("ZEX_AUTO_SWITCH") {
+                    let (mode_txt, delay) = match spec.split_once(':') {
+                        Some((m, d)) => (m.to_string(), d.parse::<u64>().unwrap_or(8000)),
+                        None => (spec.clone(), 8000),
+                    };
+                    let mode = match mode_txt.as_str() {
+                        "auto_edit" => zex_core::RunMode::AutoEdit,
+                        "plan" => zex_core::RunMode::Plan,
+                        "full_access" => zex_core::RunMode::FullAccess,
+                        _ => zex_core::RunMode::Confirm,
+                    };
+                    let weak = view.downgrade();
+                    cx.spawn(async move |cx| {
+                        cx.background_executor()
+                            .timer(std::time::Duration::from_millis(delay))
+                            .await;
+                        let _ = weak.update(cx, |this, cx| {
+                            this.run_mode = mode;
+                            let sid = zex_core::SessionId::from(this.active_session.clone());
+                            let _ = this.store.set_session_mode(&sid, mode);
+                            this.push_mode_to_kernel(mode, cx);
+                            cx.notify();
+                            eprintln!("ZEX_AUTO_SWITCH 已切到 {}", mode.label());
                         });
                     })
                     .detach();

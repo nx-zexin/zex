@@ -21,7 +21,8 @@ pub mod tool;
 
 pub use error::{Error, Result};
 pub use event::{
-    ApprovalRequest, CoreEvent, EndReason, RememberScope, RunMode, ThinkingEffort, UiCommand,
+    ApprovalRequest, CoreEvent, EndReason, ModeCell, RememberScope, RunMode, ThinkingEffort,
+    UiCommand,
 };
 pub use ids::{ApprovalId, SessionId, TaskId, ToolCallId, TurnId};
 pub use message::{ImageRef, Message, Part, Role, ToolCall, Usage};

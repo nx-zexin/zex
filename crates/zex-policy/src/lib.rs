@@ -171,6 +171,17 @@ impl Policy {
     }
 }
 
+/// 这个模式下，这个风险等级会不会被**自动放行**。
+///
+/// 给 UI 用的：用户切模式时，界面上正挂着一条审批 —— 如果新模式本来
+/// 就会放行它，那条请求就不该继续等他点（否则"切了还在问"）。
+///
+/// 单一事实来源仍是 [`mode_verdict`]：这里只是把它的结论摊平成布尔，
+/// 免得 UI 自己抄一份矩阵、抄漏一格就变成"完全访问还问 L2"这种毛病。
+pub fn auto_allows(mode: Mode, risk: Risk) -> bool {
+    matches!(mode_verdict(mode, risk), Verdict::Allow { .. })
+}
+
 /// 运行模式 × 静态风险 → 默认判定。
 ///
 /// 两条不随模式变化的底线：
@@ -353,6 +364,15 @@ mod tests {
                 _ => assert!(matches!(v, Verdict::Ask { .. }), "{m:?} 下 L2 应问，得到 {v:?}"),
             }
         }
+        // 切模式时 UI 靠这个决定"正挂着的那条要不要自动放行"：
+        // 它必须和 mode_verdict 说到一起去
+        assert!(auto_allows(Mode::FullAccess, Risk::Impactful));
+        assert!(auto_allows(Mode::AutoEdit, Risk::Reversible));
+        assert!(!auto_allows(Mode::AutoEdit, Risk::Impactful));
+        assert!(!auto_allows(Mode::Confirm, Risk::Reversible));
+        assert!(!auto_allows(Mode::FullAccess, Risk::Destructive), "完全访问也不放行不可逆");
+        assert!(auto_allows(Mode::Confirm, Risk::ReadOnly), "只读不需要许可");
+
         // L3：除 Plan(直接拒) 外一律强确认，FullAccess 也不例外
         for m in Mode::all() {
             let v = p.evaluate(
