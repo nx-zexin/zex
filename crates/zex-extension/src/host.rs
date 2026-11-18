@@ -131,6 +131,26 @@ impl ExtensionHost {
         }
     }
 
+    /// 只求值、不渲染的校验。**不需要窗口。**
+    ///
+    /// 覆盖脚本写得对不对这件事里最常见的一类：模块解析、导入名、默认导出。
+    /// 例如 `import { v_flex } from "gpui-kit"` 会在这里就报
+    /// `Could not find export 'v_flex'`，而不是等用户点开面板看到白屏。
+    ///
+    /// 不做的事：不跑 `render`，也不物化元素树 —— 那两步必须有窗口，
+    /// 而 Linux 后端的 `WindowOptions.show` 没有实现，开窗口就是真的开窗口。
+    pub fn validate_script(&self, ext: &Extension) -> std::result::Result<(), String> {
+        if let Err(e) = self.install_module(ext) {
+            return Err(e.to_string());
+        }
+        // 拿到就丢：只要「能不能求值成功」这个结论。留着反而会让后续
+        // mount 撞上「已挂载」。
+        self.runtime
+            .load_application(&ext.dir, &ext.entry)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
     /// 校验一个扩展能否加载并物化出第一帧。
     ///
     /// **必须传一个隐藏窗口的 `Window`。** 上游的 `check` 内部会

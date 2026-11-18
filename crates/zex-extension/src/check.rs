@@ -38,6 +38,8 @@ pub struct CheckReport {
     pub tree: Option<String>,
     /// 失败时的错误原文（含脚本自己的栈）。
     pub error: Option<String>,
+    /// 通过但没有渲染时的一句说明（为什么没有树、怎么才能有）。
+    pub note: Option<String>,
 }
 
 impl CheckReport {
@@ -46,6 +48,16 @@ impl CheckReport {
         Self {
             tree: Some(tree),
             error: None,
+            note: None,
+        }
+    }
+
+    /// 只求值、未渲染的通过。没有元素树 —— 也没有开过窗口。
+    pub fn validated(note: impl Into<String>) -> Self {
+        Self {
+            tree: None,
+            error: None,
+            note: Some(note.into()),
         }
     }
 
@@ -54,6 +66,7 @@ impl CheckReport {
         Self {
             tree: None,
             error: Some(message.into()),
+            note: None,
         }
     }
 
@@ -161,5 +174,13 @@ mod tests {
             }
             _ => panic!("应构造 ExtensionCheck"),
         }
+    }
+
+    #[test]
+    fn validated_report_is_ok_but_carries_no_tree() {
+        let r = CheckReport::validated("脚本求值通过");
+        assert!(r.is_ok(), "只求值的通过也是通过");
+        assert!(r.tree.is_none(), "没有渲染就不该编造元素树");
+        assert!(r.note.unwrap().contains("求值"));
     }
 }

@@ -61,11 +61,11 @@ impl Tool for ExtensionCheck {
     type Args = CheckArgs;
 
     fn description() -> &'static str {
-        "校验一个 zex 扩展能否加载并渲染出第一帧。\
-         写或改完扩展的 main.js 之后必须调用它：它会在不显示窗口的情况下\
-         真的求值一遍脚本、物化一遍元素树，把脚本自己的报错原文返回给你。\
-         成功时返回元素树的文字结构（可用来确认布局层级是否如你所愿）。\
-         常见错误：导入了不存在的名字（v_flex 属于 gpui-base，不属于 gpui-kit）。"
+        "校验一个 zex 扩展。写或改完 main.js 之后调用它。\
+         它会真的求值一遍脚本，把模块解析、导入名、默认导出的错误原文\
+         返回给你 —— 这覆盖了绝大多数手写错误（例如 v_flex 属于 gpui-base，\
+         不属于 gpui-kit）。求值通过说明代码是对的，但不代表布局如你所愿：\
+         要确认实际画面，请让用户点开这个扩展，或用 ext_logs 看运行期异常。"
     }
 
     async fn call(&self, _cx: &dyn ToolCtx, args: CheckArgs) -> Result<ToolOutput> {
@@ -119,8 +119,11 @@ impl Tool for ExtensionCheck {
                 meta: None,
             }),
             (None, None) => Ok(ToolOutput {
-                content: format!("扩展 `{app_id}` 校验没有返回内容（既无元素树也无错误）"),
-                is_error: true,
+                content: format!(
+                    "扩展 `{app_id}` 校验通过。{}",
+                    report.note.unwrap_or_else(|| "脚本求值正常。".into())
+                ),
+                is_error: false,
                 meta: None,
             }),
         }

@@ -150,18 +150,6 @@ struct SubAgentPanel {
     streaming: Option<String>,
 }
 
-/// 校验窗口的占位根视图。
-///
-/// `ShellRuntime::check` 会把这个根换成自己的探针树，所以它长什么样无所谓 ——
-/// 只要是个合法的 `Render`。存在的意义只是让 `open_window` 有个东西可返回。
-struct CheckProbe;
-
-impl Render for CheckProbe {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-    }
-}
-
 /// 右侧面板的一个标签页。
 enum PanelTab {
     /// 子智能体执行过程。
@@ -621,6 +609,39 @@ impl ChatView {
                     this.update_in(cx, |this, window, cx| {
                         this.settings = None;
                         this.open_extension(&id, window, cx);
+                    })
+                    .ok();
+                })
+                .detach();
+            }
+        }
+
+        // 测试钩子：ZEX_AUTO_CHECK=<id> 启动后静默跑一次扩展校验，
+        // 把结论打到 stderr。
+        //
+        // 用途是验证「校验不弹窗」这条：`WindowOptions.show` 在 Linux 后端
+        // 没有实现，"我自己没看见窗口"不能算证据，得有确定的入口 + 数窗口数。
+        if let Ok(spec) = std::env::var("ZEX_AUTO_CHECK") {
+            let app_id = spec.trim().to_string();
+            if !app_id.is_empty() {
+                cx.spawn_in(window, async move |this, cx| {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(900))
+                        .await;
+                    this.update_in(cx, move |this, _window, cx| {
+                        let (id, _) = zex_extension::check::request(&app_id);
+                        let mut rx = zex_extension::check::register(&id);
+                        this.run_extension_check(&id, &app_id, cx);
+                        match rx.try_recv() {
+                            Ok(r) => eprintln!(
+                                "ZEX_AUTO_CHECK 结果：ok={} error={:?} note={:?} tree={:?}",
+                                r.is_ok(),
+                                r.error,
+                                r.note,
+                                r.tree.map(|t| t.chars().take(200).collect::<String>())
+                            ),
+                            Err(e) => eprintln!("ZEX_AUTO_CHECK 没有回音：{e}"),
+                        }
                     })
                     .ok();
                 })
@@ -3585,35 +3606,26 @@ impl ChatView {
             return;
         };
 
-        let opts = WindowOptions {
-            // 不显示、不抢焦点：它只是给 check 提供一帧的载体
-            show: false,
-            focus: false,
-            window_bounds: Some(WindowBounds::Windowed(Bounds::new(
-                point(px(0.0), px(0.0)),
-                size(px(200.0), px(200.0)),
-            ))),
-            ..Default::default()
+        // **不开窗口**。这里曾经建过一个 `show: false` 的临时窗口去物化一帧，
+        // 但这条路在 Linux 上走不通，两个原因都实测过：
+        //
+        // 1. `WindowOptions.show` 在 X11/Wayland 后端根本没被读取 ——
+        //    所谓"隐藏窗口"用户看到的就是一个真的空窗口；
+        // 2. `window.remove_window()` 只是把窗口从 `cx.windows` 里摘掉，
+        //    X 那边的窗口一直留着（`xdotool search --onlyvisible` 数得到），
+        //    也就是说它会永久留在屏幕上。
+        //
+        // 所以校验退回到不依赖窗口的那一半：真求值一遍脚本。模块解析、
+        // 导入名、默认导出都在这一步暴露 —— 手写扩展最常错的就是这些。
+        // 渲染（元素树、坐标）只能在真的打开面板时才有，那需要用户在场，
+        // 不该由一句工具调用偷偷替他开窗。
+        let report = match host.validate_script(&ext) {
+            Ok(()) => zex_extension::CheckReport::validated(
+                "脚本求值通过（模块解析、导入名、默认导出都正常）。\
+                 没有渲染，所以看不到元素树 —— 要确认实际画面请让用户点开这个扩展。",
+            ),
+            Err(e) => zex_extension::CheckReport::failed(e),
         };
-        let opened = cx.open_window(opts, |_window, cx| cx.new(|_| CheckProbe));
-        let handle = match opened {
-            Ok(h) => h,
-            Err(e) => {
-                zex_extension::check::deliver(
-                    req_id,
-                    zex_extension::CheckReport::failed(format!("无法创建校验窗口：{e}")),
-                );
-                return;
-            }
-        };
-
-        let report = handle
-            .update(cx, |_, window, cx| host.check(&ext, window, cx))
-            .unwrap_or_else(|_| {
-                zex_extension::CheckReport::failed("校验窗口已失效")
-            });
-        // 用完立刻关掉：隐藏窗口也是窗口，留着会占资源和平台句柄
-        let _ = handle.update(cx, |_, window, _| window.remove_window());
         zex_extension::check::deliver(req_id, report);
     }
 
