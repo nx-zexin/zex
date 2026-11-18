@@ -1,6 +1,6 @@
 ---
 name: write-extension
-description: 给 zex 写一个应用（脚本面板/独立小应用），含模块划分、宿主接口、图标规范和三条必踩的坑
+description: 给 zex 写一个应用（脚本面板/独立小应用），含模块划分、宿主接口、本地存储与 SQLite、图标规范和三条必踩的坑
 ---
 
 # 给 zex 写应用
@@ -26,7 +26,12 @@ description: 给 zex 写一个应用（脚本面板/独立小应用），含模�
 { "id": "git-status", "name": "Git 状态", "entry": "main.js" }
 ```
 
-`id` 决定模块名（见下），`entry` 必须是目录内的相对路径。
+`id` 决定模块名（见下），也决定库文件名 —— 只能用字母、数字、`-`、`_`、`.`。
+`entry` 必须是目录内的相对路径。
+
+**数据不要写进这个目录。** 应用目录装的是代码（会被 git、被拷贝、被分享），
+运行期数据归宿主管：设置项走 `localStorage`，多行记录走 SQLite，
+落在 `~/.zex/state/` 下（见「本地存储」「SQLite」两节）。
 
 ## 先查 API，再写代码
 
@@ -183,8 +188,10 @@ await dbBatch([
 ## 宿主接口
 
 ```js
-import { ask, reply, busy, name, session } from "zex.<id>";
+import { ask, reply, busy, name, session, dbExec, dbQuery, dbBatch } from "zex.<id>";
 ```
+
+**全部可用接口就这些**，别去猜还有没有别的：
 
 | 函数 | 说明 |
 |---|---|
@@ -192,6 +199,12 @@ import { ask, reply, busy, name, session } from "zex.<id>";
 | `reply()` | 最近一次回复，**同步可读**（推荐这条） |
 | `busy()` | 是否有 `ask` 在等回包 |
 | `name()` / `session()` | 显示名 / 会话 id |
+| `dbExec(sql, params?)` | 写语句 → `{ changes, lastInsertId }`（详见「SQLite」） |
+| `dbQuery(sql, params?)` | 查询 → 对象数组（详见「SQLite」） |
+| `dbBatch(statements)` | 多条写语句一个事务（详见「SQLite」） |
+
+另外 `window.localStorage` / `window.sessionStorage` 可用，但它们不是模块导出，
+是 `window` 上的（详见「本地存储」）。
 
 模块名带 id 不是可选：宿主模块按名唯一，共用名字会互相顶掉。
 
@@ -250,9 +263,17 @@ export default class App extends View {
 
 ## 能力边界
 
-扩展默认**什么都碰不到**：没有文件、没有网络、没有剪贴板、没有子进程。
-要读文件、要联网，走宿主接口（由 zex 代劳，并受权限与审计约束），
-不要在清单里堆 `capabilities` 指望它生效。
+| 能做 | 不能做 |
+|---|---|
+| 画界面（`gpui-kit` / `gpui-base`） | 读文件（`fs` 未开放） |
+| 调 agent（`ask` / `reply`） | 联网（`network` 未开放） |
+| 本地存储（`localStorage`，全局共享一份） | 剪贴板、子进程（未开放） |
+| SQLite（`dbExec` / `dbQuery` / `dbBatch`，一应用一库） | 碰 zex 自己的库（作者器挡 `ATTACH`） |
+
+清单里的 `capabilities` **声明**可以写，用户能在应用页看到你要什么；
+但除了 `storage`，写了也不生效 —— 生效与否由宿主决定，不是清单决定。
+真要读文件或联网，现在没有路；直接告诉用户"这个能力当前不支持"，
+别绕（比如用 `ask` 让 agent 去读）。
 
 ## 写完怎么验证
 
