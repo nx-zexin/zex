@@ -259,7 +259,11 @@ impl Accumulator {
                 args
             };
             let arguments = serde_json::from_str(&args).map_err(|e| Error::Llm {
-                message: format!("工具 `{name}` 的参数不是合法 JSON: {e}（原文: {args}）"),
+                message: format!(
+                    "工具 `{name}` 的参数不是合法 JSON: {e}（原文: {args}）。\
+                     最常见的原因是输出被 max_tokens 截断：把这次调用拆小\
+                     （比如大文件分几次写，每次不超过 150 行）再试"
+                ),
                 status: None,
                 retryable: false,
             })?;

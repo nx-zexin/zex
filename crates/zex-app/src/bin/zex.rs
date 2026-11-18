@@ -2133,7 +2133,7 @@ impl ChatView {
                     text: format!("上下文已压缩（{strategy}）：{before_tokens} → {after_tokens} tokens"),
                 });
             }
-            CoreEvent::TurnEnded { session, reason, usage, turn: _ } => {
+            CoreEvent::TurnEnded { session, reason, usage, steps, elapsed_ms, turn: _ } => {
                 if !self.is_active(&session) {
                     // 后台会话跑完只是刷新待办，不动当前视图
                     self.tasks = load_tasks(&self.store);
@@ -2148,12 +2148,18 @@ impl ChatView {
                 // 一轮跑完，工作台的待办列表得跟着变 —— 否则用户
                 // 不切换视图就永远看到旧的"执行中"。
                 self.tasks = load_tasks(&self.store);
-                if !matches!(reason, zex_core::EndReason::Completed) {
-                    self.messages.push(MsgItem {
-                        kind: MsgKind::System,
-                        text: format!("本轮结束：{reason:?}"),
-                    });
-                }
+                // 结束一定要说清楚。以前只在非 Completed 时提示，且打的是
+                // `{reason:?}` 调试串 —— 用户既看不懂"MaxSteps"，
+                // 也不知道完成了没有（复杂任务跑几小时，没有落款就只能猜）。
+                self.messages.push(MsgItem {
+                    kind: MsgKind::System,
+                    text: end_reason_text(&reason, steps, elapsed_ms),
+                });
+                // 必须同步条目数：对话流是 `MessageScroller`，它的条目数在
+                // 初始化时就定了，`messages.push` 不会让它知道多了一条。
+                // 少了这一行，结束提示会**永远渲染不出来** —— 这正是
+                // "从来没告诉我任务完成了"的根因。
+                self.sync_scroller(cx);
             }
             CoreEvent::Warning { message } => {
                 self.messages.push(MsgItem { kind: MsgKind::System, text: message });
@@ -2261,6 +2267,31 @@ fn pill(label: String, bg: u32, fg: u32) -> impl IntoElement {
         .font_weight(FontWeight::MEDIUM)
         .text_color(rgb(fg))
         .child(label)
+}
+
+/// 一轮为什么停下来 —— 给用户看的一句话。
+///
+/// 每种结局都要回答两件事：**做完了没有**、**我该做什么**。
+/// 复杂任务可能跑好几个小时，没有一句明确的落款，用户没法判断
+/// "是完成了还是又停在那儿了"。
+fn end_reason_text(reason: &zex_core::EndReason, steps: u32, elapsed_ms: u64) -> String {
+    let took = zex_agent::human_elapsed(std::time::Duration::from_millis(elapsed_ms));
+    let scale = format!("共 {steps} 步，用时 {took}");
+    match reason {
+        zex_core::EndReason::Completed => format!("✓ 任务完成 · {scale}"),
+        zex_core::EndReason::Cancelled => format!("■ 已按你的要求停下 · {scale}"),
+        zex_core::EndReason::MaxSteps { limit } => format!(
+            "⏸ 连续跑了 {limit} 步（已达配置上限）后停下 · {scale}。\
+             回复「继续」可以接着做；要彻底不设上限，把配置里的 \
+             `max_steps` 设为 0"
+        ),
+        zex_core::EndReason::BudgetExhausted => {
+            format!("⏸ 上下文预算用尽，已停下 · {scale}。建议新开一个会话，或先让它总结当前进度")
+        }
+        zex_core::EndReason::Failed { message } => {
+            format!("✗ 出错了：{message} · {scale}")
+        }
+    }
 }
 
 /// 一个应用的图标：`icon.svg` 有就按主题色画出来，没有返回 `None`。
@@ -7968,6 +7999,25 @@ fn main() {
                             this.push_mode_to_kernel(mode, cx);
                             cx.notify();
                             eprintln!("ZEX_AUTO_SWITCH 已切到 {}", mode.label());
+                        });
+                    })
+                    .detach();
+                }
+
+                // 测试钩子：ZEX_AUTO_VIEW=chat 启动后进对话视图。
+                //
+                // 自动任务那条路不走 `submit()`，所以视图会停在「工作台」——
+                // 想截「任务完成」那句话就必须能进对话视图，否则永远截到
+                // 工作台的待办列表，看起来像是提示没生效。
+                if std::env::var("ZEX_AUTO_VIEW").as_deref() == Ok("chat") {
+                    let weak = view.downgrade();
+                    cx.spawn(async move |cx| {
+                        cx.background_executor()
+                            .timer(std::time::Duration::from_millis(700))
+                            .await;
+                        let _ = weak.update(cx, |this, cx| {
+                            this.mode = ViewMode::Chat;
+                            cx.notify();
                         });
                     })
                     .detach();

@@ -46,8 +46,32 @@ pub struct AgentConfig {
     pub provider: ProviderConfig,
     /// 模型名。
     pub model: String,
-    /// 单轮内最多允许的"模型调用"次数（防止工具循环失控）。
+    /// 单段内最多允许的"模型调用"次数。**`0` = 不限**（默认）。
+    ///
+    /// # 为什么默认不限
+    ///
+    /// 步数上限对"跑飞"没什么用，对"长任务"伤害很大：实测 119 个任务里
+    /// 6 个恰好停在 25 步，用户看到的是"干到一半不说话"。而真正复杂的活
+    /// （重构、批量迁移、逐文件核对）本来就该跑几百步甚至跨天。
+    ///
+    /// 该拦住的是**卡住**（同一个调用反复失败），不是**推进**。
+    /// 所以默认不设上限，靠这几个东西兜底：用户按停止、上下文压缩、
+    /// token 预算，以及每 50 步一次的进度提示。
+    ///
+    /// 显式设成正数仍然有效（撞上会自动续段，见 `max_continue_rounds`）。
     pub max_steps: u32,
+    /// 撞到 `max_steps` 之后自动续几段。
+    ///
+    /// # 为什么需要这个
+    ///
+    /// 25 步听起来很多，实际上"读几个文件 → 改 → 自查 → 再改"这种活
+    /// 很容易用掉：实测 119 个任务里有 6 个恰好停在 25 步，用户看到的是
+    /// "干到一半不说话了"，得手动打字说「继续」。
+    ///
+    /// 步数上限的本意是**防跑飞**，不是"任务边界"。模型这一轮还没给出
+    /// 最终回复就说明它没做完，续上就是了 —— 但要有天花板，所以是
+    /// 有限段数而不是无限续。
+    pub max_continue_rounds: u32,
     /// 单次输出 token 上限。
     pub max_tokens: u32,
     /// 工作目录。
@@ -79,7 +103,8 @@ impl AgentConfig {
             // 等于每轮都在白扔上下文
             budget: ContextBudget::for_model(&model),
             model,
-            max_steps: 25,
+            max_steps: 0,
+            max_continue_rounds: 3,
             max_tokens: 8192,
             cwd,
             mode: Mode::Confirm,
@@ -109,6 +134,59 @@ impl AgentConfig {
             self.max_tokens = m;
         }
         self
+    }
+}
+
+/// 把时长说成人话。
+///
+/// 长任务可能跑几小时，`3700 秒` 没人愿意换算。UI 报"完成"时也用它，
+/// 所以是 `pub` 而不是内部小工具。
+pub fn human_elapsed(d: std::time::Duration) -> String {
+    let secs = d.as_secs();
+    if secs < 60 {
+        format!("{secs} 秒")
+    } else if secs < 3600 {
+        format!("{} 分 {} 秒", secs / 60, secs % 60)
+    } else {
+        format!("{} 小时 {} 分", secs / 3600, (secs % 3600) / 60)
+    }
+}
+
+/// 到了步数上限该干什么。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StepBudget {
+    /// 没设上限（`max_steps == 0`），想跑多久跑多久。
+    Unlimited,
+    /// 再开一段，`round` 是第几次续段（从 1 开始）。
+    Continue {
+        /// 第几次续段。
+        round: u32,
+    },
+    /// 到顶了，收工。`total` 是这一轮总共跑过多少步。
+    Stop {
+        /// 总步数上限（含续段）。
+        total: u32,
+    },
+}
+
+/// 到了 `max_steps` 时，续段还是停。
+///
+/// 单独抽出来是为了能测：这段逻辑决定"任务会不会被悄悄掐断"，
+/// 而真正的循环里带着网络和存储，测不动。
+fn step_budget(step: u32, cfg: &AgentConfig, round: u32) -> StepBudget {
+    // `0` = 不限：这是默认值，也是"长任务不该被步数掐断"的落实点
+    if cfg.max_steps == 0 {
+        return StepBudget::Unlimited;
+    }
+    if step < cfg.max_steps {
+        return StepBudget::Unlimited; // 还没到，调用方也不会问
+    }
+    if round < cfg.max_continue_rounds {
+        StepBudget::Continue { round: round + 1 }
+    } else {
+        StepBudget::Stop {
+            total: cfg.max_steps.saturating_mul(cfg.max_continue_rounds + 1),
+        }
     }
 }
 
@@ -494,19 +572,60 @@ impl Agent {
         let mut final_text = String::new();
         let mut end_reason = EndReason::Completed;
         let mut step = 0u32;
+        // 已经自动续过几段
+        let mut round = 0u32;
+        // 整轮累计（续段也算进去）—— 结束时报给用户的就是它
+        let mut total_steps = 0u32;
+        let started = std::time::Instant::now();
 
         loop {
             if self.cancelled.load(Ordering::SeqCst) {
                 end_reason = EndReason::Cancelled;
                 break;
             }
-            if step >= self.cfg.max_steps {
-                end_reason = EndReason::MaxSteps {
-                    limit: self.cfg.max_steps,
-                };
-                break;
+            // 步数上限是**防跑飞**的闸，不是任务边界：这一轮还没给出
+            // 最终回复，就说明没做完，续一段接着跑（上限见 max_continue_rounds）。
+            // 以前这里直接 break，用户看到的是"干到一半不说话"。
+            //
+            // 判定只有 `step_budget` 一处：早先这里还额外写了一遍
+            // `max_steps != 0 &&`，结果改了默认值之后两边对不上 ——
+            // 0（不限）被守卫判成"已到上限"，第一轮就停。
+            match step_budget(step, &self.cfg, round) {
+                    StepBudget::Unlimited => {}
+                    StepBudget::Continue { round: next } => {
+                        round = next;
+                        step = 0;
+                        // 让用户知道这不是结束，也解释了为什么还在动
+                        self.emit(
+                            CoreEvent::Warning {
+                                message: format!(
+                                    "已达单轮 {} 步上限，自动继续（{}/{}）",
+                                    self.cfg.max_steps, round, self.cfg.max_continue_rounds
+                                ),
+                            },
+                            events,
+                        );
+                        continue;
+                    }
+                    StepBudget::Stop { total } => {
+                        end_reason = EndReason::MaxSteps { limit: total };
+                        break;
+                    }
             }
             step += 1;
+            total_steps += 1;
+            // 跨天跑也让人看得见它在动：不是限制，是心跳
+            if total_steps % 50 == 0 {
+                self.emit(
+                    CoreEvent::Warning {
+                        message: format!(
+                            "已跑 {total_steps} 步，用时 {}",
+                            human_elapsed(started.elapsed())
+                        ),
+                    },
+                    events,
+                );
+            }
 
             // 压缩判断放在每次调用模型之前。
             //
@@ -530,6 +649,8 @@ impl Agent {
                                     message: e.to_string(),
                                 },
                                 usage: self.usage,
+                                steps: total_steps,
+                                elapsed_ms: started.elapsed().as_millis() as u64,
                             },
                             events,
                         );
@@ -609,10 +730,12 @@ impl Agent {
 
         self.emit(
             CoreEvent::TurnEnded {
-                        session: self.session.clone(),
+                session: self.session.clone(),
                 turn,
                 reason: end_reason,
                 usage: self.usage,
+                steps: total_steps,
+                elapsed_ms: started.elapsed().as_millis() as u64,
             },
             events,
         );
@@ -1096,6 +1219,62 @@ mod tests {
             "test-model",
             PathBuf::from("/tmp"),
         )
+    }
+
+    #[test]
+    fn default_has_no_step_cap() {
+        // 用户的原话：复杂任务可能跑好几天，别用步数掐断它
+        let cfg = test_cfg();
+        assert_eq!(cfg.max_steps, 0, "默认不设上限");
+        assert_eq!(
+            step_budget(100_000, &cfg, 0),
+            StepBudget::Unlimited,
+            "再长也不该因为步数停下"
+        );
+    }
+
+    #[test]
+    fn explicit_cap_auto_continues_before_giving_up() {
+        // 显式设了上限时，撞上要续段而不是直接哑掉
+        let mut cfg = test_cfg();
+        cfg.max_steps = 25;
+        cfg.max_continue_rounds = 3;
+
+        assert_eq!(
+            step_budget(10, &cfg, 0),
+            StepBudget::Unlimited,
+            "没到上限不该触发任何动作"
+        );
+        assert_eq!(
+            step_budget(25, &cfg, 0),
+            StepBudget::Continue { round: 1 }
+        );
+        assert_eq!(
+            step_budget(25, &cfg, 2),
+            StepBudget::Continue { round: 3 }
+        );
+        assert_eq!(
+            step_budget(25, &cfg, 3),
+            StepBudget::Stop { total: 100 },
+            "续满要停，且报出真实总步数（25 × 4 = 100）"
+        );
+    }
+
+    #[test]
+    fn zero_continue_rounds_stops_at_the_cap() {
+        let mut cfg = test_cfg();
+        cfg.max_steps = 25;
+        cfg.max_continue_rounds = 0;
+        assert_eq!(step_budget(25, &cfg, 0), StepBudget::Stop { total: 25 });
+    }
+
+    #[test]
+    fn elapsed_is_human_readable() {
+        use std::time::Duration;
+        assert_eq!(human_elapsed(Duration::from_secs(9)), "9 秒");
+        assert_eq!(human_elapsed(Duration::from_secs(80)), "1 分 20 秒");
+        // 长任务就是这个量级，得让人一眼看懂
+        assert_eq!(human_elapsed(Duration::from_secs(3 * 3600 + 25 * 60)), "3 小时 25 分");
     }
 
     #[test]
