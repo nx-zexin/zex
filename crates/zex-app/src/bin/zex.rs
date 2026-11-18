@@ -431,6 +431,11 @@ struct ChatView {
     ///
     /// 只在设置页打开时刷新：扫描目录要读文件，没必要每帧做。
     extensions: Vec<zex_extension::Extension>,
+    /// 已打开的扩展 → 脚本文件的最后修改时间（纳秒）。
+    ///
+    /// 用来做热重载：变了就重挂。`runtime.watch` 需要 `ShellRoot`，
+    /// 而我们是面板挂载（View 直接塞进标签），用不了它。
+    ext_mtimes: std::collections::HashMap<String, u128>,
     /// 扩展宿主（首次打开扩展时才建）。
     ///
     /// 建它就要起一个 QuickJS VM（十几 MiB 内存），所以不跟着启动走 ——
@@ -584,6 +589,25 @@ impl ChatView {
             }
         }
 
+        // 扩展热重载：每 1.2 秒看一次已打开扩展的脚本有没有变。
+        // 没有打开的扩展时这个循环几乎不花时间（直接返回）。
+        cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(1200))
+                    .await;
+                let alive = this
+                    .update_in(cx, |this, window, cx| {
+                        this.poll_extension_changes(window, cx);
+                    })
+                    .is_ok();
+                if !alive {
+                    break;
+                }
+            }
+        })
+        .detach();
+
         // 测试钩子：ZEX_AUTO_EXTENSION=<id> 启动后直接把那个扩展挂进右侧面板。
         //
         // 扩展开、关、加载失败这几条路都得有人跑一遍。靠截图点鼠标验证
@@ -680,6 +704,7 @@ impl ChatView {
             expanded_tools: std::collections::HashSet::new(),
             models_expanded: std::collections::HashSet::new(),
             extensions: zex_extension::scan_default(),
+            ext_mtimes: std::collections::HashMap::new(),
             ext_host: None,
             subagent_panel_width: DEFAULT_PANEL_WIDTH,
             subagent_resizing: false,
@@ -3140,12 +3165,11 @@ impl ChatView {
                     _ => (TEXT_DIM, BG_HOVER),
                 },
                 PanelTab::File(_) => (TEXT_DIM, BG_HOVER),
-                PanelTab::Extension(e) => match e.status.as_str() {
-                    "运行中" => (BRAND, BRAND_SOFT),
-                    "就绪" => (OK, OK_SOFT),
-                    "失败" => (DANGER, DANGER_SOFT),
-                    _ => (TEXT_DIM, BG_HOVER),
-                },
+                // 按前缀判断：状态后面可能带补充说明（"就绪 · 已重载"）
+                PanelTab::Extension(e) if e.status.starts_with("运行中") => (BRAND, BRAND_SOFT),
+                PanelTab::Extension(e) if e.status.starts_with("失败") => (DANGER, DANGER_SOFT),
+                PanelTab::Extension(e) if e.status.starts_with("就绪") => (OK, OK_SOFT),
+                PanelTab::Extension(_) => (TEXT_DIM, BG_HOVER),
             };
 
             let chip = div()
@@ -3406,6 +3430,93 @@ impl ChatView {
         self.persist_config(msg, cx);
     }
 
+    /// 脚本文件最后一次修改的时间（纳秒）。取不到时返回 0。
+    ///
+    /// 同时看 `main.js` 和清单：改清单里的 entry 也算改了东西。
+    fn ext_stamp(ext: &zex_extension::Extension) -> u128 {
+        fn mtime(p: &std::path::Path) -> u128 {
+            std::fs::metadata(p)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        }
+        let entry = mtime(&ext.entry_path());
+        let manifest = mtime(&ext.dir.join(zex_extension::catalog::MANIFEST));
+        entry.max(manifest)
+    }
+
+    /// 检查已打开的扩展有没有被改动，变了就重新挂载。
+    ///
+    /// 轮询而不是监听文件系统：一次开发会话里最多同时开两三个扩展，
+    /// 每 1.2 秒读几个 mtime 的成本远低于引入一个 watcher 依赖。
+    /// 没有打开的扩展时这个函数什么都不做。
+    fn poll_extension_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.ext_mtimes.is_empty() {
+            return;
+        }
+        let Some(_host) = self.ext_host.clone() else {
+            return;
+        };
+        // 先算出哪些需要重挂，避免在借用 panel 的同时改 self
+        let mut reload: Vec<zex_extension::Extension> = Vec::new();
+        {
+            let Some(rp) = &self.right_panel else {
+                return;
+            };
+            for tab in &rp.tabs {
+                let PanelTab::Extension(p) = tab else { continue };
+                let Some(ext) = self.extensions.iter().find(|e| e.id == p.id) else {
+                    continue;
+                };
+                let stamp = Self::ext_stamp(ext);
+                let seen = self.ext_mtimes.get(&ext.id).copied().unwrap_or(0);
+                if stamp != seen {
+                    reload.push(ext.clone());
+                }
+            }
+        }
+        if reload.is_empty() {
+            return;
+        }
+
+        let Some(host) = self.ext_host.clone() else {
+            return;
+        };
+        for ext in reload {
+            // 重新扫一遍：改动可能连清单也换了（比如换了 entry）
+            self.extensions = zex_extension::scan_default();
+            let Some(fresh) = self.extensions.iter().find(|e| e.id == ext.id).cloned() else {
+                continue;
+            };
+            let mounted = host.mount(&fresh, window, cx);
+            self.ext_mtimes
+                .insert(fresh.id.clone(), Self::ext_stamp(&fresh));
+            if let Some(rp) = &mut self.right_panel {
+                if let Some(PanelTab::Extension(p)) =
+                    rp.tabs.iter_mut().find(|t| t.key() == format!("ext:{}", fresh.id))
+                {
+                    match mounted {
+                        Ok(v) => {
+                            p.view = Some(v);
+                            p.error = None;
+                            p.status = "就绪 · 已重载".into();
+                        }
+                        Err(e) => {
+                            // 重载失败保留上一版界面：改到一半语法错时，
+                            // 屏幕上那块还在，比整块变红好收拾
+                            p.error = Some(e.to_string());
+                            p.status = "重载失败".into();
+                        }
+                    }
+                }
+            }
+            self.status = format!("`{}` 已重载", fresh.id);
+        }
+        cx.notify();
+    }
+
     /// 跑一次扩展自检，把结论交回给等着的工具。
     ///
     /// 为什么要开一个**隐藏窗口**：`ShellRuntime::check` 内部会
@@ -3560,6 +3671,7 @@ impl ChatView {
             streaming: None,
             status,
         });
+        self.ext_mtimes.insert(ext.id.clone(), Self::ext_stamp(&ext));
         self.activate_or_push_tab(tab, cx);
         true
     }
