@@ -61,11 +61,11 @@ impl Tool for ExtensionCheck {
     type Args = CheckArgs;
 
     fn description() -> &'static str {
-        "校验一个 zex 扩展。写或改完 main.js 之后调用它。\
+        "校验一个 zex 应用（扩展）。写或改完 main.js 之后调用它。\
          它会真的求值一遍脚本，把模块解析、导入名、默认导出的错误原文\
          返回给你 —— 这覆盖了绝大多数手写错误（例如 v_flex 属于 gpui-base，\
          不属于 gpui-kit）。求值通过说明代码是对的，但不代表布局如你所愿：\
-         要确认实际画面，请让用户点开这个扩展，或用 ext_logs 看运行期异常。"
+         要确认实际画面，请让用户点开这个应用，或用 ext_logs 看运行期异常。"
     }
 
     async fn call(&self, _cx: &dyn ToolCtx, args: CheckArgs) -> Result<ToolOutput> {
@@ -107,20 +107,20 @@ impl Tool for ExtensionCheck {
 
         match (report.tree, report.error) {
             (_, Some(err)) => Ok(ToolOutput {
-                content: format!("扩展 `{app_id}` 校验失败：\n{err}"),
+                content: format!("应用 `{app_id}` 校验失败：\n{err}"),
                 // 失败对模型来说是**可用的信息**（它下一步要据此改代码），
                 // 所以带 is_error 但内容完整，而不是抛异常把上下文丢掉
                 is_error: true,
                 meta: None,
             }),
             (Some(tree), None) => Ok(ToolOutput {
-                content: format!("扩展 `{app_id}` 校验通过。元素树：\n{tree}"),
+                content: format!("应用 `{app_id}` 校验通过。元素树：\n{tree}"),
                 is_error: false,
                 meta: None,
             }),
             (None, None) => Ok(ToolOutput {
                 content: format!(
-                    "扩展 `{app_id}` 校验通过。{}",
+                    "应用 `{app_id}` 校验通过。{}",
                     report.note.unwrap_or_else(|| "脚本求值正常。".into())
                 ),
                 is_error: false,
@@ -268,6 +268,18 @@ impl Tool for ExtensionInstall {
         } else {
             format!("\n注意：{entry} 还不存在，先用 fs_write 写好再打开。")
         };
+        // 图标缺失只提醒、不拦：它是装饰，不该让"能跑的应用"装不上。
+        // 但一定要说 —— 不说的话模型每次都会漏，用户看到的就是一排灰点。
+        let icon_note = if dir.join(zex_extension::catalog::ICON).exists() {
+            String::new()
+        } else {
+            format!(
+                "\n提示：{} 里还没有 {}，侧边栏那儿会显示成一个灰点。\
+                 写上它（24x24 viewBox、单色、stroke-width=2），用户才分得清哪个是哪个。",
+                dir.display(),
+                zex_extension::catalog::ICON
+            )
+        };
 
         let manifest_path = dir.join(zex_extension::catalog::MANIFEST);
         if !manifest_path.exists() {
@@ -287,8 +299,8 @@ impl Tool for ExtensionInstall {
         let count = zex_extension::scan_default().len();
         Ok(ToolOutput {
             content: format!(
-                "已登记扩展 `{id}`（入口 {entry}）。当前共有 {count} 个扩展。{entry_note}\n\
-                 下一步：用 ext_check 校验；用户在「设置 → 扩展」点开，或固定到侧边栏直接点。"
+                "已登记应用 `{id}`（入口 {entry}）。当前共有 {count} 个。{entry_note}{icon_note}\n\
+                 下一步：用 ext_check 校验；用户在「设置 → 应用」点开，或固定到侧边栏直接点。"
             ),
             is_error: false,
             meta: None,
@@ -347,7 +359,7 @@ impl Tool for ExtensionUninstall {
             message: format!("删除失败 {}: {e}", dir.display()),
         })?;
         Ok(ToolOutput {
-            content: format!("已删除扩展 `{id}`（{}）。已固定的侧边栏入口会在下次启动时消失。", dir.display()),
+            content: format!("已删除应用 `{id}`（{}）。已固定的侧边栏入口会在下次启动时消失。", dir.display()),
             is_error: false,
             meta: None,
         })

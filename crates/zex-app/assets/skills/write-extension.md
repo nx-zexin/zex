@@ -1,12 +1,14 @@
 ---
 name: write-extension
-description: 给 zex 写一个扩展（脚本面板/独立小应用），含模块划分、宿主接口和三条必踩的坑
+description: 给 zex 写一个应用（脚本面板/独立小应用），含模块划分、宿主接口、图标规范和三条必踩的坑
 ---
 
-# 给 zex 写扩展
+# 给 zex 写应用
 
-扩展是一段跑在 zex 进程内的 JavaScript，能画自己的界面、能调 agent 和工具。
+一个应用就是一段跑在 zex 进程内的 JavaScript，能画自己的界面、能调 agent 和工具。
 不需要编译，改完重新打开面板即可生效。
+
+界面上管它叫「应用」，代码和路径里还叫扩展（`~/.zex/extensions`）—— 同一个东西。
 
 ## 目录
 
@@ -14,6 +16,7 @@ description: 给 zex 写一个扩展（脚本面板/独立小应用），含模�
 ~/.zex/extensions/<id>/
 ├── gpui-shell.json     # 清单
 ├── main.js             # 入口
+├── icon.svg            # 图标（见下，每次都要给）
 └── gpui-kit.d.ts       # 自动生成，别手写、别提交
 ```
 
@@ -43,6 +46,46 @@ grep -n "v_flex\|h_flex" ~/.zex/extensions/<id>/gpui-kit.d.ts
 | `zex.<id>` | 本扩展的宿主接口（见下） |
 
 最常见的错：`import { v_flex } from "gpui-kit"` —— **`v_flex` 在 `gpui-base`**。
+
+## 图标：每个应用都要有一个
+
+`icon.svg` 会显示在左侧栏和设置页的应用列表里。**每次建应用都顺手写一个**，
+否则那里只有一个灰点，用户分不清自己装了什么。
+
+它是靠**文件名**认的，清单里不写 —— 上游清单 `deny_unknown_fields`，
+多一个键整个清单一解析就废，所以图标走约定文件。
+
+### 三条硬约束
+
+1. **单色**。渲染器只取 alpha 遮罩，颜色由主题决定：写 `fill="#ff0000"`
+   不会出来红色，出来的是当前主题的前景色。所以**别用颜色表达信息**，
+   要靠形状、疏密、`fill-opacity` / `stroke-opacity` 区分层次。
+2. **`viewBox` 固定 `0 0 24 24`**，不要写 `width` / `height`。
+   实际显示 14px（侧栏）和 28px（设置页），靠缩放。
+3. **线条要够粗**。14px 下 1 单位 ≈ 0.58px，`stroke-width="1"` 会虚。
+   统一用 `stroke-width="2"`、`fill="none"`、`stroke-linecap="round"`，
+   和界面上其他图标（Lucide 风格）保持一致。
+
+### 可直接改的模板
+
+```svg
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"
+     stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+  <circle cx="12" cy="12" r="9"/>
+  <path d="M12 7v5l3 2"/>
+</svg>
+```
+
+（这是「时钟」。换成你的应用要画的形状就行；`currentColor` 才是对的写法，
+它表示"用主题色"，虽然渲染器其实不看这个值。）
+
+### 别做的事
+
+- 别内嵌位图（`<image>`）、别用滤镜/渐变/`<text>` —— resvg 能解析，
+  但在 14px 的 alpha 遮罩上只会糊成一团；
+- 别把整块 24x24 涂满：会变成一个实心方块，和旁边的小圆点没区别；
+- 写坏了不会报错，只是那行回到灰点 —— 所以写完用 `ext_check` 顺带确认
+  目录里有这个文件，或者直接问用户看到的是不是他想要的形状。
 
 ## 宿主接口
 

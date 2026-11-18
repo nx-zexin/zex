@@ -2234,6 +2234,26 @@ fn pill(label: String, bg: u32, fg: u32) -> impl IntoElement {
         .child(label)
 }
 
+/// 一个应用的图标：`icon.svg` 有就按主题色画出来，没有返回 `None`。
+///
+/// 为什么是 `Option`：回退方案在两个调用点不一样 —— 侧边栏退成一个小圆点
+/// （保持原来的视觉节奏），设置页干脆不占位（那里有名字和路径，图标只是点缀）。
+/// 所以"没有图标"这件事交给调用方决定，不在这里编一个通用占位。
+///
+/// SVG 是**单色**渲染的：resvg 只取 alpha 遮罩，颜色由 `text_color` 决定。
+/// 所以图标里写什么 `fill` 都不作数，形状和 `fill-opacity` 才作数。
+fn app_icon(icon: Option<&Arc<[u8]>>, size: f32, color: u32) -> Option<AnyElement> {
+    let bytes = icon?;
+    Some(
+        svg()
+            .data(bytes)
+            .flex_shrink_0()
+            .size(px(size))
+            .text_color(rgb(color))
+            .into_any_element(),
+    )
+}
+
 /// 往当前组里追加一步调用，没有组就新开一个。
 fn push_tool_step(items: &mut Vec<MsgItem>, step: ToolStep) {
     if let Some(MsgItem { kind: MsgKind::ToolGroup { steps }, .. }) = items.last_mut() {
@@ -3382,7 +3402,7 @@ impl ChatView {
                         .text_sm()
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(rgb(DANGER))
-                        .child(format!("扩展 `{}` 未能加载", e.id)),
+                        .child(format!("应用 `{}` 未能加载", e.id)),
                 )
                 .child(
                     div()
@@ -3639,7 +3659,7 @@ impl ChatView {
         cx: &mut Context<Self>,
     ) -> bool {
         let Some(ext) = self.extensions.iter().find(|e| e.id == id).cloned() else {
-            self.status = format!("没有名为 `{id}` 的扩展");
+            self.status = format!("没有名为 `{id}` 的应用");
             cx.notify();
             return false;
         };
@@ -3658,7 +3678,7 @@ impl ChatView {
         // 没有这一行的话 create_task 会静默失败（`let _ =` 吞掉了）
         let _ = self.store.ensure_session(
             &zex_core::SessionId::from(session.as_str()),
-            &format!("扩展：{}", ext.name),
+            &format!("应用：{}", ext.name),
             &self.model,
             &self.cwd,
         );
@@ -4108,7 +4128,7 @@ impl ChatView {
             (SettingsTab::Model, "模型", "provider 与默认模型"),
             (SettingsTab::Skill, "技能", "可复用的能力包"),
             (SettingsTab::Mcp, "MCP", "外部工具服务"),
-            (SettingsTab::Extension, "扩展", "脚本面板"),
+            (SettingsTab::Extension, "应用", "自己写的小应用"),
             (SettingsTab::About, "关于", "版本与路径"),
         ];
 
@@ -5491,7 +5511,7 @@ impl ChatView {
                             .text_lg()
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(rgb(TEXT))
-                            .child("扩展"),
+                            .child("应用"),
                     )
                     .child(div().flex_1())
                     .child(
@@ -5502,7 +5522,7 @@ impl ChatView {
                             .on_click(cx.listener(|this, _: &ClickEvent, _w, cx| {
                                 this.extensions = zex_extension::scan_default();
                                 this.status =
-                                    format!("已扫描到 {} 个扩展", this.extensions.len());
+                                    format!("已扫描到 {} 个应用", this.extensions.len());
                                 cx.notify();
                             })),
                     ),
@@ -5518,8 +5538,9 @@ impl ChatView {
                     .text_xs()
                     .text_color(rgb(TEXT_MUTED))
                     .child(
-                        "每个扩展是一个子目录，里面放 gpui-shell.json（id / name / entry）\
-                         和脚本入口。脚本里用 `import { ask } from \"zex.<id>\"` 调用 agent；\
+                        "每个应用是一个子目录，里面放 gpui-shell.json（id / name / entry）、\
+                         脚本入口，以及可选的 icon.svg（侧边栏显示的那个图标）。\
+                         脚本里用 `import { ask } from \"zex.<id>\"` 调用 agent；\
                          示例见仓库 examples/extensions/demo，文档见 docs/EXTENSIONS.md。",
                     ),
             );
@@ -5540,7 +5561,7 @@ impl ChatView {
                             div()
                                 .text_sm()
                                 .text_color(rgb(TEXT_MUTED))
-                                .child("还没有任何扩展。"),
+                                .child("还没有任何应用。"),
                         )
                         .child(
                             div()
@@ -5573,6 +5594,8 @@ impl ChatView {
                     .border_color(rgb(BORDER))
                     .bg(rgb(BG_MAIN))
                     .p_4()
+                    // 图标放在名字左边、和名字同高对齐；没有就不占位
+                    .children(app_icon(ext.icon.as_ref(), 28.0, TEXT_MUTED))
                     .child(
                         div()
                             .flex()
@@ -6080,11 +6103,11 @@ impl ChatView {
                 .cursor_pointer()
                 .hover(|s| s.bg(rgb(BG_HOVER)))
                 .child(
-                    Icon::new(IconName::Puzzle)
+                    Icon::new(IconName::Blocks)
                         .text_size(px(14.0))
                         .text_color(rgb(TEXT_DIM)),
                 )
-                .child("扩展")
+                .child("应用")
                 .child(div().flex_1())
                 // 已固定几个，就在右边标几个：一眼看出还有没有空位
                 .child(
@@ -6132,13 +6155,21 @@ impl ChatView {
             col = col.child(
                 row
                     .hover(|s| s.bg(rgb(BG_HOVER)))
-                    .child(
-                        div()
+                    .child(match app_icon(
+                        ext.icon.as_ref(),
+                        14.0,
+                        if open { BRAND } else { TEXT_MUTED },
+                    ) {
+                        // 有 icon.svg 就画它；没有就退回原作那个小圆点，
+                        // 让老应用（和手写的半成品）看起来不像是坏了
+                        Some(icon) => icon,
+                        None => div()
                             .size(px(6.0))
                             .rounded_full()
                             .flex_none()
-                            .bg(rgb(if open { BRAND } else { TEXT_DIM })),
-                    )
+                            .bg(rgb(if open { BRAND } else { TEXT_DIM }))
+                            .into_any_element(),
+                    })
                     .child(div().flex_1().min_w(px(0.0)).truncate().child(ext.name.clone()))
                     .on_mouse_down(
                         MouseButton::Left,

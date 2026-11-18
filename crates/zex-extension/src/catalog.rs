@@ -11,7 +11,8 @@
 //! ```text
 //! ~/.zex/extensions/git-status/
 //! ├── gpui-shell.json     # id / name / entry，上游认的格式
-//! └── main.js
+//! ├── main.js
+//! └── icon.svg           # 可选，清单里不写，靠文件名认
 //! ```
 //!
 //! `gpui-shell.json` 直接复用上游的清单格式，不自造一套：这样同一个目录
@@ -21,6 +22,7 @@
 //! 需要额外元数据时另开文件，别去污染它。
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::Deserialize;
 
@@ -29,6 +31,14 @@ pub const MANIFEST: &str = "gpui-shell.json";
 
 /// 缺省入口。
 pub const DEFAULT_ENTRY: &str = "main.js";
+
+/// 图标的约定文件名。
+///
+/// 为什么是文件而不是清单字段：上游的 `gpui-shell.json` 开了
+/// `deny_unknown_fields`，往里塞 `icon` 会让清单整个解析失败 ——
+/// 那样 zex 能显示图标，`gpui-shell dev` 却跑不起来。约定文件名
+/// 对上游完全透明，两边都能用。
+pub const ICON: &str = "icon.svg";
 
 /// 一个已安装扩展的静态信息。
 ///
@@ -46,6 +56,11 @@ pub struct Extension {
     pub dir: PathBuf,
     /// 清单里申请的能力。只作展示与留痕，本版不生效。
     pub request: CapabilityRequest,
+    /// 图标的原始 SVG 字节（`icon.svg` 存在时才有）。
+    ///
+    /// 扫描时就读进来，而不是每次渲染再读盘：侧边栏一行一个图标，
+    /// 每帧都去 open/read 一遍太亏。图标只有几 KB，内存里放着无妨。
+    pub icon: Option<Arc<[u8]>>,
 }
 
 impl Extension {
@@ -246,9 +261,23 @@ fn read_one(dir: &Path) -> Result<Option<Extension>, String> {
         id: manifest.id,
         name: manifest.name,
         entry,
+        icon: read_icon(dir),
         dir: dir.to_path_buf(),
         request: parse_request(&text),
     }))
+}
+
+/// 读 `icon.svg`。
+///
+/// 读不出来就当没有 —— 图标是装饰，缺了不该让整个应用装不上。
+/// 空文件也当没有：`svg().data(&[])` 会让 resvg 报解析错误，
+/// 那是由每帧刷一条日志的代价换来的一个空方块，不值。
+fn read_icon(dir: &Path) -> Option<Arc<[u8]>> {
+    let bytes = std::fs::read(dir.join(ICON)).ok()?;
+    if bytes.is_empty() {
+        return None;
+    }
+    Some(Arc::from(bytes))
 }
 
 /// 从清单原文里取能力申请。
@@ -399,6 +428,38 @@ mod tests {
     }
 
     #[test]
+    fn reads_icon_svg_from_convention_file() {
+        let root = temp_root("icon");
+        write_ext(&root, "a", r#"{"id":"a","name":"A"}"#, "");
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/></svg>"#;
+        std::fs::write(root.join("a").join(ICON), svg).unwrap();
+        let list = scan(&root);
+        let icon = list[0].icon.as_ref().expect("icon.svg 存在就该读进来");
+        assert_eq!(&**icon, svg.as_bytes());
+    }
+
+    #[test]
+    fn missing_or_empty_icon_is_none() {
+        let root = temp_root("noicon");
+        write_ext(&root, "a", r#"{"id":"a","name":"A"}"#, "");
+        write_ext(&root, "b", r#"{"id":"b","name":"B"}"#, "");
+        std::fs::write(root.join("b").join(ICON), "").unwrap();
+        let list = scan(&root);
+        assert!(list[0].icon.is_none(), "没有 icon.svg");
+        assert!(list[1].icon.is_none(), "空文件也算没有");
+    }
+
+    #[test]
+    fn icon_is_not_a_manifest_field() {
+        // 图标走文件名约定，清单里写 icon 也不会被当字段
+        let root = temp_root("icon-field");
+        write_ext(&root, "a", r#"{"id":"a","name":"A","icon":"x.svg"}"#, "");
+        let list = scan(&root);
+        assert_eq!(list.len(), 1, "上游清单允许的额外键不该导致失败");
+        assert!(list[0].icon.is_none(), "清单里的 icon 不参与，只看文件");
+    }
+
+    #[test]
     fn session_id_is_namespaced() {
         let ext = Extension {
             id: "demo".into(),
@@ -406,6 +467,7 @@ mod tests {
             entry: "main.js".into(),
             dir: PathBuf::from("/tmp/x"),
             request: CapabilityRequest::default(),
+            icon: None,
         };
         // 前缀让"是不是扩展的会话"一眼可判
         assert_eq!(ext.session_id(), "ext-demo");

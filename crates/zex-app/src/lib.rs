@@ -82,29 +82,117 @@ const BUNDLED_SKILLS: &[(&str, &str)] = &[(
     include_str!("../assets/skills/write-extension.md"),
 )];
 
-/// 把随程序带的技能铺到磁盘（已有就跳过）。
+/// 记录"我们上次铺下去的是什么"，用来分辨用户改没改。
 ///
-/// 用 `create_new` 而不是 `write`：用户改过的版本必须留着。
-/// 说明书是起点，不是圣旨。
+/// 放在技能目录里而不是配置目录：它描述的是这个目录的内容，
+/// 跟着目录走，整个 `~/.zex/skills` 拷贝/删除时不会错位。
+const BUNDLE_STATE: &str = ".bundled-hashes.json";
+
+/// 把随程序带的技能铺到磁盘。
+///
+/// 规则是「没改过就更新，改过就不动」——
+///
+/// - 文件不存在 → 写。
+/// - 存在、且内容和上次铺下去的一模一样 → 说明用户没碰过，用新版覆盖。
+///   这一条是必须的：技能里写的是 API 事实（`v_flex` 属于哪个模块），
+///   留着旧版会**主动误导**模型，比没有更糟。
+/// - 存在、但和记录对不上 → 用户改过，一个字都不动。
+/// - 存在、但没有记录（这个机制上线前装的）→ 无法判断，于是先把旧内容
+///   备份成 `.bundled-backup-<名字>`，再写新版。宁可多一个备份文件，
+///   也不能悄悄扔掉别人可能改过的东西。
 fn install_bundled_skills(dir: &std::path::Path) {
+    let state_path = dir.join(BUNDLE_STATE);
+    let mut state = read_bundle_state(&state_path);
+    let mut dirty = false;
+
     for (name, body) in BUNDLED_SKILLS {
         let path = dir.join(name);
-        if path.exists() {
-            continue;
-        }
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
-            Ok(mut f) => {
-                use std::io::Write as _;
-                let _ = f.write_all(body.as_bytes());
+        let want = fnv1a(body);
+        let existing = std::fs::read_to_string(&path).ok();
+
+        let decision = match &existing {
+            None => Decision::Write,
+            Some(text) => {
+                let have = fnv1a(text);
+                if have == want {
+                    // 已经是最新的，不用写，但记下来
+                    state.insert((*name).to_string(), want);
+                    dirty = true;
+                    continue;
+                }
+                match state.get(*name) {
+                    Some(recorded) if *recorded == have => Decision::Write,
+                    Some(_) => Decision::KeepUserEdited,
+                    None => Decision::Migrate,
+                }
             }
-            // 写不进去不当错误：技能库少了这一条，其它照常
-            Err(e) => tracing::warn!(skill = name, error = %e, "无法安装内置技能"),
+        };
+
+        match decision {
+            Decision::Write => {
+                if let Err(e) = std::fs::write(&path, body) {
+                    tracing::warn!(skill = name, error = %e, "无法写入内置技能");
+                    continue;
+                }
+                state.insert((*name).to_string(), want);
+                dirty = true;
+            }
+            Decision::KeepUserEdited => {
+                tracing::debug!(skill = name, "内置技能被用户改过，保留原样");
+            }
+            Decision::Migrate => {
+                let backup = dir.join(format!(".bundled-backup-{name}"));
+                if let Some(old) = &existing {
+                    let _ = std::fs::write(&backup, old);
+                }
+                if let Err(e) = std::fs::write(&path, body) {
+                    tracing::warn!(skill = name, error = %e, "无法写入内置技能");
+                    continue;
+                }
+                tracing::info!(
+                    skill = name,
+                    backup = %backup.display(),
+                    "内置技能已升级到当前版本，旧内容已备份"
+                );
+                state.insert((*name).to_string(), want);
+                dirty = true;
+            }
         }
     }
+
+    if dirty {
+        if let Ok(text) = serde_json::to_string_pretty(&state) {
+            let _ = std::fs::write(&state_path, text);
+        }
+    }
+}
+
+/// 一次写入的取舍。
+enum Decision {
+    /// 没改过 / 不存在：写新版。
+    Write,
+    /// 用户改过：一个字都不动。
+    KeepUserEdited,
+    /// 没有记录：备份后写新版。
+    Migrate,
+}
+
+fn read_bundle_state(path: &std::path::Path) -> std::collections::BTreeMap<String, u64> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+/// FNV-1a。用它是为了**跨版本稳定**：这个值要落盘，换个工具链还得认得出来。
+/// `DefaultHasher` 做不到这点（不保证跨 Rust 版本稳定）。
+fn fnv1a(text: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in text.as_bytes() {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    hash
 }
 
 /// 加载技能库。
@@ -839,23 +927,71 @@ mod skills_tests {
     }
 
     #[test]
-    fn bundled_skill_is_installed_once() {
+    fn bundled_skill_is_installed_when_missing() {
         let dir = temp_dir("install");
         install_bundled_skills(&dir);
         let path = dir.join("write-extension.md");
         assert!(path.exists(), "内置技能应被铺到磁盘");
         let once = std::fs::read_to_string(&path).unwrap();
-        assert!(once.contains("write-extension") || once.contains("给 zex 写扩展"));
+        assert!(once.contains("write-extension") || once.contains("给 zex 写"));
+        assert!(dir.join(BUNDLE_STATE).exists(), "应记下铺的版本，用于下次判断");
+    }
+
+    #[test]
+    fn unmodified_copy_is_upgraded() {
+        let dir = temp_dir("upgrade");
+        install_bundled_skills(&dir);
+        let path = dir.join("write-extension.md");
+        // 模拟"旧版铺下去、用户没碰"：内容变了，但记录也跟着变
+        let stale = "---\nname: write-extension\ndescription: 旧版\n---\n\n旧内容\n";
+        std::fs::write(&path, stale).unwrap();
+        std::fs::write(
+            dir.join(BUNDLE_STATE),
+            serde_json::json!({"write-extension.md": fnv1a(stale)}).to_string(),
+        )
+        .unwrap();
+        install_bundled_skills(&dir);
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(!after.contains("旧内容"), "没改过的旧版必须被升级，否则会误导模型");
+        assert!(after.contains("icon.svg"), "新版内容应到位");
     }
 
     #[test]
     fn user_edited_copy_is_never_overwritten() {
         let dir = temp_dir("keep");
         let path = dir.join("write-extension.md");
-        // 用户改过的版本
-        std::fs::write(&path, "---\nname: mine\ndescription: 我改过的\n---\n\n别动我\n").unwrap();
+        let mine = "---\nname: write-extension\ndescription: 我改过的\n---\n\n别动我\n";
+        std::fs::write(&path, mine).unwrap();
+        // 记录里是别的版本 → 说明用户动过
+        std::fs::write(
+            dir.join(BUNDLE_STATE),
+            serde_json::json!({"write-extension.md": fnv1a("别的版本")}).to_string(),
+        )
+        .unwrap();
         install_bundled_skills(&dir);
         let after = std::fs::read_to_string(&path).unwrap();
         assert!(after.contains("别动我"), "内置技能不该覆盖用户改过的版本");
+    }
+
+    #[test]
+    fn copy_without_record_is_migrated_with_backup() {
+        let dir = temp_dir("migrate");
+        let path = dir.join("write-extension.md");
+        // 这个机制上线前装的：文件在，但没有记录
+        std::fs::write(&path, "---\nname: write-extension\n---\n\n上一代内容\n").unwrap();
+        install_bundled_skills(&dir);
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.contains("icon.svg"), "没有记录时也要升级到新版");
+        let backup = dir.join(".bundled-backup-write-extension.md");
+        let kept = std::fs::read_to_string(&backup).unwrap();
+        assert!(kept.contains("上一代内容"), "旧内容必须留个备份，不能凭空消失");
+    }
+
+    #[test]
+    fn fnv1a_is_stable() {
+        // 这个值要落盘跨版本使用，变了就等于所有人的技能都被判成"用户改过"
+        assert_eq!(fnv1a(""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fnv1a("a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(fnv1a("abc"), 0xe71f_a219_0541_574b);
     }
 }

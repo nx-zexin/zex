@@ -1,12 +1,17 @@
-# 扩展
+# 扩展（界面上叫「应用」）
 
-扩展是一段跑在 zex 进程内的 JavaScript，能画自己的界面（挂在右侧面板的一个标签里），
+一个扩展就是一段跑在 zex 进程内的 JavaScript，能画自己的界面（挂在右侧面板的一个标签里），
 也能调 agent。它不需要重新编译，也不需要重新分发二进制。
+
+**界面上管它叫「应用」**：说"写个应用"比"写个扩展"更像用户想干的事。
+代码、路径、工具名里仍是 `extension` / `ext_*` —— 改名会牵动插件清单格式和
+所有已装目录，收益不够，所以保留内部叫法，只改用户看到的那一层。
 
 ```text
 ~/.zex/extensions/git-status/
 ├── gpui-shell.json     # id / name / entry
-└── main.js
+├── main.js
+└── icon.svg            # 可选，侧边栏显示的那个图标
 ```
 
 把 `examples/extensions/demo` 整个目录拷到 `~/.zex/extensions/` 就能看到它：
@@ -15,7 +20,34 @@
 cp -r examples/extensions/demo ~/.zex/extensions/
 ```
 
-然后在「设置 → 扩展」里点「打开」。
+然后在「设置 → 应用」里点「打开」。
+
+## 图标
+
+`icon.svg` 出现在侧边栏和设置页的应用列表里；没有就退回一个小灰点。
+
+它是**按文件名认的**，清单里不写 —— 上游的 `gpui-shell.json` 开了
+`deny_unknown_fields`，加一个 `icon` 键会让整份清单解析失败：那样 zex 能显示图标，
+`gpui-shell dev` 却跑不起来。约定文件名对上游完全透明。
+
+```svg
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"
+     stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+  <circle cx="12" cy="12" r="9"/>
+  <path d="M12 7v5l3 2"/>
+</svg>
+```
+
+三条约束：
+
+- **单色**。`Window::paint_svg` 只取 alpha 遮罩，颜色来自 `text_color`，
+  所以图标里的 `fill` 写什么都不作数 —— 层次只能靠形状和 `fill-opacity`。
+- **`viewBox 0 0 24 24`**，不写 `width`/`height`：实际按 14px（侧栏）和 28px（设置页）缩放。
+- **线要够粗**。14px 下 1 个用户单位约 0.58px，`stroke-width="1"` 会发虚，
+  和界面上其他 Lucide 图标一样用 2。
+
+扫描时就把字节读进 `Extension::icon`，不是每帧读盘：侧边栏一行一个图标，
+每帧 open/read 一遍太亏。读不出来就当没有 —— 图标是装饰，缺了不该让应用装不上。
 
 ## 让 agent 来写
 
