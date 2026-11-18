@@ -57,6 +57,60 @@ pub const MAX_CONNECTIONS: usize = 8;
 /// 一次 `recv` 最多等多久（脚本可以传更小的值）。
 pub const RECV_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// 清单申请的主机 ∩ 用户授权的主机。
+///
+/// # 为什么取交集而不是"用户授权说了算"
+///
+/// 清单是模型写的，用户授权是人给的 —— 两边的方向正好相反：
+/// 清单可能偷偷加一条（用户批准之后改了清单），授权可能留着旧条目。
+/// 取交集保证**任何时候生效的都是"人同意过、且代码里确实要用的"**：
+/// 清单偷偷加 = 不生效；用户撤销 = 立刻不生效。
+pub fn intersect(declared: &[String], granted: &[String]) -> Vec<String> {
+    declared
+        .iter()
+        .filter(|want| {
+            // 逐条比对：清单写 `api.x.com`、授权写 `https://api.x.com/` 也算同一条
+            let w = want.trim().to_ascii_lowercase();
+            granted.iter().any(|g| g.trim().to_ascii_lowercase() == w)
+        })
+        .cloned()
+        .collect()
+}
+
+/// 把生效的主机清单拆成上游 `Capabilities` 能表达的形状。
+///
+/// # 为什么需要这层翻译
+///
+/// 宿主自己的 `httpRequest` / `tcpConnect` 走 [`NetPolicy`]，什么写法都认；
+/// 但脚本里更顺手的 `fetch`、`WebSocket` 是 **gpui-shell 内建**的，它们看
+/// 的是 `Capabilities::network_hosts` —— 只认精确主机名，不认通配、不认端口。
+/// 想让 `fetch` 也遵守"清单 ∩ 授权"，就得把结果翻译成它的语言：
+///
+/// - `api.example.com` → `network_hosts`（精确主机，端口不限）
+/// - `api.example.com:8443` → `HttpRequestGrant`（上游只有这里能带端口）
+/// - `*.example.com` / `*` → 翻译不过去，**只留给自己的 `httpRequest`**：
+///   与其让 `fetch` 悄悄放行整个域，不如让它连不上（见下面的注释）。
+pub fn upstream_grants(entries: &[String]) -> (Vec<String>, Vec<(String, u16)>, Vec<String>) {
+    let mut hosts = Vec::new();
+    let mut ports = Vec::new();
+    let mut unsupported = Vec::new();
+    for entry in entries {
+        let Ok(rule) = parse_rule(entry) else {
+            // 解析不过去的条目本来就进不了 NetPolicy，这里也不必放大
+            continue;
+        };
+        match (rule.pattern, rule.port) {
+            (Pattern::Exact(host), None) => hosts.push(host),
+            (Pattern::Exact(host), Some(port)) => ports.push((host, port)),
+            // 通配没有对应表达。宁可让 fetch 拒绝，也不能退化成
+            // "为了让它能用，把 `*` 当成放行一切"
+            (Pattern::Any, _) => unsupported.push(entry.clone()),
+            (Pattern::Suffix(_), _) => unsupported.push(entry.clone()),
+        }
+    }
+    (hosts, ports, unsupported)
+}
+
 /// 一个应用的网络白名单。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NetPolicy {
@@ -292,7 +346,9 @@ pub struct NetHub {
 }
 
 struct Inner {
-    policy: NetPolicy,
+    /// 当前生效的白名单。可换：用户在应用开着的时候点「允许」，
+    /// 下一次调用就该通，不用重开面板。
+    policy: std::sync::RwLock<NetPolicy>,
     conns: Mutex<HashMap<ConnId, Conn>>,
     next_id: std::sync::atomic::AtomicU64,
 }
@@ -308,16 +364,27 @@ impl NetHub {
         Ok(Self {
             runtime,
             inner: Arc::new(Inner {
-                policy,
+                policy: std::sync::RwLock::new(policy),
                 conns: Mutex::new(HashMap::new()),
                 next_id: std::sync::atomic::AtomicU64::new(1),
             }),
         })
     }
 
-    /// 白名单（测试与错误信息用）。
-    pub fn policy(&self) -> &NetPolicy {
-        &self.inner.policy
+    /// 换白名单（用户确认/撤销后立刻生效）。
+    pub fn set_policy(&self, policy: NetPolicy) {
+        if let Ok(mut p) = self.inner.policy.write() {
+            *p = policy;
+        }
+    }
+
+    /// 当前白名单的摘要（错误信息用）。
+    pub fn describe_policy(&self) -> String {
+        self.inner
+            .policy
+            .read()
+            .map(|p| p.describe())
+            .unwrap_or_else(|_| "（不可读）".into())
     }
 
     /// 把一段工作丢进自己的运行时。
@@ -438,7 +505,7 @@ async fn http_on(inner: &Arc<Inner>, req: HttpRequest) -> Result<HttpResponse, S
     if scheme != "http" && scheme != "https" {
         return Err(format!("只支持 http/https，收到 `{scheme}://`"));
     }
-    guard(&inner.policy, &host, port)?;
+    guard_now(inner, &host, port)?;
 
     let client = reqwest::Client::builder()
         // **不跟随重定向**：跟着跳就能绕过白名单（302 到别的域名）。
@@ -497,7 +564,7 @@ async fn http_on(inner: &Arc<Inner>, req: HttpRequest) -> Result<HttpResponse, S
 }
 
 async fn tcp_connect_on(inner: &Arc<Inner>, host: &str, port: u16) -> Result<ConnId, String> {
-    guard(&inner.policy, host, port)?;
+    guard_now(inner, &host, port)?;
     inner.ensure_room().await?;
 
     let stream = tokio::net::TcpStream::connect((host, port))
@@ -583,7 +650,7 @@ async fn ws_connect_on(inner: &Arc<Inner>, url: &str) -> Result<ConnId, String> 
     if scheme != "ws" && scheme != "wss" {
         return Err(format!("只支持 ws/wss，收到 `{scheme}://`"));
     }
-    guard(&inner.policy, &host, port)?;
+    guard_now(inner, &host, port)?;
     inner.ensure_room().await?;
 
     let (stream, _resp) = tokio_tungstenite::connect_async(url)
@@ -659,6 +726,15 @@ async fn ws_close_on(inner: &Arc<Inner>, id: &str) -> bool {
     true
 }
 
+/// 按当前白名单过闸（读锁在函数内取，避免跨 await 持有）。
+fn guard_now(inner: &Inner, host: &str, port: u16) -> Result<(), String> {
+    let policy = inner
+        .policy
+        .read()
+        .map_err(|_| "白名单不可读".to_string())?;
+    guard(&policy, host, port)
+}
+
 /// 白名单闸门：不在名单里就给一句能照做的错误。
 ///
 /// 单独一个函数而不是 `NetHub` 的方法：判定逻辑不需要运行时，
@@ -684,13 +760,12 @@ async fn recv_on(
     tcp: bool,
 ) -> Result<Recv, String> {
     let conns = inner.conns.lock().await;
-    let (inbox, exists) = match conns.get(id) {
-        Some(Conn::Tcp(c)) if tcp => (&c.inbox, true),
-        Some(Conn::Ws(c)) if !tcp => (&c.inbox, true),
-        Some(_) => (return Err(format!("连接 `{id}` 的类型不匹配"))),
-        None => (return Err(format!("没有连接 `{id}`"))),
+    let inbox = match conns.get(id) {
+        Some(Conn::Tcp(c)) if tcp => &c.inbox,
+        Some(Conn::Ws(c)) if !tcp => &c.inbox,
+        Some(_) => return Err(format!("连接 `{id}` 的类型不匹配")),
+        None => return Err(format!("没有连接 `{id}`")),
     };
-    let _ = exists;
     recv_from_mpsc(inbox, timeout_ms).await
 }
 
@@ -852,6 +927,49 @@ mod tests {
         assert!(split_url("example.com").is_err(), "没有 scheme");
         assert!(split_url("ftp://example.com").is_err(), "不支持的 scheme");
         assert!(split_url("https:///path").is_err(), "没有主机");
+    }
+
+    #[test]
+    fn intersect_keeps_only_what_the_user_agreed_to() {
+        let declared = vec!["api.example.com".to_string(), "cdn.example.com".to_string()];
+        // 用户只同意了其中一个
+        let granted = vec!["api.example.com".to_string()];
+        assert_eq!(intersect(&declared, &granted), vec!["api.example.com".to_string()]);
+        // 用户什么都没同意 → 一条都不生效（清单不能自己扩权）
+        assert!(intersect(&declared, &[]).is_empty());
+        // 授权里多出来的条目不影响：生效的永远是"声明且授权"
+        assert_eq!(intersect(&[], &granted).len(), 0);
+    }
+
+    #[test]
+    fn intersect_ignores_case_and_whitespace() {
+        let declared = vec![" https://API.example.com/v1 ".to_string()];
+        let granted = vec!["https://api.example.com/v1".to_string()];
+        assert_eq!(intersect(&declared, &granted).len(), 1, "写法差异不该让授权失效");
+    }
+
+    #[test]
+    fn upstream_grants_speaks_the_shells_language() {
+        let entries = vec![
+            "api.example.com".to_string(),
+            "https://secure.example.com:8443/path".to_string(),
+            "*.wild.example.com".to_string(),
+            "*".to_string(),
+        ];
+        let (hosts, ports, unsupported) = upstream_grants(&entries);
+        assert_eq!(hosts, vec!["api.example.com".to_string()]);
+        // 端口只有 http_requests 能表达
+        assert_eq!(ports, vec![("secure.example.com".to_string(), 8443)]);
+        // 通配翻译不过去 —— 退化成"放行整个域"才是真出错
+        assert_eq!(unsupported.len(), 2);
+    }
+
+    #[test]
+    fn upstream_grants_skips_unparsable_entries() {
+        let entries = vec!["*.".to_string(), "ok.example.com".to_string()];
+        let (hosts, _ports, unsupported) = upstream_grants(&entries);
+        assert_eq!(hosts, vec!["ok.example.com".to_string()]);
+        assert!(unsupported.is_empty(), "解析不了的条目不该被当成通配");
     }
 
     #[test]

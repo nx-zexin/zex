@@ -176,6 +176,8 @@ struct ExtensionPanel {
     streaming: Option<String>,
     /// 状态栏文字。
     status: String,
+    /// 还没得到确认的网络申请（主机清单）。`Some` = 该弹确认卡片。
+    net_request: Option<Vec<String>>,
 }
 
 impl PanelTab {
@@ -609,6 +611,26 @@ impl ChatView {
                     this.update_in(cx, |this, window, cx| {
                         this.settings = None;
                         this.open_extension(&id, window, cx);
+                    })
+                    .ok();
+                })
+                .detach();
+            }
+        }
+
+        // 测试钩子：ZEX_AUTO_GRANT=<id> 启动后替用户点一下「允许」。
+        //
+        // 这个环境里 XTest 被挡着，合成鼠标点击拉不动指针 —— 但"点允许
+        // 之后应用能不能立刻联网"是这次改动的核心，必须有人跑过。所以走
+        // 和按钮**同一个函数**，验证的仍是配置写入 + 网关刷新 + 原地重挂。
+        if let Ok(id) = std::env::var("ZEX_AUTO_GRANT") {
+            if !id.trim().is_empty() {
+                cx.spawn_in(window, async move |this, cx| {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(1600))
+                        .await;
+                    this.update_in(cx, |this, window, cx| {
+                        this.grant_network(&id, true, window, cx);
                     })
                     .ok();
                 })
@@ -2269,9 +2291,46 @@ fn pill(label: String, bg: u32, fg: u32) -> impl IntoElement {
         .child(label)
 }
 
-/// 从配置里取"用户批准过哪些应用"。
-fn approvals_of(config: &zex_app::config::FileConfig) -> std::collections::HashSet<String> {
-    config.approved_extensions.iter().cloned().collect()
+/// 从配置里取"每个应用被授权访问哪些主机"，交给扩展宿主做网络闸门。
+fn grants_of(
+    config: &zex_app::config::FileConfig,
+) -> std::collections::BTreeMap<String, Vec<String>> {
+    config.network_grants.clone()
+}
+
+/// 加载这个应用时要不要弹网络确认？
+///
+/// 三种情况要问：
+/// - 没问过（配置里没这个应用）；
+/// - 清单后来**新增**了主机（模型可能自己加了一条）——这时老授权只覆盖
+///   旧的那几条，新的一条该由人来定；
+/// - 用户已经明确拒绝过（空列表）的**不**再问：问过一次"不要"就是不要。
+fn pending_net(
+    config: &zex_app::config::FileConfig,
+    ext: &zex_extension::Extension,
+) -> Option<Vec<String>> {
+    let declared = &ext.request.network_hosts;
+    if declared.is_empty() {
+        return None;
+    }
+    let Some(granted) = config.network_grants.get(&ext.id) else {
+        return Some(declared.clone());
+    };
+    if granted.is_empty() {
+        // 明确拒绝过：别追着问
+        return None;
+    }
+    let covered = declared.iter().all(|want| {
+        granted
+            .iter()
+            .any(|have| have.trim().eq_ignore_ascii_case(want.trim()))
+    });
+    if covered {
+        None
+    } else {
+        // 清单里出现了没被授权过的主机：重新问一次
+        Some(declared.clone())
+    }
 }
 
 /// 一轮为什么停下来 —— 给用户看的一句话。
@@ -3451,6 +3510,113 @@ impl ChatView {
     /// 挂载失败时不是白屏：错误信息摆在这里，其它面板照常工作 ——
     /// 一个写坏的扩展不该拖垮宿主。
     fn render_extension_body(&self, e: &ExtensionPanel, cx: &mut Context<Self>) -> AnyElement {
+        let mut col = div().flex_1().min_h(px(0.0)).flex().flex_col();
+        if let Some(hosts) = &e.net_request {
+            col = col.child(self.render_net_request(e, hosts, cx));
+        }
+        col.child(self.render_extension_inner(e, cx))
+            .into_any_element()
+    }
+
+    /// 网络确认卡片：应用要联网，得由人点一下。
+    ///
+    /// 为什么要确认：清单是模型写的，它自己写一行 `network.hosts`
+    /// 就能决定"我要连哪儿"。要是清单直接生效，等于模型给自己发授权。
+    /// 所以清单只算**申请**，点这一下才是授权 —— 而且授权存进配置，
+    /// 只放行清单里这几条，之后清单再偷偷加大也过不去。
+    fn render_net_request(
+        &self,
+        e: &ExtensionPanel,
+        hosts: &[String],
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let allow_id = e.id.clone();
+        let deny_id = e.id.clone();
+        div()
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .px_3()
+            .py_3()
+            .bg(rgb(BG_TOOL))
+            .border_b_1()
+            .border_color(rgb(BRAND))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(BRAND))
+                            .child(format!("`{}` 想访问网络", e.id)),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(TEXT_DIM))
+                            .child("需你确认后才会生效"),
+                    ),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .font_family(MONO)
+                    .text_color(rgb(TEXT_MUTED))
+                    .child(hosts.join("、")),
+            )
+            .child(div().text_xs().text_color(rgb(TEXT_DIM)).child(
+                "只放行上面这几条；随时可在「设置 → 应用」里撤销。",
+            ))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .px_2()
+                            .py_1()
+                            .rounded(px(5.0))
+                            .cursor_pointer()
+                            .bg(rgb(OK_SOFT))
+                            .text_xs()
+                            .text_color(rgb(OK))
+                            .hover(|st| st.bg(rgb(BG_HOVER)))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _: &MouseDownEvent, w, cx| {
+                                    this.grant_network(&allow_id, true, w, cx);
+                                }),
+                            )
+                            .child("允许"),
+                    )
+                    .child(
+                        div()
+                            .px_2()
+                            .py_1()
+                            .rounded(px(5.0))
+                            .cursor_pointer()
+                            .text_xs()
+                            .text_color(rgb(TEXT_DIM))
+                            .hover(|st| st.bg(rgb(BG_HOVER)))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _: &MouseDownEvent, w, cx| {
+                                    this.grant_network(&deny_id, false, w, cx);
+                                }),
+                            )
+                            .child("不允许"),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// 面板主体：脚本 View 或错误信息。
+    fn render_extension_inner(&self, e: &ExtensionPanel, cx: &mut Context<Self>) -> AnyElement {
         let _ = cx;
         if let Some(err) = &e.error {
             return div()
@@ -3522,24 +3688,81 @@ impl ChatView {
         body.into_any_element()
     }
 
-    /// 记下"用户已审阅并批准这个扩展的能力申请"。
+    /// 用户对这个应用的网络申请表态：允许（= 授权清单里那些主机）或拒绝。
     ///
-    /// 不做成"授予"，因为这一版没有 per-app 能力。这个动作的意义是：
-    /// 把界面上的"未审阅"变成"已批准"，并留下痕迹给将来的 per-app 策略用。
-    fn approve_extension(&mut self, id: &str, cx: &mut Context<Self>) {
-        let approved = zex_app::config::toggle_pinned(&mut self.config.approved_extensions, id);
-        // 网络闸门读的就是这张表：点了立刻生效，不用重启、不用重开面板
+    /// 三种结果里只有"允许"会写非空列表；拒绝写空列表 —— 这样
+    /// 界面就能区分"没问过"和"问过、说不要"，不会每次都追着问。
+    ///
+    /// `window` 用来在允许之后**原地重挂**：应用的 `init` 里那一通
+    /// 网络调用当时是被拒的，不重挂它就得等用户自己关掉再打开。
+    fn grant_network(&mut self, id: &str, allow: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let declared = self
+            .extensions
+            .iter()
+            .find(|e| e.id == id)
+            .map(|e| e.request.network_hosts.clone())
+            .unwrap_or_default();
+        let list = if allow { declared.clone() } else { Vec::new() };
+        self.config.network_grants.insert(id.to_string(), list);
+        // 闸门读的就是这张表：点了立刻生效，不用重启
         if let Some(host) = &self.ext_host {
-            host.set_approvals(approvals_of(&self.config));
+            host.set_grants(grants_of(&self.config));
         }
-        self.persist_config(
-            if approved {
-                format!("已批准 `{id}`（网络访问即刻生效；文件/剪贴板仍不授予）")
-            } else {
-                format!("已撤销对 `{id}` 的批准，它的网络访问立即停止")
-            },
-            cx,
-        );
+        // 面板上的确认卡片收掉
+        if let Some(rp) = &mut self.right_panel {
+            if let Some(PanelTab::Extension(p)) = rp
+                .tabs
+                .iter_mut()
+                .find(|t| t.key() == format!("ext:{id}"))
+            {
+                p.net_request = None;
+            }
+        }
+        let msg = if allow {
+            format!(
+                "已允许 `{id}` 访问网络（{}）——只放行清单里这几条，随时可撤销",
+                declared.join("、")
+            )
+        } else {
+            format!("已拒绝 `{id}` 的网络申请，它再调用会被拦下（可随时在设置里改）")
+        };
+        self.persist_config(msg, cx);
+        if allow {
+            self.remount_extension(id, window, cx);
+        }
+    }
+
+    /// 重新挂载一个已经打开的应用面板（改了授权/脚本之后用）。
+    fn remount_extension(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(host) = self.ext_host.clone() else {
+            return;
+        };
+        self.extensions = zex_extension::scan_default();
+        let Some(fresh) = self.extensions.iter().find(|e| e.id == id).cloned() else {
+            return;
+        };
+        let mounted = host.mount(&fresh, window, cx);
+        self.ext_mtimes.insert(fresh.id.clone(), Self::ext_stamp(&fresh));
+        if let Some(rp) = &mut self.right_panel {
+            if let Some(PanelTab::Extension(p)) = rp
+                .tabs
+                .iter_mut()
+                .find(|t| t.key() == format!("ext:{id}"))
+            {
+                match mounted {
+                    Ok(v) => {
+                        p.view = Some(v);
+                        p.error = None;
+                        p.status = "就绪 · 已重载".into();
+                    }
+                    Err(e) => {
+                        p.error = Some(e.to_string());
+                        p.status = "重载失败".into();
+                    }
+                }
+            }
+        }
+        cx.notify();
     }
 
     /// 固定 / 取消固定某个扩展到侧边栏，并写回配置。
@@ -3619,6 +3842,8 @@ impl ChatView {
             let mounted = host.mount(&fresh, window, cx);
             self.ext_mtimes
                 .insert(fresh.id.clone(), Self::ext_stamp(&fresh));
+            // 清单可能刚改过：还没确认过的网络申请要在重挂后重新摆出来
+            let pending = pending_net(&self.config, &fresh);
             if let Some(rp) = &mut self.right_panel {
                 if let Some(PanelTab::Extension(p)) =
                     rp.tabs.iter_mut().find(|t| t.key() == format!("ext:{}", fresh.id))
@@ -3628,6 +3853,7 @@ impl ChatView {
                             p.view = Some(v);
                             p.error = None;
                             p.status = "就绪 · 已重载".into();
+                            p.net_request = pending;
                         }
                         Err(e) => {
                             // 重载失败保留上一版界面：改到一半语法错时，
@@ -3678,8 +3904,8 @@ impl ChatView {
             let bridge = zex_extension::AgentBridge::new(self.cmd_tx.clone());
             match zex_extension::ExtensionHost::new(cx, bridge) {
                 Ok(h) => {
-                    // 批准表随宿主一起交过去：网络闸门认的就是它
-                    h.set_approvals(approvals_of(&self.config));
+                    // 授权表随宿主一起交过去：网络闸门认的就是它
+                    h.set_grants(grants_of(&self.config));
                     self.ext_host = Some(std::rc::Rc::new(h));
                 }
                 Err(e) => {
@@ -3761,8 +3987,8 @@ impl ChatView {
             let bridge = zex_extension::AgentBridge::new(self.cmd_tx.clone());
             match zex_extension::ExtensionHost::new(cx, bridge) {
                 Ok(h) => {
-                    // 批准表随宿主一起交过去：网络闸门认的就是它
-                    h.set_approvals(approvals_of(&self.config));
+                    // 授权表随宿主一起交过去：网络闸门认的就是它
+                    h.set_grants(grants_of(&self.config));
                     self.ext_host = Some(std::rc::Rc::new(h));
                 }
                 Err(e) => {
@@ -3795,6 +4021,7 @@ impl ChatView {
             error,
             streaming: None,
             status,
+            net_request: pending_net(&self.config, &ext),
         });
         self.ext_mtimes.insert(ext.id.clone(), Self::ext_stamp(&ext));
         self.activate_or_push_tab(tab, cx);
@@ -5736,11 +5963,16 @@ impl ChatView {
                                         .child(live)
                                 } else {
                                     let broad = req.broad();
-                                    let approved = self
+                                    // 网络三态：没问过 / 明确拒绝 / 允许了这几条
+                                    let net_state = match self
                                         .config
-                                        .approved_extensions
-                                        .iter()
-                                        .any(|x| x == &ext.id);
+                                        .network_grants
+                                        .get(&ext.id)
+                                    {
+                                        None => None,
+                                        Some(list) if list.is_empty() => Some(Vec::new()),
+                                        Some(list) => Some(list.clone()),
+                                    };
                                     let mut line = div()
                                         .flex()
                                         .items_center()
@@ -5766,12 +5998,18 @@ impl ChatView {
                                     line.child(
                                         div()
                                             .text_xs()
-                                            .text_color(rgb(if approved { OK } else { TEXT_DIM }))
-                                            .child(if approved {
-                                                // 只有存储真的生效了，其余仍然只是留痕
-                                                "· 已批准（存储之外本版不生效）"
-                                            } else {
-                                                "· 未审阅"
+                                            .text_color(rgb(match &net_state {
+                                                Some(list) if !list.is_empty() => OK,
+                                                Some(_) => DANGER,
+                                                None => TEXT_DIM,
+                                            }))
+                                            .child(match &net_state {
+                                                Some(list) if !list.is_empty() => format!(
+                                                    "· 已允许联网：{}",
+                                                    list.join("、")
+                                                ),
+                                                Some(_) => "· 已拒绝联网".to_string(),
+                                                None => "· 联网未确认".to_string(),
                                             }),
                                     )
                                     .child(live)
@@ -5779,15 +6017,17 @@ impl ChatView {
                             }),
                     )
                     .child(div().flex_1())
-                    // 批准能力申请：只有真的申请了才出现，否则是废按钮
+                    // 网络的允许 / 撤销：只有真申请了网络才出现，否则是废按钮
                     .child({
                         let id = ext.id.clone();
-                        let needs = !ext.request.is_empty();
+                        // 没有网络申请的就不给按钮：批准一个用不到的权限没意义
+                        let needs = !ext.request.network_hosts.is_empty();
                         let approved = self
                             .config
-                            .approved_extensions
-                            .iter()
-                            .any(|x| x == &ext.id);
+                            .network_grants
+                            .get(&ext.id)
+                            .map(|l| !l.is_empty())
+                            .unwrap_or(false);
                         if needs {
                             div()
                                 .text_xs()
@@ -5799,11 +6039,11 @@ impl ChatView {
                                 .hover(|st| st.bg(rgb(BG_HOVER)))
                                 .on_mouse_down(
                                     MouseButton::Left,
-                                    cx.listener(move |this, _: &MouseDownEvent, _w, cx| {
-                                        this.approve_extension(&id, cx);
+                                    cx.listener(move |this, _: &MouseDownEvent, w, cx| {
+                                        this.grant_network(&id, !approved, w, cx);
                                     }),
                                 )
-                                .child(if approved { "撤销批准" } else { "批准申请" })
+                                .child(if approved { "撤销联网" } else { "允许联网" })
                         } else {
                             div()
                         }

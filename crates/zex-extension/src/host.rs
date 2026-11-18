@@ -71,11 +71,11 @@ pub struct ExtensionHost {
     /// 按应用分开而不是共用：白名单来自各自的清单，共用就等于
     /// 把 A 申请的主机递给 B。
     nets: NetRegistry,
-    /// 用户批准过哪些应用（能力申请页上那个「批准申请」）。
+    /// 用户对每个应用的网络授权：应用 id → 允许的主机。
     ///
-    /// 共享一份 `Arc`：用户在设置页点批准之后，正在跑的应用**立刻**能联网，
-    /// 不用重启、也不用重新挂载。
-    approvals: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// 共享一份 `Arc`：用户点「允许」之后，正在跑的应用**立刻**能联网，
+    /// 不用重启、也不用重新挂载（每次取 hub 时现算交集）。
+    grants: Arc<Mutex<std::collections::BTreeMap<String, Vec<String>>>>,
 }
 
 /// 已打开的库。
@@ -116,7 +116,7 @@ impl ExtensionHost {
             }
         }
         gpui_shell::set_storage_path(store);
-        gpui_shell::set_capabilities(Capabilities::new().storage(true));
+        gpui_shell::set_capabilities(base_capabilities());
 
         let runtime = ShellRuntime::new(cx)
             .map_err(|e| zex_core::Error::Other(format!("无法创建扩展运行时: {e}")))?;
@@ -127,17 +127,71 @@ impl ExtensionHost {
             replies: Arc::new(Mutex::new(HashMap::new())),
             dbs: Arc::new(Mutex::new(HashMap::new())),
             nets: Arc::new(Mutex::new(HashMap::new())),
-            approvals: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            grants: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
         })
     }
 
-    /// 把"用户批准了哪些应用"交给宿主。
+    /// 这个应用这次挂载时的能力集：存储照旧，网络按「清单 ∩ 授权」。
     ///
-    /// 不传也行：那样所有应用都算未批准，网络调用会被拒并提示去批准。
-    /// UI 启动时和每次点「批准申请」之后各同步一次。
-    pub fn set_approvals(&self, approved: std::collections::HashSet<String>) {
-        if let Ok(mut guard) = self.approvals.lock() {
-            *guard = approved;
+    /// 为什么要在这里算，而不是挂载时读全局：gpui-shell 的 `fetch` /
+    /// `WebSocket` 读的是**建视图那一刻**的默认策略，视图建好后自己持有
+    /// 那一份。所以把交集装成默认、挂载、再换回来，就等于给这个应用发了
+    /// 一张只属于它的通行证 —— 别的应用拿不到（它们各自挂载时各算各的）。
+    fn capabilities_for(&self, ext: &Extension) -> Capabilities {
+        let mut caps = base_capabilities();
+        let declared = &ext.request.network_hosts;
+        if declared.is_empty() {
+            return caps;
+        }
+        let granted = self
+            .grants
+            .lock()
+            .ok()
+            .and_then(|g| g.get(&ext.id).cloned());
+        let Some(granted) = granted else {
+            // 还没问过用户：一条都不给，脚本会拿到"没被授予"的拒绝
+            return caps;
+        };
+        let effective = crate::net::intersect(declared, &granted);
+        let (hosts, ports, unsupported) = crate::net::upstream_grants(&effective);
+        if !unsupported.is_empty() {
+            tracing::debug!(
+                app = %ext.id,
+                entries = ?unsupported,
+                "通配主机不能翻译成上游能力，只有 httpRequest 能用它们"
+            );
+        }
+        let mut requests = Vec::new();
+        for (host, port) in ports {
+            // 上游按 scheme 分别判端口，http 和 https 各发一张
+            for scheme in ["http", "https"] {
+                requests.push(
+                    gpui_shell::HttpRequestGrant::new(
+                        host.clone(),
+                        ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"],
+                        Vec::<String>::new(),
+                        // 空前缀 = 任何路径
+                        vec![String::new()],
+                    )
+                    .scheme(scheme)
+                    .port(port),
+                );
+            }
+        }
+        caps = caps.network_hosts(hosts).http_requests(requests);
+        caps
+    }
+
+    /// 把"每个应用被授权访问哪些主机"交给宿主。
+    ///
+    /// 不传也行：那样所有应用的网络调用都会被拒，并提示去确认。
+    /// UI 启动时、以及每次用户点「允许 / 撤销」之后各同步一次。
+    pub fn set_grants(
+        &self,
+        grants: std::collections::BTreeMap<String, Vec<String>>,
+    ) {
+        if let Ok(mut guard) = self.grants.lock() {
+            *guard = grants;
         }
     }
 
@@ -160,13 +214,21 @@ impl ExtensionHost {
         // 之后再注册对已求值的模块无效
         self.install_module(ext)?;
 
-        let app = self
-            .runtime
-            .load_application(&ext.dir, &ext.entry)
-            .map_err(|e| zex_core::Error::Other(format!("加载失败: {e}")))?;
-        self.runtime
-            .mount_application(&app, window, cx)
-            .map_err(|e| zex_core::Error::Other(format!("挂载失败: {e}")))
+        // 能力集临时装成"这个应用的"，挂完立刻换回基础集。
+        // 换回是必须的：默认策略是**下一位**挂载者的起点，留着上一个
+        // 应用的网络授权，后面那个应用白捡一份。
+        let caps = self.capabilities_for(ext);
+        gpui_shell::set_capabilities(caps);
+        let mounted = match self.runtime.load_application(&ext.dir, &ext.entry) {
+            Ok(app) => {
+                let view = self.runtime.mount_application(&app, window, cx);
+                view.map_err(|e| zex_core::Error::Other(format!("挂载失败: {e}")))
+            }
+            Err(e) => Err(zex_core::Error::Other(format!("加载失败: {e}"))),
+        };
+        gpui_shell::set_capabilities(base_capabilities());
+
+        mounted
     }
 
     /// 记下某个会话的最后一次回复，并刷新对应脚本 View。
@@ -245,7 +307,7 @@ impl ExtensionHost {
             self.replies.clone(),
             self.dbs.clone(),
             self.nets.clone(),
-            self.approvals.clone(),
+            self.grants.clone(),
         );
         module
             .validate()
@@ -271,21 +333,21 @@ fn zex_module(
     replies: Arc<Mutex<HashMap<String, String>>>,
     dbs: DbRegistry,
     nets: NetRegistry,
-    approvals: Arc<Mutex<std::collections::HashSet<String>>>,
+    grants: Arc<Mutex<std::collections::BTreeMap<String, Vec<String>>>>,
 ) -> HostModule {
-    // 这个应用的网络世界：白名单来自它自己的清单。
-    // 清单写错了（比如 `*.` 这种）不该让模块注册失败——那会让应用
-    // 连界面都打不开，而错误其实只在联网时才该出现。所以退化成一个
-    // 空白名单：任何连接都会被拒，并说明原因。
-    let net = match crate::net::NetPolicy::parse(&ext.request.network_hosts) {
-        Ok(policy) => crate::net::NetHub::new(policy).ok().map(Arc::new),
-        Err(e) => {
-            tracing::warn!(app = %ext.id, error = %e, "网络白名单写法有误，按空名单处理");
-            None
-        }
-    };
+    // 这个应用的网络世界。**建的时候白名单是空的**：真正生效的那份在
+    // 每次取 hub 时按「清单申请 ∩ 用户授权」现算（见 `net_hub`）——
+    // 用户在面板上点「允许」之后，下一次调用就该通，不用重开。
+    let net = crate::net::NetHub::new(crate::net::NetPolicy::default())
+        .ok()
+        .map(std::sync::Arc::new);
+    if net.is_none() {
+        tracing::warn!(app = %ext.id, "无法为应用建立网络运行时，网络功能不可用");
+    }
     // 每个闭包各拿一份：`HostModule` 的闭包是 `Fn`，共享一个 moved 值是拿不到的
     let net_handle = net;
+    // 清单里申请的主机（只是申请，见 `net_hub`）
+    let declared = ext.request.network_hosts.clone();
     let app = ext.id.clone();
     let ask_bridge = bridge.clone();
     let reply_map = replies;
@@ -402,16 +464,16 @@ fn zex_module(
             Ok(HostValue::from(busy_bridge.is_waiting(&busy_session)))
         })
         .async_function("httpRequest", {
-            let (approved, app, registry, ready) = (
-                approvals.clone(),
+            let (grants, declared, app, registry, ready) = (
+                grants.clone(),
+                declared.clone(),
                 app.clone(),
                 nets.clone(),
                 net_handle.clone(),
             );
             move |args| {
                 let spec = http_spec(args.get(0))?;
-                gate(&approved, &app)?;
-                let hub = net_hub(&registry, &app, ready.clone())?;
+                let hub = net_hub(&registry, &app, &declared, &grants, ready.clone())?;
                 Ok(async move {
                     let out = hub.http(spec).await.map_err(HostError::from)?;
                     Ok(HostValue::Object(vec![
@@ -425,13 +487,17 @@ fn zex_module(
             }
         })
         .async_function("tcpConnect", {
-            let (approved, app, registry, ready) =
-                (approvals.clone(), app.clone(), nets.clone(), net_handle.clone());
+            let (grants, declared, app, registry, ready) = (
+                grants.clone(),
+                declared.clone(),
+                app.clone(),
+                nets.clone(),
+                net_handle.clone(),
+            );
             move |args| {
                 let host = args.string(0)?.to_string();
                 let port = args.integer(1)? as u16;
-                gate(&approved, &app)?;
-                let hub = net_hub(&registry, &app, ready.clone())?;
+                let hub = net_hub(&registry, &app, &declared, &grants, ready.clone())?;
                 Ok(async move {
                     let id = hub.tcp_connect(&host, port).await.map_err(HostError::from)?;
                     Ok(HostValue::from(id))
@@ -439,11 +505,17 @@ fn zex_module(
             }
         })
         .async_function("tcpSend", {
-            let (app, registry, ready) = (app.clone(), nets.clone(), net_handle.clone());
+            let (grants, declared, app, registry, ready) = (
+                grants.clone(),
+                declared.clone(),
+                app.clone(),
+                nets.clone(),
+                net_handle.clone(),
+            );
             move |args| {
                 let id = args.string(0)?.to_string();
                 let data = args.string(1)?.to_string();
-                let hub = net_hub(&registry, &app, ready.clone())?;
+                let hub = net_hub(&registry, &app, &declared, &grants, ready.clone())?;
                 Ok(async move {
                     let n = hub.tcp_send(&id, &data).await.map_err(HostError::from)?;
                     Ok(HostValue::Number(n as f64))
@@ -451,11 +523,17 @@ fn zex_module(
             }
         })
         .async_function("tcpRecv", {
-            let (app, registry, ready) = (app.clone(), nets.clone(), net_handle.clone());
+            let (grants, declared, app, registry, ready) = (
+                grants.clone(),
+                declared.clone(),
+                app.clone(),
+                nets.clone(),
+                net_handle.clone(),
+            );
             move |args| {
                 let id = args.string(0)?.to_string();
                 let wait = args.get(1).and_then(|v| v.as_number()).map(|n| n as u64);
-                let hub = net_hub(&registry, &app, ready.clone())?;
+                let hub = net_hub(&registry, &app, &declared, &grants, ready.clone())?;
                 Ok(async move {
                     let r = hub.tcp_recv(&id, wait).await.map_err(HostError::from)?;
                     Ok(recv_value(r))
@@ -463,20 +541,30 @@ fn zex_module(
             }
         })
         .async_function("tcpClose", {
-            let (app, registry, ready) = (app.clone(), nets.clone(), net_handle.clone());
+            let (grants, declared, app, registry, ready) = (
+                grants.clone(),
+                declared.clone(),
+                app.clone(),
+                nets.clone(),
+                net_handle.clone(),
+            );
             move |args| {
                 let id = args.string(0)?.to_string();
-                let hub = net_hub(&registry, &app, ready.clone())?;
+                let hub = net_hub(&registry, &app, &declared, &grants, ready.clone())?;
                 Ok(async move { Ok(HostValue::Bool(hub.tcp_close(&id).await)) })
             }
         })
         .async_function("wsConnect", {
-            let (approved, app, registry, ready) =
-                (approvals.clone(), app.clone(), nets.clone(), net_handle.clone());
+            let (grants, declared, app, registry, ready) = (
+                grants.clone(),
+                declared.clone(),
+                app.clone(),
+                nets.clone(),
+                net_handle.clone(),
+            );
             move |args| {
                 let url = args.string(0)?.to_string();
-                gate(&approved, &app)?;
-                let hub = net_hub(&registry, &app, ready.clone())?;
+                let hub = net_hub(&registry, &app, &declared, &grants, ready.clone())?;
                 Ok(async move {
                     let id = hub.ws_connect(&url).await.map_err(HostError::from)?;
                     Ok(HostValue::from(id))
@@ -484,11 +572,17 @@ fn zex_module(
             }
         })
         .async_function("wsSend", {
-            let (app, registry, ready) = (app.clone(), nets.clone(), net_handle.clone());
+            let (grants, declared, app, registry, ready) = (
+                grants.clone(),
+                declared.clone(),
+                app.clone(),
+                nets.clone(),
+                net_handle.clone(),
+            );
             move |args| {
                 let id = args.string(0)?.to_string();
                 let text = args.string(1)?.to_string();
-                let hub = net_hub(&registry, &app, ready.clone())?;
+                let hub = net_hub(&registry, &app, &declared, &grants, ready.clone())?;
                 Ok(async move {
                     hub.ws_send(&id, &text).await.map_err(HostError::from)?;
                     Ok(HostValue::Null)
@@ -496,11 +590,17 @@ fn zex_module(
             }
         })
         .async_function("wsRecv", {
-            let (app, registry, ready) = (app.clone(), nets.clone(), net_handle.clone());
+            let (grants, declared, app, registry, ready) = (
+                grants.clone(),
+                declared.clone(),
+                app.clone(),
+                nets.clone(),
+                net_handle.clone(),
+            );
             move |args| {
                 let id = args.string(0)?.to_string();
                 let wait = args.get(1).and_then(|v| v.as_number()).map(|n| n as u64);
-                let hub = net_hub(&registry, &app, ready.clone())?;
+                let hub = net_hub(&registry, &app, &declared, &grants, ready.clone())?;
                 Ok(async move {
                     let r = hub.ws_recv(&id, wait).await.map_err(HostError::from)?;
                     Ok(recv_value(r))
@@ -508,10 +608,16 @@ fn zex_module(
             }
         })
         .async_function("wsClose", {
-            let (app, registry, ready) = (app.clone(), nets.clone(), net_handle.clone());
+            let (grants, declared, app, registry, ready) = (
+                grants.clone(),
+                declared.clone(),
+                app.clone(),
+                nets.clone(),
+                net_handle.clone(),
+            );
             move |args| {
                 let id = args.string(0)?.to_string();
-                let hub = net_hub(&registry, &app, ready.clone())?;
+                let hub = net_hub(&registry, &app, &declared, &grants, ready.clone())?;
                 Ok(async move { Ok(HostValue::Bool(hub.ws_close(&id).await)) })
             }
         })
@@ -570,46 +676,78 @@ fn zex_module(
         })
 }
 
-/// 网络闸门：这个应用的能力申请被批准了吗。
+/// 宿主给所有应用的基础能力：只有本地存储。
 ///
-/// 批准是**用户动作**，不是清单自说自话。模型能写清单，所以清单只能
-/// 表达"我想要什么"；真正放行要人在设置页点一下。已经批准的集合放在
-/// 共享表里，点完立刻生效，不用重启。
-fn gate(
-    approved: &Arc<Mutex<std::collections::HashSet<String>>>,
-    app: &str,
-) -> std::result::Result<(), HostError> {
-    let ok = approved
-        .lock()
-        .map(|g| g.contains(app))
-        .unwrap_or(false);
-    if ok {
-        Ok(())
-    } else {
-        Err(HostError::from(format!(
-            "应用 `{app}` 的能力申请还没被批准，网络不可用。             请让用户在「设置 → 应用」里点这个应用的「批准申请」"
-        )))
-    }
+/// 网络不在这里：它必须按应用分别授予，见 `capabilities_for`。
+fn base_capabilities() -> Capabilities {
+    Capabilities::new().storage(true)
 }
 
-/// 取（必要时建）某个应用的网络世界。
+/// 网络闸门 + 取 hub：把「清单申请」和「用户授权」合成当前白名单。
+///
+/// 三种状态各有各的说法，别让用户/模型猜：
+/// - **没问过**（配置里没有这个应用）→ 拒绝，并告诉他去面板上确认；
+/// - **拒绝过**（授权是空列表）→ 拒绝，并说"你拒绝过，可在设置里改"；
+/// - **授权过** → 只放行「清单 ∩ 授权」，清单偷偷加大也不会自动生效。
 fn net_hub(
     nets: &NetRegistry,
     app: &str,
+    declared: &[String],
+    grants: &Arc<Mutex<std::collections::BTreeMap<String, Vec<String>>>>,
     ready: Option<Arc<crate::net::NetHub>>,
 ) -> std::result::Result<Arc<crate::net::NetHub>, HostError> {
+    if declared.is_empty() {
+        return Err(HostError::from(format!(
+            "应用 `{app}` 没有申请任何网络主机：清单里 capabilities.network.hosts 是空的"
+        )));
+    }
+    let granted = grants
+        .lock()
+        .map_err(|_| HostError::from("网络授权表中毒"))?
+        .get(app)
+        .cloned();
+
+    let effective = match granted {
+        None => {
+            return Err(HostError::from(format!(
+                "应用 `{app}` 申请访问网络（申请：{}），但还没得到确认。请在它的面板上点「允许」",
+                declared.join("、")
+            )))
+        }
+        Some(list) if list.is_empty() => {
+            return Err(HostError::from(format!(
+                "你拒绝过应用 `{app}` 的网络访问（申请：{}）。要改的话在「设置 → 应用」里允许",
+                declared.join("、")
+            )))
+        }
+        Some(list) => crate::net::intersect(declared, &list),
+    };
+
+    if effective.is_empty() {
+        return Err(HostError::from(format!(
+            "应用 `{app}` 申请的主机（{}）没有一条被授权；以清单为准，授权只减不增",
+            declared.join("、")
+        )));
+    }
+
+    let policy = crate::net::NetPolicy::parse(&effective)
+        .map_err(|e| HostError::from(format!("白名单写法有误：{e}")))?;
+
     let mut map = nets
         .lock()
         .map_err(|_| HostError::from("网络表中毒"))?;
-    if let Some(hub) = map.get(app) {
-        return Ok(hub.clone());
-    }
-    let Some(hub) = ready else {
-        return Err(HostError::from(
-            "这个应用没有可用的网络（清单里的 network.hosts 写法有误，或运行时建不起来）",
-        ));
+    let hub = match map.get(app) {
+        Some(hub) => hub.clone(),
+        None => {
+            let Some(hub) = ready else {
+                return Err(HostError::from("这个应用没有可用的网络运行时"));
+            };
+            map.insert(app.to_string(), hub.clone());
+            hub
+        }
     };
-    map.insert(app.to_string(), hub.clone());
+    // 每次调用都刷新一次：用户刚点过「允许」的话，这一通就该通
+    hub.set_policy(policy);
     Ok(hub)
 }
 

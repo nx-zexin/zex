@@ -83,8 +83,23 @@ pub struct FileConfig {
     /// 只记"用户看过并同意了"，**不等于能力已生效**：当前是进程级单一能力集，
     /// 按应用授予会串味。这一栏留给 per-app 策略落地后直接使用，
     /// 现在的作用是留痕 + 界面区分"未审阅"与"已批准"。
+    /// 早期"这个应用的申请我审阅过"的痕迹，**只读不再写**。
+    ///
+    /// 网络改由 `network_grants` 判定（批准一个布尔值等于把清单当授权）。
+    /// 保留字段是为了老配置照常解析：读出来不带任何权限。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub approved_extensions: Vec<String>,
+    /// 用户对每个应用的**网络授权**：应用 id → 允许访问的主机。
+    ///
+    /// 清单里的 `capabilities.network.hosts` 只是**申请**（模型也能写清单，
+    /// 所以它不能自己生效）；真正放行的是这里，由用户在加载应用时确认。
+    ///
+    /// 三种状态靠"键在不在"区分：
+    /// - 键不存在 —— 还没问过，加载应用时要弹确认；
+    /// - `[]` —— 用户明确拒绝过，不再反复打扰；
+    /// - 非空 —— 允许这些主机（会与清单申请取交集，清单改大了也不会自动扩权）。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub network_grants: BTreeMap<String, Vec<String>>,
 }
 
 /// 解析后的运行时配置。
@@ -725,4 +740,36 @@ mod tests {
         let cfg: FileConfig = serde_json::from_str(r#"{"default_model":"a/b"}"#).unwrap();
         assert!(cfg.pinned_extensions.is_empty());
     }
+
+#[cfg(test)]
+mod tests_network_grants {
+    use super::*;
+
+    #[test]
+    fn grants_roundtrip() {
+        let mut c = FileConfig::default();
+        c.network_grants
+            .insert("weather".into(), vec!["api.example.com".into()]);
+        // 空列表有明确含义（拒绝过），必须能原样存回去
+        c.network_grants.insert("news".into(), Vec::new());
+        let json = serde_json::to_string(&c).unwrap();
+        let back: FileConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back.network_grants.get("weather").map(|v| v.len()),
+            Some(1)
+        );
+        assert_eq!(
+            back.network_grants.get("news").map(|v| v.is_empty()),
+            Some(true),
+            "拒绝过（空列表）不能被读成\"没问过\""
+        );
+        assert!(!back.network_grants.contains_key("other"));
+    }
+
+    #[test]
+    fn missing_field_means_never_asked() {
+        let c: FileConfig = serde_json::from_str("{}").unwrap();
+        assert!(c.network_grants.is_empty());
+    }
+}
 }

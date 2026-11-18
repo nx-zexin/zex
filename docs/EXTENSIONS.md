@@ -75,8 +75,41 @@ Policy，而 zex 挂应用走 `load_application`，所有应用共用同一份�
 现在所有网络方法都是薄壳：`self.runtime.spawn(async move { ... })`，
 真活儿全在 `*_on(inner, ...)` 里跑。
 
-**闸门有两道**：清单声明白名单（`capabilities.network.hosts`）+ 用户点
-「批准申请」。后者是硬要求：模型能写清单，所以清单只能表达"我想要什么"。
+**闸门是"清单 ∩ 授权"**。清单（`capabilities.network.hosts`）只是申请：
+模型能写清单，所以它自己说"我要连哪儿"不算数。真正放行的是用户确认后存进
+`config.json` 的 `network_grants`，生效的是两者的交集 —— 清单偷偷加一条不会
+扩权，用户撤销则立刻失效。
+
+### 三态，靠"键在不在"区分
+
+| `network_grants[id]` | 意思 | 界面 |
+|---|---|---|
+| 键不存在 | 还没问过 | 打开应用时弹确认卡 |
+| `[]` | 明确拒绝过 | 不弹了；设置页可改成允许 |
+| `["api.x.com"]` | 允许这几条 | 生效中；清单后来又加主机时会重新问 |
+
+### 两层各管什么
+
+脚本里两条路都通，但门在两层上关：
+
+| 通道 | 代码 | 认的白名单 |
+|---|---|---|
+| `fetch` / `WebSocket`（上游内建） | gpui-shell | 挂载时装进去的 `Capabilities` |
+| `httpRequest` / `wsConnect` / `tcpConnect`（我们加的） | `net.rs` | 每次调用现算的 `NetPolicy` |
+
+上游那层只认精确主机名（`network_hosts` 不认通配、端口另走
+`HttpRequestGrant`），所以 `upstream_grants()` 把交集翻译成它的语言：精确
+主机直给，带端口的转成 `HttpRequestGrant`，`*.` 与 `*` 翻译不过去 —— 那两条
+只留给自己的 `httpRequest`。宁可让 `fetch` 连不上，也不能为了"能用"把 `*`
+当成放行一切。
+
+### 能力集怎么"按应用"
+
+上游的 `set_capabilities` 改的是**默认** Policy，而 `mount_application` 建视图
+时读的就是这份默认 —— 视图建好后自己持有那一份（`ScriptView::with_policy`）。
+所以挂载时"装 → 加载 → 挂载 → 立刻换回基础集"就够：这份通行证只属于这个
+应用，换回是为了别让下一个应用白捡上一份授权。同一线程、挂载即返回，
+中间没有别的应用在跑。
 
 边界（说清楚，不假装安全）：白名单按主机名判，DNS 返回私有地址也照连
 （应用连本机开发服务器是正常需求）；只能做客户端，不能监听。
@@ -150,18 +183,25 @@ agent 会写 `main.js` → `ext_install` 登记 → `ext_check` 自检 → 报�
 · 未审阅
 ```
 
-**这一版真正生效的只有 `storage`（本地存储）**，而且是全局的：
+**这一版真正生效的是 `storage` 和 `network`**（后者按应用各自授权）：
 
 | 能力 | 状态 |
 |---|---|
-| `storage` → `localStorage` | ✅ 生效，落盘在 `~/.zex/state/extensions-store.json` |
-| `fs` / `network` / `clipboard` / `execute` | ❌ 只解析、展示、留痕 |
+| `storage` → `localStorage` | ✅ 生效，落盘在 `~/.zex/state/extensions-store.json`（全局共享一份） |
+| `network` → `fetch` / `httpRequest` / WS / TCP | ✅ 生效，按应用：清单 ∩ 用户允许（见上节） |
+| `fs` / `clipboard` / `execute` | ❌ 只解析、展示、留痕 |
 
 存储之所以能给，是因为它不需要"按应用隔离才有意义"：宿主建运行时调 `set_storage_path` + `set_capabilities(storage)`，两行成对就有——少任一行脚本一碰 `localStorage` 就抛错，报错还看不出另一边没配。
 
-**代价是它被所有应用共享**：`set_storage_path` 改的是全局默认 Policy，而 zex 挂应用走 `load_application`（全应用共用一个 policy）。所以键空间共享（8 MiB / 1024 键 / 单值 1 MiB 也是全局算的）、没申请存储的应用一样能用。要每应用一份文件得换成上游 `plugin::Plugin::load`，那是一整套插件生命周期，先不值当。
+**代价是它被所有应用共享**：存储仍走全局默认 Policy（网络已经按应用分开了，
+见上节）。所以键空间共享（8 MiB / 1024 键 / 单值 1 MiB 也是全局算的）、
+没申请存储的应用一样能用。要每应用一份文件得换成上游 `plugin::Plugin::load`，
+那是一整套插件生命周期，先不值当。
 
-其余四项仍然只做「申请 → 审阅 → 批准」和留痕（`config.json` 的 `approved_extensions`）：全局单能力集下按清单授予，等于把 A 申请的权限递给 B —— 比不给更糟。等 per-app 策略落地再逐个接。
+`fs` / `clipboard` / `execute` 仍然只是「申请 → 展示 → 留痕」：它们比网络更
+难按应用切（一个路径授权要落到 `Grant` 句柄上，剪贴板根本没法按应用隔离），
+等 per-app 策略铺开再逐个接。`config.json` 里还留着 `approved_extensions`
+（早期"审阅过"的痕迹），网络早已改由 `network_grants` 判定。
 
 ## 侧边栏入口
 
