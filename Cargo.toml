@@ -69,7 +69,7 @@ reqwest = { version = "0.13", default-features = false, features = [
 ] }
 
 # ─── 存储 ───
-rusqlite = { version = "0.41", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled", "hooks"] }
 
 # ─── 观测 ───
 tracing = "0.1"

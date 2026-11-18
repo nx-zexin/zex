@@ -131,6 +131,55 @@ try {
 清单里要不要声明 `capabilities.storage`？**声明**，用户能在应用页看到你要什么。
 但别指望它当开关：现在生效与否由宿主决定，不是清单决定。
 
+## SQLite：要存"多行数据"就用它
+
+`localStorage` 适合几个设置项。**打卡记录、任务、消息、流水这类越攒越多的
+东西，用 SQLite** —— 它在同一个文件里直接按条件查，不用整份读进来再筛。
+
+```js
+import { dbExec, dbQuery, dbBatch } from "zex.<id>";
+
+// 建表（幂等，每次启动都跑一遍没关系）
+await dbExec("CREATE TABLE IF NOT EXISTS punches (id INTEGER PRIMARY KEY, at TEXT, kind TEXT)");
+
+// 写：返回 { changes, lastInsertId }
+const r = await dbExec("INSERT INTO punches (at, kind) VALUES (?, ?)", [now, "in"]);
+
+// 查：返回对象数组，一列一个键
+const today = await dbQuery("SELECT * FROM punches WHERE at >= ? ORDER BY id DESC", [dayStart]);
+
+// 多条一次提交（同一个事务，任一失败整体回滚）
+await dbBatch([
+  { sql: "INSERT INTO punches (at, kind) VALUES (?, ?)", params: [t1, "in"] },
+  { sql: "INSERT INTO punches (at, kind) VALUES (?, ?)", params: [t2, "out"] },
+]);
+```
+
+### 规则
+
+- **存表之前先想清楚主键和索引**。没人替你建，`ORDER BY at` 又没有索引，
+  几千行之后每次渲染都是全表扫。
+- **一次查询最多 5000 行**，超了直接报错。要"最近 20 条"就写 `LIMIT 20`，
+  别 `SELECT *` 然后把结果丢掉。
+- **库文件最大 64 MiB**。存不下就说明该做成文件（`fs` 目前没开放）。
+- **数字只有一种**：JS 的数字是 f64，所以超过 2^53 的整数会掉精度。
+  真要存雪花 id，按 TEXT 存。
+- **对象和数组会存成 JSON 文本**，取出来是字符串，要自己 `JSON.parse`。
+  （省得你每次手动 stringify，但别指望它自动还回来。）
+- **参数用 `?` 占位**，不要把值拼进 SQL 字符串 —— 引号、换行、空格都在
+  等着坑你。
+
+### 一个应用一个库
+
+库里只有你自己的表：每个应用在 `~/.zex/state/db/<id>.db` 有一个独立文件。
+`ATTACH` 和 `PRAGMA` 会被**拒绝**（`not authorized`），所以碰不到 zex 自己的
+库，也改不了上限。这不是建议，是连接级作者器，绕不过去。
+
+### 什么时候别建表
+
+只有一两个设置项（主题、上次选的城市）→ 用 `localStorage`，别为了两行数据
+建一张表。
+
 ## 宿主接口
 
 ```js

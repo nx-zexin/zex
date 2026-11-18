@@ -22,6 +22,28 @@ cp -r examples/extensions/demo ~/.zex/extensions/
 
 然后在「设置 → 应用」里点「打开」。
 
+## 数据：localStorage 与 SQLite
+
+两套都用，按数据形状选：
+
+| 用途 | 用什么 | 落盘 |
+|---|---|---|
+| 几个设置项 | `localStorage`（全局共享一份） | `~/.zex/state/extensions-store.json` |
+| 多行记录、要按条件查 | `dbExec` / `dbQuery` / `dbBatch` | `~/.zex/state/db/<id>.db` |
+
+**SQLite 是一个应用一个库文件。** 这条隔离是宿主做的，不是靠 SQL 过滤：脚本
+只能传 SQL 和参数，路径永远由宿主按应用 id 拼，所以它打不开 `~/.zex/zex.db`
+（那里面有全部会话、审计记录和授权表）。
+
+连接上装了作者器，`ATTACH` 和 `PRAGMA` 一律 `not authorized` —— 这是唯一的
+"跨库"通道，也是"改上限把磁盘写满"的入口，所以从底层挡，而不是解析 SQL 猜意图。
+
+限额：库 64 MiB（`max_page_count`）、单次查询 5000 行。库连接按应用缓存，
+首次用到才建文件 —— 不用数据库的应用不会凭空多出个 `.db`。
+
+实现见 `crates/zex-extension/src/store_db.rs`（纯 SQLite 逻辑，12 个测试）
+和 `host.rs`（接到 `HostModule`）。
+
 ## 图标
 
 `icon.svg` 出现在侧边栏和设置页的应用列表里；没有就退回一个小灰点。

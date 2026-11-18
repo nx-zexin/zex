@@ -26,6 +26,7 @@
 
 pub mod bridge;
 pub mod catalog;
+pub mod store_db;
 #[cfg(feature = "ui")]
 pub mod check;
 

@@ -42,11 +42,12 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use gpui_kit::*;
-use gpui_shell::{Capabilities, HostModule, HostValue, ScriptView, ShellRuntime};
+use gpui_shell::{Capabilities, HostError, HostModule, HostValue, ScriptView, ShellRuntime};
 use zex_core::Result;
 
 use crate::bridge::AgentBridge;
 use crate::catalog::Extension;
+use crate::store_db::{self, JsValue};
 
 /// 扩展宿主：一个 VM 加一套宿主模块。
 pub struct ExtensionHost {
@@ -59,7 +60,16 @@ pub struct ExtensionHost {
     /// 让宿主把结果存下来、由宿主触发重绘，脚本在 render 里同步读取 ——
     /// 这条路不需要跨 await 的 cx。
     replies: Arc<Mutex<HashMap<String, String>>>,
+    /// 应用 id → 已打开的库连接。
+    ///
+    /// 缓存而不是每次现开：打开 SQLite 要读文件头、跑一遍 pragma，
+    /// 而一次渲染里脚本可能连着查好几次。连接带 `Mutex` 是因为
+    /// `rusqlite::Connection` 不是 `Sync`，而宿主模块的回调可能并发。
+    dbs: DbRegistry,
 }
+
+/// 已打开的库。
+type DbRegistry = Arc<Mutex<HashMap<String, Arc<Mutex<rusqlite::Connection>>>>>;
 
 impl ExtensionHost {
     /// 建运行时。
@@ -102,6 +112,7 @@ impl ExtensionHost {
             runtime,
             bridge,
             replies: Arc::new(Mutex::new(HashMap::new())),
+            dbs: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -203,7 +214,12 @@ impl ExtensionHost {
 
     /// 给这个扩展注册 `zex.<id>` 模块。
     fn install_module(&self, ext: &Extension) -> Result<()> {
-        let module = zex_module(ext, self.bridge.clone(), self.replies.clone());
+        let module = zex_module(
+            ext,
+            self.bridge.clone(),
+            self.replies.clone(),
+            self.dbs.clone(),
+        );
         module
             .validate()
             .map_err(|e| zex_core::Error::Other(format!("宿主模块声明与实现不一致: {e}")))?;
@@ -222,7 +238,12 @@ pub fn module_name(ext_id: &str) -> String {
 /// 边界是**纯数据**：进出都只有 null/布尔/数字/字符串/数组/对象，
 /// 不传任何脚本句柄，也不传 `Entity`。这不是洁癖 —— 句柄一旦被宿主留住，
 /// 就可能在下一次脚本调用时还活着，而它所属的调用栈早就没了。
-fn zex_module(ext: &Extension, bridge: AgentBridge, replies: Arc<Mutex<HashMap<String, String>>>) -> HostModule {
+fn zex_module(
+    ext: &Extension,
+    bridge: AgentBridge,
+    replies: Arc<Mutex<HashMap<String, String>>>,
+    dbs: DbRegistry,
+) -> HostModule {
     let ask_bridge = bridge.clone();
     let reply_map = replies;
     let reply_session = ext.session_id();
@@ -246,7 +267,28 @@ fn zex_module(ext: &Extension, bridge: AgentBridge, replies: Arc<Mutex<HashMap<S
              /** 最近一次 ask() 的回复（可同步读）。 */\n\
              export function reply(): string;\n\
              /** 是否有 ask() 还在等回包。 */\n\
-             export function busy(): boolean;\n",
+             export function busy(): boolean;\n\
+             /**\n\
+              * 执行一条写语句（INSERT / UPDATE / DELETE / DDL）。\n\
+              * 返回受影响行数与最后插入的 rowid。\n\
+              */\n\
+             export function dbExec(\n\
+               sql: string,\n\
+               params?: unknown[],\n\
+             ): Promise<{{ changes: number; lastInsertId: number }}>;\n\
+             /**\n\
+              * 查询，返回按列名组织的对象数组。一次最多 5000 行。\n\
+              */\n\
+             export function dbQuery(\n\
+               sql: string,\n\
+               params?: unknown[],\n\
+             ): Promise<Array<Record<string, unknown>>>;\n\
+             /**\n\
+              * 同一个事务里跑多条写语句；任一条失败整体回滚。\n\
+              */\n\
+             export function dbBatch(\n\
+               statements: Array<{{ sql: string; params?: unknown[] }}>,\n\
+             ): Promise<Array<{{ changes: number; lastInsertId: number }}>>;\n",
         ))
         .async_function("ask", move |args| {
             let prompt = args.string(0)?.to_string();
@@ -277,4 +319,186 @@ fn zex_module(ext: &Extension, bridge: AgentBridge, replies: Arc<Mutex<HashMap<S
         .function("busy", move |_| {
             Ok(HostValue::from(busy_bridge.is_waiting(&busy_session)))
         })
+        .async_function("dbExec", {
+            let dbs = dbs.clone();
+            let id = ext.id.clone();
+            move |args| {
+                let sql = args.string(0)?.to_string();
+                let params = sql_params(args.get(1))?;
+                let conn = open_db(&dbs, &id)?;
+                Ok(async move {
+                    let guard = lock_conn(&conn)?;
+                    let r = store_db::exec(&guard, &sql, &params).map_err(HostError::from)?;
+                    Ok(exec_result(r))
+                })
+            }
+        })
+        .async_function("dbQuery", {
+            let dbs = dbs.clone();
+            let id = ext.id.clone();
+            move |args| {
+                let sql = args.string(0)?.to_string();
+                let params = sql_params(args.get(1))?;
+                let conn = open_db(&dbs, &id)?;
+                Ok(async move {
+                    let guard = lock_conn(&conn)?;
+                    let rows = store_db::query(&guard, &sql, &params).map_err(HostError::from)?;
+                    Ok(HostValue::Array(
+                        rows.into_iter()
+                            .map(|record| {
+                                HostValue::Object(
+                                    record
+                                        .into_iter()
+                                        .map(|(k, v)| (k, host_value(v)))
+                                        .collect(),
+                                )
+                            })
+                            .collect(),
+                    ))
+                })
+            }
+        })
+        .async_function("dbBatch", {
+            let dbs = dbs.clone();
+            let id = ext.id.clone();
+            move |args| {
+                let items = batch_items(args.get(0))?;
+                let conn = open_db(&dbs, &id)?;
+                Ok(async move {
+                    let mut guard = lock_conn(&conn)?;
+                    let out =
+                        store_db::batch(&mut guard, &items).map_err(HostError::from)?;
+                    Ok(HostValue::Array(out.into_iter().map(exec_result).collect()))
+                })
+            }
+        })
+}
+
+/// 取（必要时打开）某个应用的库。
+///
+/// 这里只接受应用 id，路径由 [`Extension::db_file`] 拼 —— 脚本给不出
+/// 第二个参数，也就没有"打开别的文件"这条路。
+fn open_db(dbs: &DbRegistry, id: &str) -> std::result::Result<Arc<Mutex<rusqlite::Connection>>, HostError> {
+    let mut map = dbs
+        .lock()
+        .map_err(|_| HostError::from("库连接表中毒"))?;
+    if let Some(conn) = map.get(id) {
+        return Ok(conn.clone());
+    }
+    // 目录在 ExtensionHost::new 里已经建过；这里失败只有一个原因：
+    // 磁盘/权限出问题，值得原样报给脚本
+    let conn = store_db::open(&state_db_path(id))
+        .map_err(|e| HostError::from(format!("无法打开本应用的库: {e}")))?;
+    let shared = Arc::new(Mutex::new(conn));
+    map.insert(id.to_string(), shared.clone());
+    Ok(shared)
+}
+
+/// 库文件路径。和 [`Extension::db_file`] 同一来源，但这里没有 `Extension`。
+fn state_db_path(id: &str) -> std::path::PathBuf {
+    crate::store_db::db_path(&crate::catalog::state_dir(), id)
+}
+
+fn lock_conn(
+    conn: &Arc<Mutex<rusqlite::Connection>>,
+) -> std::result::Result<std::sync::MutexGuard<'_, rusqlite::Connection>, HostError> {
+    conn.lock().map_err(|_| HostError::from("库连接已损坏"))
+}
+
+fn exec_result(r: store_db::ExecResult) -> HostValue {
+    HostValue::Object(vec![
+        ("changes".to_string(), HostValue::Number(r.changes as f64)),
+        (
+            "lastInsertId".to_string(),
+            HostValue::Number(r.last_insert_id as f64),
+        ),
+    ])
+}
+
+/// 参数数组 → 内部表示。
+///
+/// 第二个参数可以省略，也可以给 `null`/`undefined`。
+fn sql_params(value: Option<&HostValue>) -> std::result::Result<Vec<JsValue>, HostError> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    match value {
+        HostValue::Null => Ok(Vec::new()),
+        HostValue::Array(items) => Ok(items.iter().map(to_js_value).collect()),
+        other => Err(HostError::from(format!(
+            "params 必须是数组，收到的是 {}",
+            other.describe()
+        ))),
+    }
+}
+
+fn to_js_value(v: &HostValue) -> JsValue {
+    match v {
+        HostValue::Null => JsValue::Null,
+        HostValue::Bool(b) => JsValue::Bool(*b),
+        HostValue::Number(n) => JsValue::Number(*n),
+        HostValue::Str(s) => JsValue::Str(s.clone()),
+        // 数组和对象存成 JSON 文本：SQLite 没有嵌套类型，而"存一坨结构化
+        // 数据"是脚本最常干的事，让它自己 JSON.stringify 一遍太啰嗦
+        HostValue::Array(_) | HostValue::Object(_) => {
+            JsValue::Json(to_json(v).to_string())
+        }
+    }
+}
+
+fn to_json(v: &HostValue) -> serde_json::Value {
+    match v {
+        HostValue::Null => serde_json::Value::Null,
+        HostValue::Bool(b) => serde_json::Value::Bool(*b),
+        HostValue::Number(n) => serde_json::Number::from_f64(*n)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+        HostValue::Str(s) => serde_json::Value::String(s.clone()),
+        HostValue::Array(items) => serde_json::Value::Array(items.iter().map(to_json).collect()),
+        HostValue::Object(entries) => serde_json::Value::Object(
+            entries
+                .iter()
+                .map(|(k, v)| (k.clone(), to_json(v)))
+                .collect(),
+        ),
+    }
+}
+
+fn host_value(v: JsValue) -> HostValue {
+    match v {
+        JsValue::Null => HostValue::Null,
+        JsValue::Bool(b) => HostValue::Bool(b),
+        JsValue::Number(n) => HostValue::Number(n),
+        JsValue::Str(s) => HostValue::Str(s),
+        JsValue::Json(s) => HostValue::Str(s),
+    }
+}
+
+/// `dbBatch` 的参数：`[{sql, params?}, ...]`。
+fn batch_items(value: Option<&HostValue>) -> std::result::Result<Vec<(String, Vec<JsValue>)>, HostError> {
+    let Some(HostValue::Array(items)) = value else {
+        return Err(HostError::from("dbBatch 需要语句数组"));
+    };
+    let mut out = Vec::with_capacity(items.len());
+    for (i, item) in items.iter().enumerate() {
+        let HostValue::Object(entries) = item else {
+            return Err(HostError::from(format!("第 {} 条不是对象", i + 1)));
+        };
+        let mut sql = None;
+        let mut params = Vec::new();
+        for (k, v) in entries {
+            match k.as_str() {
+                "sql" => {
+                    sql = v.as_str().map(str::to_string);
+                }
+                "params" => params = sql_params(Some(v))?,
+                _ => {}
+            }
+        }
+        let Some(sql) = sql else {
+            return Err(HostError::from(format!("第 {} 条缺少 sql", i + 1)));
+        };
+        out.push((sql, params));
+    }
+    Ok(out)
 }

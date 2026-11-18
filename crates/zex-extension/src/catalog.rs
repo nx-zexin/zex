@@ -69,6 +69,14 @@ impl Extension {
         self.dir.join(&self.entry)
     }
 
+    /// 这个扩展的 SQLite 库文件（`~/.zex/state/db/<id>.db`）。
+    ///
+    /// 路径由宿主按 id 拼，脚本拿不到也改不了 —— 这是"应用碰不到
+    /// zex 自己的库"的实现方式，见 [`crate::store_db`]。
+    pub fn db_file(&self) -> PathBuf {
+        crate::store_db::db_path(&state_dir(), &self.id)
+    }
+
     /// 这个扩展专用的会话 id。
     ///
     /// 用它做事件分流：内核产出的事件带 `session`，UI 据此判断
@@ -231,7 +239,16 @@ fn config_dir() -> PathBuf {
 /// 那是一整套插件生命周期，不是两行能改的。先共享，等 per-app 策略
 /// 真落地了再拆。
 pub fn storage_path() -> PathBuf {
-    config_dir().join("state").join("extensions-store.json")
+    state_dir().join("extensions-store.json")
+}
+
+/// 宿主自己的状态目录：`~/.zex/state`。
+///
+/// 和 `~/.zex` 根目录分开：根目录放配置和 zex 自己的库（`zex.db`），
+/// 这里放**扩展产生的数据**（localStorage 的 JSON、每个应用的 SQLite）。
+/// 分开了，用户想清理扩展数据时不用怕误删会话。
+pub fn state_dir() -> PathBuf {
+    config_dir().join("state")
 }
 
 /// 扫描全部扩展，按 id 排序。
@@ -271,6 +288,14 @@ fn read_one(dir: &Path) -> Result<Option<Extension>, String> {
         serde_json::from_str(&text).map_err(|e| format!("{MANIFEST} 解析失败: {e}"))?;
     if manifest.id.trim().is_empty() {
         return Err("id 不能为空".into());
+    }
+    // id 会变成目录名、宿主模块名（`zex.<id>`）和库文件名。
+    // 任何一处被注入 `../` 都会出事，所以入口就挡
+    if !crate::store_db::valid_app_id(&manifest.id) {
+        return Err(format!(
+            "id `{}` 不合法：只能用字母、数字、`-`、`_`、`.`，且不能含 `..`",
+            manifest.id
+        ));
     }
     let entry = manifest
         .entry

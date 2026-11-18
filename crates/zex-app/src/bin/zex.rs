@@ -5669,8 +5669,10 @@ impl ChatView {
                                     .text_xs()
                                     .text_color(rgb(TEXT_MUTED))
                                     .child(format!(
-                                        "已生效：本地存储（全部应用共享一份，{}）",
-                                        zex_extension::catalog::storage_path().display()
+                                        "已生效：本地存储（全局共享）+ SQLite（每个应用一份，{}）",
+                                        zex_extension::catalog::state_dir()
+                                            .join(zex_extension::store_db::DB_DIR)
+                                            .display()
                                     ));
                                 if req.is_empty() {
                                     div()
