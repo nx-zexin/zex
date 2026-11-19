@@ -203,6 +203,22 @@ pub struct CollectedResponse {
     pub stop_reason: Option<String>,
 }
 
+/// 错误消息里回显的原文最多留多少字符。
+///
+/// 400 个字符足够看出「断在哪个 token 上」：JSON 截断的现场通常就在开头
+/// 或者紧邻截断处，两头各留一点即可，不必把整个文件搬进错误消息。
+const ARGS_EXCERPT_CHARS: usize = 400;
+
+/// 取一段原文做证据：超长时截断并标注原始长度。
+fn excerpt(text: &str, limit: usize) -> String {
+    let total = text.chars().count();
+    if total <= limit {
+        return text.to_string();
+    }
+    let head: String = text.chars().take(limit).collect();
+    format!("{head}…（原文共 {total} 字符，此处只留开头 {limit} 个）")
+}
+
 /// 把分片事件聚合成完整响应。
 #[derive(Debug, Default)]
 pub struct Accumulator {
@@ -260,9 +276,13 @@ impl Accumulator {
             };
             let arguments = serde_json::from_str(&args).map_err(|e| Error::Llm {
                 message: format!(
-                    "工具 `{name}` 的参数不是合法 JSON: {e}（原文: {args}）。\
+                    "工具 `{name}` 的参数不是合法 JSON: {e}（原文开头: {}）。\
                      最常见的原因是输出被 max_tokens 截断：把这次调用拆小\
-                     （比如大文件分几次写，每次不超过 150 行）再试"
+                     （比如大文件分几次写，每次不超过 150 行）再试",
+                    // 原文可能是一整个文件（写大文件时几十上百 KB）。
+                    // 整段塞进错误消息有两个后果：界面上刷成一条读不完的长行，
+                    // 下一轮还要把这坨载荷再送进上下文。所以只取开头做证据。
+                    excerpt(&args, ARGS_EXCERPT_CHARS)
                 ),
                 status: None,
                 retryable: false,
@@ -434,6 +454,29 @@ mod tests {
         assert_eq!(out.tool_calls.len(), 2);
         assert_eq!(out.tool_calls[0].name, "fs_read");
         assert_eq!(out.tool_calls[1].arguments["cmd"], "ls");
+    }
+
+    #[test]
+    fn broken_tool_args_error_keeps_only_an_excerpt() {
+        // 写大文件时参数有一整个文件那么大。错误消息如果整段回显，
+        // 界面上会是一条读不完的长行，下一轮还会把它再塞进上下文。
+        let big = format!("{{\"text\": \"{}\"", "字".repeat(20_000));
+        let mut acc = Accumulator::default();
+        acc.push(StreamEvent::ToolCallDelta {
+            index: 0,
+            id: Some("call_1".into()),
+            name: Some("fs_write".into()),
+            args_delta: big,
+        });
+        let err = acc.finish().unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("不是合法 JSON"), "{msg}");
+        assert!(
+            msg.chars().count() < 800,
+            "错误消息不该带上整段参数，实际 {} 字符",
+            msg.chars().count()
+        );
+        assert!(msg.contains("原文共 20011 字符"), "应当说明原始长度: {msg}");
     }
 
     #[test]

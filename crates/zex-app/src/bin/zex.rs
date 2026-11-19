@@ -3074,21 +3074,60 @@ impl ChatView {
                 card.into_any_element()
             }
 
-            MsgKind::System => div()
-                .w_full()
-                .flex()
-                .justify_center()
-                .child(
+            MsgKind::System => {
+                // 系统消息有两种长度：一行能说完的（"✓ 任务完成 · 共 3 步"）
+                // 和说不完的（出错的那一大段原因）。后者塞进胶囊里会被排成
+                // 一整行、然后两头各裁掉一截 —— 正好把"出错了"和后面的
+                // 处理建议裁没，只剩中间一段谁也看不懂的原文。
+                if zex_app::system_banner_is_long(&m.text) {
+                    let danger = m.text.starts_with('✗');
+                    let muted = if danger { DANGER } else { TEXT_MUTED };
                     div()
-                        .px_3()
-                        .py_1()
-                        .rounded_full()
-                        .bg(rgb(BG_TOOL))
-                        .text_xs()
-                        .text_color(rgb(TEXT_DIM))
-                        .child(m.text.clone()),
-                )
-                .into_any_element(),
+                        .w_full()
+                        .flex()
+                        .justify_center()
+                        .child(
+                            div()
+                                .w_full()
+                                .min_w(px(0.0))
+                                .px_3()
+                                .py_2()
+                                .rounded_lg()
+                                .border_1()
+                                .border_color(rgb(if danger { DANGER_SOFT } else { BORDER_SOFT }))
+                                .bg(rgb(if danger { DANGER_SOFT } else { BG_TOOL }))
+                                .child(
+                                    // 用 markdown 而不是裸文本：系统消息里
+                                    // 常带反引号和路径，顺手渲染成码字更好读
+                                    TextView::markdown(
+                                        ElementId::Name(format!("md-sys-{idx}").into()),
+                                        m.text.clone(),
+                                    )
+                                    .text_size(px(12.0))
+                                    .line_height(px(18.0))
+                                    .text_color(rgb(muted))
+                                    .style(md_style_flat(scale)),
+                                ),
+                        )
+                        .into_any_element()
+                } else {
+                    div()
+                        .w_full()
+                        .flex()
+                        .justify_center()
+                        .child(
+                            div()
+                                .px_3()
+                                .py_1()
+                                .rounded_full()
+                                .bg(rgb(BG_TOOL))
+                                .text_xs()
+                                .text_color(rgb(TEXT_DIM))
+                                .child(m.text.clone()),
+                        )
+                        .into_any_element()
+                }
+            }
         }
     }
 

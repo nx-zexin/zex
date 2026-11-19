@@ -67,6 +67,15 @@ pub fn build_agent(cfg: &ResolvedConfig, cwd: PathBuf) -> zex_core::Result<zex_a
 ///
 /// 这是"关掉再打开能接着聊"的实现：GUI 启动时恢复上次的对话，
 /// 而不是每次都开一个空白会话。
+/// 系统消息该按「整段卡片」还是「一行胶囊」渲染。
+///
+/// 分界线定在 60 个字：一行放得下的提示（"✓ 任务完成 · 共 3 步，用时 2 分钟"）
+/// 仍用胶囊，短提示视觉上不打断阅读节奏；更长的一律铺开成可换行的块 ——
+/// 出错说明动辄几十上百字，挤成一行会把两头的关键信息裁掉。
+pub fn system_banner_is_long(text: &str) -> bool {
+    text.chars().count() > 60 || text.contains('\n')
+}
+
 /// 技能目录：`~/.zex/skills`。
 pub fn skills_dir() -> PathBuf {
     config_dir().join("skills")
@@ -874,6 +883,28 @@ async fn run_task(
 }
 
 #[cfg(test)]
+mod system_banner_tests {
+    use super::*;
+
+    #[test]
+    fn short_completion_pill_stays_a_pill() {
+        assert!(!system_banner_is_long("✓ 任务完成 · 共 3 步，用时 12 秒"));
+    }
+
+    #[test]
+    fn long_error_gets_the_wide_layout() {
+        // 真实报错带一段原文，远超一行
+        let text = format!("✗ 出错了：工具 `fs_write` 的参数不是合法 JSON: {}", "字".repeat(200));
+        assert!(system_banner_is_long(&text));
+    }
+
+    #[test]
+    fn newlines_count_as_long_even_when_short() {
+        // 短短两行也是多行，胶囊里排不下
+        assert!(system_banner_is_long("第一行\n第二行"));
+    }
+}
+
 mod control_panel_tests {
     use super::*;
     use zex_core::tool::{Tool, ToolCtx};
