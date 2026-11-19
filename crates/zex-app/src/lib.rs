@@ -222,6 +222,24 @@ pub fn build_agent_resuming(cfg: &ResolvedConfig, cwd: PathBuf) -> zex_core::Res
 ///
 /// 单独开一个函数而不是给原函数加参数：`build_agent_resuming`
 /// 已经是 CLI / GUI 共用的稳定入口，加参数会牵动所有调用点。
+/// 所有 builder 共用的内核配置。
+///
+/// 单独抽出来是因为踩过：CLI 那条路（`build_agent_with_team`）曾经自己
+/// `AgentConfig::new` 一遍，忘了接 `params` 和技能清单 —— 于是用户在
+/// 配置里写的 `max_tokens` 在 CLI 下静默失效，仍然是默认的 8192。
+/// 参数只有一处来源，才不会漏。
+fn agent_config_for(
+    cfg: &ResolvedConfig,
+    cwd: PathBuf,
+    skills: &Arc<zex_skill::SkillRegistry>,
+) -> zex_agent::AgentConfig {
+    zex_agent::AgentConfig::new(cfg.provider.clone(), cfg.model.clone(), cwd)
+        .with_extra_prompt(skills.prompt_section())
+        // 模型参数跟着配置走：温度决定"同样的问法给不给同样的答案"，
+        // 是用户最容易感知的一项
+        .with_model_params(cfg.model_params.temperature, cfg.model_params.max_tokens)
+}
+
 pub fn build_agent_resuming_with(
     cfg: &ResolvedConfig,
     cwd: PathBuf,
@@ -236,11 +254,7 @@ pub fn build_agent_resuming_with(
         Err(e) => tracing::warn!(error = %e, "清理孤儿任务失败"),
     }
     let skills = load_skills();
-    let agent_cfg = zex_agent::AgentConfig::new(cfg.provider.clone(), cfg.model.clone(), cwd)
-        .with_extra_prompt(skills.prompt_section())
-        // 模型参数跟着配置走：温度决定"同样的问法给不给同样的答案"，
-        // 是用户最容易感知的一项
-        .with_model_params(cfg.model_params.temperature, cfg.model_params.max_tokens);
+    let agent_cfg = agent_config_for(cfg, cwd, &skills);
 
     // 跳过空会话：每次启动都会留下一个没说话的会话壳，
     // 直接恢复它会让用户以为历史丢了。
@@ -316,7 +330,8 @@ pub fn build_agent_with_team(
         Ok(0) | Err(_) => {}
         Ok(n) => tracing::info!(count = n, "已标记上次退出时未完成的任务"),
     }
-    let agent_cfg = zex_agent::AgentConfig::new(cfg.provider.clone(), cfg.model.clone(), cwd);
+    let skills = load_skills();
+    let agent_cfg = agent_config_for(cfg, cwd, &skills);
     let broker = Arc::new(zex_agent::ApprovalBroker::new());
     let (registry, tools) = attach_team_tools(agent_cfg.clone(), store.clone(), ev_tx, broker.clone());
     let agent = zex_agent::Agent::new(agent_cfg, tools, store)?.with_shared_approvals(broker);
@@ -332,7 +347,8 @@ pub fn build_ephemeral_agent_with_team(
     ev_tx: mpsc::Sender<CoreEvent>,
 ) -> zex_core::Result<(zex_agent::Agent, Arc<zex_agent::subagent::AgentRegistry>)> {
     let store = Store::in_memory()?;
-    let agent_cfg = zex_agent::AgentConfig::new(cfg.provider.clone(), cfg.model.clone(), cwd);
+    let skills = load_skills();
+    let agent_cfg = agent_config_for(cfg, cwd, &skills);
     let broker = Arc::new(zex_agent::ApprovalBroker::new());
     let (registry, tools) = attach_team_tools(agent_cfg.clone(), store.clone(), ev_tx, broker.clone());
     let agent = zex_agent::Agent::new(agent_cfg, tools, store)?.with_shared_approvals(broker);
