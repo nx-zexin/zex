@@ -22,6 +22,16 @@ pub fn build_body(model: &str, req: &ChatRequest) -> Value {
         messages.push(message_to_wire(m));
     }
 
+    // 实际发出去的上限记一条 debug：截断问题排查全靠它，
+    // 不然只能靠猜"到底发的是 4096 还是 8192"
+    tracing::debug!(
+        model,
+        max_tokens = req.max_tokens,
+        messages = req.messages.len(),
+        tools = req.tools.len(),
+        thinking = ?req.thinking,
+        "发起对话请求"
+    );
     let mut body = json!({
         "model": model,
         "messages": messages,

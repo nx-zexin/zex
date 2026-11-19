@@ -83,6 +83,13 @@ pub fn build_body(model: &str, req: &ChatRequest) -> Value {
         "stream": true,
     });
 
+    tracing::debug!(
+        model,
+        max_tokens = req.max_tokens,
+        messages = req.messages.len(),
+        thinking = ?req.thinking,
+        "发起对话请求"
+    );
     if let Some(system) = &req.system {
         body["system"] = json!(system);
     }

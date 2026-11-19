@@ -576,6 +576,9 @@ impl Agent {
         let mut round = 0u32;
         // 整轮累计（续段也算进去）—— 结束时报给用户的就是它
         let mut total_steps = 0u32;
+        // 因输出截断自动重试过没有。只给一次：第二次还撞上限，
+        // 说明模型没按提醒拆分，继续重试只是烧钱。
+        let mut truncation_retried = false;
         let started = std::time::Instant::now();
 
         loop {
@@ -637,26 +640,45 @@ impl Agent {
             self.maybe_compress(&turn, events).await;
 
             let req = self.build_request();
-            let (text, thinking, tool_calls, usage) =
-                match self.stream_once(req, &turn, events).await {
-                    Ok(v) => v,
-                    Err(e) => {
-                        self.emit(
-                            CoreEvent::TurnEnded {
-                        session: self.session.clone(),
-                                turn: turn.clone(),
-                                reason: EndReason::Failed {
-                                    message: e.to_string(),
-                                },
-                                usage: self.usage,
-                                steps: total_steps,
-                                elapsed_ms: started.elapsed().as_millis() as u64,
+            let streamed = match self.stream_once(req, &turn, events).await {
+                Ok(v) => Ok(v),
+                // 输出被上限截断：这一轮的半截工具调用不能进历史（协议要求
+                // 调用与结果成对），只能丢掉重来。重来之前做两件事：
+                // 关掉思考（它和正文抢同一份 max_tokens），并在系统提示里
+                // 明确要求拆分写入 —— 否则模型会原样再写一遍，再撞一次。
+                Err(zex_core::Error::Truncated { detail }) if !truncation_retried => {
+                    truncation_retried = true;
+                    self.emit(
+                        CoreEvent::Warning {
+                            message: format!("{detail}（正在重试一次：关闭思考并要求分块写入）"),
+                        },
+                        events,
+                    );
+                    self.stream_once(truncation_retry_request(&self.build_request()), &turn, events)
+                        .await
+                }
+                Err(e) => Err(e),
+            };
+
+            let (text, thinking, tool_calls, usage) = match streamed {
+                Ok(v) => v,
+                Err(e) => {
+                    self.emit(
+                        CoreEvent::TurnEnded {
+                            session: self.session.clone(),
+                            turn: turn.clone(),
+                            reason: EndReason::Failed {
+                                message: e.to_string(),
                             },
-                            events,
-                        );
-                        return Err(e);
-                    }
-                };
+                            usage: self.usage,
+                            steps: total_steps,
+                            elapsed_ms: started.elapsed().as_millis() as u64,
+                        },
+                        events,
+                    );
+                    return Err(e);
+                }
+            };
 
             self.usage.add(usage);
 
@@ -850,6 +872,9 @@ impl Agent {
         turn: &TurnId,
         events: Option<&mpsc::Sender<CoreEvent>>,
     ) -> Result<(String, String, Vec<zex_core::ToolCall>, Usage)> {
+        // 记住这一轮的输出上限：截断报错要把它写进去，否则用户和模型
+        // 只知道"被截断了"，不知道顶在哪儿、该往哪调
+        let max_tokens = req.max_tokens;
         let mut stream = match zex_llm::stream_chat(&self.http, &self.cfg.provider, &self.cfg.model, req).await {
             Ok(s) => s,
             Err(e) => {
@@ -885,7 +910,26 @@ impl Agent {
             acc.push(ev);
         }
 
-        let out = acc.finish()?;
+        let out = acc.finish().map_err(|e| match e {
+            zex_core::Error::Truncated { detail } => zex_core::Error::Truncated {
+                detail: format!("{detail}（本轮 max_tokens={max_tokens}）"),
+            },
+            other => other,
+        })?;
+        // 没有工具调用却被截断：模型是把**正文**写到一半没词了。
+        // 这种情况不该悄悄结束 —— 用户看到的会是一句戛然而止的话，
+        // 只能猜"是它不想说了还是被砍了"。
+        if out.tool_calls.is_empty() && zex_llm::is_truncated(out.stop_reason.as_deref()) {
+            self.emit(
+                CoreEvent::Warning {
+                    message: format!(
+                        "这一轮回复被 max_tokens={max_tokens} 截断，内容没有说完。\
+                         可以回复「继续」接着写，或把这个模型的 max_tokens 调大"
+                    ),
+                },
+                events,
+            );
+        }
         Ok((out.text, out.thinking, out.tool_calls, out.usage))
     }
 
@@ -1185,6 +1229,29 @@ mod tests {
     }
 
     #[test]
+    fn truncation_retry_turns_thinking_off_and_asks_for_chunks() {
+        // 重试请求必须做两件事：关掉思考（它和正文抢同一份 max_tokens）、
+        // 明确要求分块写（否则模型会原样重写整个文件）
+        let mut req = ChatRequest::new(Vec::new()).with_system("系统提示");
+        req.thinking = zex_llm::ThinkingEffort::High;
+        let next = truncation_retry_request(&req);
+        assert_eq!(next.thinking, zex_llm::ThinkingEffort::Off);
+        let sys = next.system.unwrap_or_default();
+        assert!(sys.starts_with("系统提示"), "原提示要保留");
+        assert!(sys.contains("append"), "得告诉它怎么续写: {sys}");
+        assert!(sys.contains("max_tokens"), "得说明为什么被截断: {sys}");
+        // 原请求不能被就地改掉：克隆语义
+        assert_eq!(req.thinking, zex_llm::ThinkingEffort::High);
+    }
+
+    #[test]
+    fn truncation_retry_works_without_a_system_prompt() {
+        let req = ChatRequest::new(Vec::new());
+        let next = truncation_retry_request(&req);
+        assert!(next.system.unwrap_or_default().contains("被截断"));
+    }
+
+    #[test]
     fn brief_truncates_long_first_line() {
         let long = "x".repeat(200);
         let b = brief(&long);
@@ -1447,3 +1514,27 @@ mod autotitle_tests {
         assert!(!title.is_empty());
     }
 }
+
+/// 因输出截断而重试时，改一版请求再发。
+///
+/// 两处改动，都是冲着"为什么会撞上限"去的：
+///
+/// - **关掉思考**：推理内容同样计入 `max_tokens`。开着思考的模型可能把
+///   大半预算花在推理上，正文刚开始写就被切断 —— 这正是实测里
+///   `fs_write` 只写出半截的原因。
+/// - **明确要求分块**：模型的默认行为是"一次写完整个文件"。光说
+///   "被截断了"它多半原样再来一遍，得告诉它具体怎么拆。
+fn truncation_retry_request(req: &ChatRequest) -> ChatRequest {
+    let mut next = req.clone();
+    next.thinking = zex_llm::ThinkingEffort::Off;
+    let note = "\n\n## 上一次尝试被截断\n\n\
+        你上一轮的输出达到了 max_tokens 上限，工具调用只写出了一半，已作废。\n\
+        这次请把大块内容拆开：第一次用 `fs_write` 写开头，之后用 `append: true` 续写，\
+        每次不要超过 150 行；不要试图一次写完整个文件。\n";
+    match next.system.as_mut() {
+        Some(sys) => sys.push_str(note),
+        None => next.system = Some(note.to_string()),
+    }
+    next
+}
+

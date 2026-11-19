@@ -203,6 +203,29 @@ pub struct CollectedResponse {
     pub stop_reason: Option<String>,
 }
 
+/// 各家表示"输出撞到上限"的 stop_reason 写法。
+///
+/// OpenAI 兼容端点多用 `length`，Anthropic 用 `max_tokens`，个别网关
+/// 会自造一个名字。放在一处列举，避免每个调用点各自 hardcode。
+const TRUNCATED_STOP_REASONS: &[&str] = &[
+    "length",
+    "max_tokens",
+    "max_output_tokens",
+    "model_context_window_exceeded",
+];
+
+/// 这次响应是不是被上限截断了。
+///
+/// 公开是因为调用方也要用：工具调用被截断我们要报错，**正文**被截断
+/// 则是另一回事 —— 那时没有错误，只是答案写到一半没了，得提醒用户。
+pub fn is_truncated(reason: Option<&str>) -> bool {
+    reason.is_some_and(|r| {
+        TRUNCATED_STOP_REASONS
+            .iter()
+            .any(|known| known.eq_ignore_ascii_case(r))
+    })
+}
+
 /// 错误消息里回显的原文最多留多少字符。
 ///
 /// 400 个字符足够看出「断在哪个 token 上」：JSON 截断的现场通常就在开头
@@ -262,6 +285,8 @@ impl Accumulator {
     ///
     /// 工具参数分片拼接后统一解析；空字符串按 `{}` 处理（无参工具很常见）。
     pub fn finish(self) -> Result<CollectedResponse> {
+        // 先记下来：下面的循环会消耗 self.calls，而"为什么坏"要一起判断
+        let cut_off = is_truncated(self.stop_reason.as_deref());
         let mut tool_calls = Vec::with_capacity(self.calls.len());
         for (index, (id, name, args)) in self.calls {
             let name = name.ok_or_else(|| Error::Llm {
@@ -274,18 +299,34 @@ impl Accumulator {
             } else {
                 args
             };
-            let arguments = serde_json::from_str(&args).map_err(|e| Error::Llm {
-                message: format!(
-                    "工具 `{name}` 的参数不是合法 JSON: {e}（原文开头: {}）。\
-                     最常见的原因是输出被 max_tokens 截断：把这次调用拆小\
-                     （比如大文件分几次写，每次不超过 150 行）再试",
-                    // 原文可能是一整个文件（写大文件时几十上百 KB）。
-                    // 整段塞进错误消息有两个后果：界面上刷成一条读不完的长行，
-                    // 下一轮还要把这坨载荷再送进上下文。所以只取开头做证据。
-                    excerpt(&args, ARGS_EXCERPT_CHARS)
-                ),
-                status: None,
-                retryable: false,
+            let arguments = serde_json::from_str(&args).map_err(|e| {
+                if cut_off {
+                    // 被截断和写错语法是两回事：前者改语法没用。
+                    // 而且思考也吃同一份预算 —— 开了思考时，一半以上的
+                    // 上限可能花在推理上，正文刚开头就被切断。
+                    return Error::Truncated {
+                        detail: format!(
+                            "工具 `{name}` 的调用只写出了一半就被切断（已收到 {} 字符，\
+                             停在第 {:?} 列）。原因不是语法错，而是这一轮输出达到了 \
+                             max_tokens 上限。三个办法任选：把内容拆成多次写入\
+                             （第一次 fs_write，之后用 append=true 续写）；把思考强度调低或关掉\
+                             （思考与正文共用这份上限）；或者提高该模型的 max_tokens",
+                            args.chars().count(),
+                            e.column()
+                        ),
+                    };
+                }
+                Error::Llm {
+                    message: format!(
+                        "工具 `{name}` 的参数不是合法 JSON: {e}（原文开头: {}）",
+                        // 原文可能是一整个文件（写大文件时几十上百 KB）。
+                        // 整段塞进错误消息有两个后果：界面上刷成一条读不完的长行，
+                        // 下一轮还要把这坨载荷再送进上下文。所以只取开头做证据。
+                        excerpt(&args, ARGS_EXCERPT_CHARS)
+                    ),
+                    status: None,
+                    retryable: false,
+                }
             })?;
             tool_calls.push(zex_core::ToolCall {
                 id: zex_core::ToolCallId::new(id.unwrap_or_else(|| format!("call_{index}"))),
@@ -454,6 +495,59 @@ mod tests {
         assert_eq!(out.tool_calls.len(), 2);
         assert_eq!(out.tool_calls[0].name, "fs_read");
         assert_eq!(out.tool_calls[1].arguments["cmd"], "ls");
+    }
+
+    #[test]
+    fn truncation_stop_reasons_cover_both_protocols() {
+        // OpenAI 兼容端点写 length，Anthropic 写 max_tokens，个别网关自造名字
+        for r in ["length", "max_tokens", "MAX_OUTPUT_TOKENS"] {
+            assert!(is_truncated(Some(r)), "{r} 应判为截断");
+        }
+        for r in ["stop", "end_turn", "tool_calls"] {
+            assert!(!is_truncated(Some(r)), "{r} 不该判为截断");
+        }
+        assert!(!is_truncated(None), "没有 stop_reason 时不能猜截断");
+    }
+
+    #[test]
+    fn truncated_tool_call_is_reported_as_truncation_not_syntax_error() {
+        // 模型写到一半撞上 max_tokens：stop_reason=length，参数是半截 JSON。
+        // 这种时候让模型"修语法"毫无意义，必须说清楚是预算不够。
+        let mut acc = Accumulator::default();
+        acc.push(StreamEvent::ToolCallDelta {
+            index: 0,
+            id: Some("call_1".into()),
+            name: Some("fs_write".into()),
+            args_delta: "{\"path\": \"main.js\", \"content\": \"import {".into(),
+        });
+        acc.push(StreamEvent::Done {
+            usage: Usage::default(),
+            stop_reason: Some("length".into()),
+        });
+        let err = acc.finish().unwrap_err();
+        assert!(matches!(err, Error::Truncated { .. }), "实际: {err:?}");
+        let msg = err.to_string();
+        assert!(msg.contains("max_tokens"), "{msg}");
+        assert!(msg.contains("append=true"), "得给出可照做的办法: {msg}");
+    }
+
+    #[test]
+    fn genuine_syntax_error_still_blames_the_syntax() {
+        // 没有被截断，就是模型把 JSON 写坏了：这时不应甩锅给预算
+        let mut acc = Accumulator::default();
+        acc.push(StreamEvent::ToolCallDelta {
+            index: 0,
+            id: Some("call_1".into()),
+            name: Some("fs_read".into()),
+            args_delta: "{\"path\": }".into(),
+        });
+        acc.push(StreamEvent::Done {
+            usage: Usage::default(),
+            stop_reason: Some("stop".into()),
+        });
+        let err = acc.finish().unwrap_err();
+        assert!(!matches!(err, Error::Truncated { .. }), "不该报截断: {err:?}");
+        assert!(err.to_string().contains("不是合法 JSON"), "{err}");
     }
 
     #[test]
