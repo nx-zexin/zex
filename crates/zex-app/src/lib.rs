@@ -16,7 +16,8 @@ pub mod models_dev;
 use std::path::PathBuf;
 
 pub use config::{
-    FileConfig, ProviderEntry, ResolvedConfig, config_dir, load, read_file_config, save_file_config,
+    FileConfig, ModelParams, ProviderEntry, ResolvedConfig, config_dir, load, read_file_config,
+    save_file_config,
 };
 
 /// 连上配置里声明的所有 MCP 服务端。
@@ -286,6 +287,35 @@ pub fn build_agent_resuming_with(
     }
 }
 
+/// 把配置文件里的模型参数套到这一轮的内核配置上。
+///
+/// 读不到配置（文件缺失、这个模型没配参数）时回到默认值，而不是沿用
+/// 上一个模型留下的值 —— 否则从"上限 2048 的模型"切到没配参数的模型，
+/// 会莫名其妙还是 2048。
+fn apply_model_params(cfg: &mut zex_agent::AgentConfig, provider: &str, model: &str) {
+    let file = read_file_config();
+    let params = params_for_model(file.as_ref(), provider, model);
+    cfg.temperature = params.temperature;
+    cfg.max_tokens = params.max_tokens.unwrap_or(zex_agent::DEFAULT_MAX_TOKENS);
+}
+
+/// 从配置里取某个模型的参数；没有就返回全空，交给调用方回落到默认值。
+///
+/// 单独一个纯函数是为了能测：`apply_model_params` 要读磁盘，测起来得
+/// 折腾环境变量，而"没配参数时该回到默认"这条恰恰是最容易写错的地方。
+fn params_for_model(
+    file: Option<&FileConfig>,
+    provider: &str,
+    model: &str,
+) -> ModelParams {
+    file.and_then(|f| {
+        f.providers
+            .get(provider)
+            .and_then(|e| e.params.get(model).cloned())
+    })
+    .unwrap_or_default()
+}
+
 /// 装配一个用内存数据库的内核（测试与 --ephemeral 模式）。
 pub fn build_ephemeral_agent(
     cfg: &ResolvedConfig,
@@ -458,6 +488,7 @@ fn session_summaries(agent: &Agent) -> Vec<zex_core::event::SessionSummary> {
 pub fn spawn_core(
     mut agent: Agent,
     providers: std::collections::BTreeMap<String, zex_llm::ProviderConfig>,
+    default_provider: String,
 ) -> CoreHandles {
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<UiCommand>(64);
     let (ev_tx, ev_rx) = mpsc::channel::<CoreEvent>(256);
@@ -537,6 +568,7 @@ pub fn spawn_core(
                                 providers.clone(),
                                 mode_cells.clone(),
                             );
+                            let default_provider = default_provider.clone();
                             tokio::spawn(async move {
                                 // 请求级模型覆盖：换了模型不必重启内核
                                 let mut task_cfg = cfg.clone();
@@ -550,30 +582,28 @@ pub fn spawn_core(
                                 if let Some(t) = thinking {
                                     task_cfg.thinking = t;
                                 }
+                                // 这一轮实际用哪个 provider/model：请求级覆盖
+                                // 会换掉它，参数也要按换完之后的那个查
+                                let mut eff_provider = default_provider.clone();
+                                let mut eff_model = task_cfg.model.clone();
                                 if let Some(m) = model.as_deref() {
                                     if let Some((p, rest)) = m.split_once('/') {
                                         if let Some(pc) = providers.get(p) {
                                             task_cfg.provider = pc.clone();
                                             task_cfg.model = rest.to_string();
+                                            eff_provider = p.to_string();
+                                            eff_model = rest.to_string();
                                             // 换模型顺带换预算：从 128K 的模型
                                             // 切到 1M 的，压缩阈值得跟着走
                                             task_cfg.budget =
                                                 zex_agent::context::ContextBudget::for_model(rest);
-                                            // 参数也跟着换。没配就重置成默认，
-                                            // 否则上一个模型的温度会漏到新模型上
-                                            let params = read_file_config()
-                                                .and_then(|f| {
-                                                    f.providers
-                                                        .get(p)
-                                                        .and_then(|e| e.params.get(rest).cloned())
-                                                })
-                                                .unwrap_or_default();
-                                            task_cfg.temperature = params.temperature;
-                                            task_cfg.max_tokens =
-                                                params.max_tokens.unwrap_or(task_cfg.max_tokens);
                                         }
                                     }
                                 }
+                                // 参数**每一轮**都从配置文件重读，不只是换模型时。
+                                // 用户在设置里改了温度或上限，下一句话就该按新值走 ——
+                                // 要求重启才生效没有道理，而且他看不出来没生效。
+                                apply_model_params(&mut task_cfg, &eff_provider, &eff_model);
                                 run_task(
                                     task_cfg, tools, store, session, text, attachments, ev,
                                     locks, broker, cell,
@@ -899,6 +929,58 @@ async fn run_task(
 }
 
 #[cfg(test)]
+mod model_params_tests {
+    use super::*;
+    use crate::config::ProviderEntry;
+
+    fn file_with(params: ModelParams) -> FileConfig {
+        let mut f = FileConfig::default();
+        f.providers.insert(
+            "deepseek".into(),
+            ProviderEntry {
+                kind: "openai-compat".into(),
+                base_url: "https://api.deepseek.com/v1".into(),
+                params: [("deepseek-flash".to_string(), params)].into_iter().collect(),
+                ..Default::default()
+            },
+        );
+        f
+    }
+
+    #[test]
+    fn configured_params_are_used() {
+        let f = file_with(ModelParams {
+            temperature: Some(0.3),
+            max_tokens: Some(2048),
+        });
+        let p = params_for_model(Some(&f), "deepseek", "deepseek-flash");
+        assert_eq!(p.temperature, Some(0.3));
+        assert_eq!(p.max_tokens, Some(2048));
+    }
+
+    #[test]
+    fn missing_entry_falls_back_to_defaults() {
+        // 模型没配参数：温度交回服务端默认，上限回到 DEFAULT_MAX_TOKENS，
+        // 不能沿用上一个模型留下的值
+        let f = file_with(ModelParams::default());
+        let p = params_for_model(Some(&f), "deepseek", "deepseek-flash");
+        assert_eq!(p.temperature, None);
+        assert_eq!(p.max_tokens, None);
+    }
+
+    #[test]
+    fn unknown_provider_or_model_is_harmless() {
+        let f = file_with(ModelParams {
+            max_tokens: Some(4096),
+            ..Default::default()
+        });
+        assert!(params_for_model(Some(&f), "nope", "deepseek-flash").max_tokens.is_none());
+        assert!(params_for_model(Some(&f), "deepseek", "nope").max_tokens.is_none());
+        assert!(params_for_model(None, "deepseek", "deepseek-flash").max_tokens.is_none());
+    }
+}
+
+#[cfg(test)]
 mod system_banner_tests {
     use super::*;
 
@@ -921,6 +1003,7 @@ mod system_banner_tests {
     }
 }
 
+#[cfg(test)]
 mod control_panel_tests {
     use super::*;
     use zex_core::tool::{Tool, ToolCtx};

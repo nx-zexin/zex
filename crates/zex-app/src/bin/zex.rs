@@ -5544,7 +5544,13 @@ impl ChatView {
         }
 
         self.editing_params_for = None;
-        self.persist_config(format!("已更新 `{provider}/{model}` 的参数"), cx);
+        // 参数每轮从配置文件重读，所以明确说"下一轮"就生效 ——
+        // 说"重启后生效"会让人白等一次重启
+        self.status = match zex_app::save_file_config(&self.config) {
+            Ok(()) => format!("已更新 `{provider}/{model}` 的参数（下一轮对话生效）"),
+            Err(e) => format!("保存失败：{e}"),
+        };
+        cx.notify();
     }
 
     /// 把"内置回退"的模型清单固化进配置。
@@ -8092,7 +8098,7 @@ fn main() {
     let history = history_to_items(agent.history());
     let tasks = load_tasks(agent.store());
     let store = Arc::new(agent.store().clone());
-    let handles = zex_app::spawn_core(agent, cfg.all_providers.clone());
+    let handles = zex_app::spawn_core(agent, cfg.all_providers.clone(), cfg.provider_name.clone());
     let cmd_tx = handles.cmd_tx.clone();
     let mut event_rx = handles.event_rx;
 

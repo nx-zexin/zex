@@ -93,6 +93,12 @@ pub struct AgentConfig {
     pub extra_prompt: String,
 }
 
+/// 单次输出的默认上限（token）。
+///
+/// 配置里没写 `max_tokens` 时用它。单独提成常量是因为不止一处要"回到默认"：
+/// 换了模型、配置被删掉，都得有一个明确的落点，而不是沿用上一个模型的值。
+pub const DEFAULT_MAX_TOKENS: u32 = 8192;
+
 impl AgentConfig {
     /// 用最小必填项构造。
     pub fn new(provider: ProviderConfig, model: impl Into<String>, cwd: PathBuf) -> Self {
@@ -105,7 +111,7 @@ impl AgentConfig {
             model,
             max_steps: 0,
             max_continue_rounds: 3,
-            max_tokens: 8192,
+            max_tokens: DEFAULT_MAX_TOKENS,
             cwd,
             mode: Mode::Confirm,
             approval_timeout: approval::DEFAULT_TIMEOUT,
