@@ -109,33 +109,48 @@ pub fn watching() -> bool {
 }
 
 /// 启动监视线程。重复调用是空操作。
+#[cfg(target_os = "linux")]
 pub fn start() {
-    if STARTED.set(()).is_err() {
+    /// "试过了"。和 `STARTED` 分开：没起来的时候不能让 `watching()` 说在跑。
+    static ATTEMPTED: OnceLock<()> = OnceLock::new();
+    if ATTEMPTED.set(()).is_err() {
         return;
     }
-    #[cfg(target_os = "linux")]
-    {
-        // 只有 Wayland 会话才起。X11 下 wl-clipboard-rs 连不上 compositor，
-        // 与其在后台空转报错，不如让脚本用主线程那条路。
-        let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty());
-        if !wayland {
-            tracing::debug!("没有 WAYLAND_DISPLAY，剪贴板监视线程不启动");
-            return;
+
+    // 只有 Wayland 会话才起。X11 下 wl-clipboard-rs 连不上 compositor，
+    // 与其在后台空转报错，不如让脚本用主线程那条路。
+    let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty());
+    if !wayland {
+        tracing::debug!("没有 WAYLAND_DISPLAY，剪贴板监视线程不启动");
+        return;
+    }
+
+    let spawned = std::thread::Builder::new()
+        .name("zex-clip-watch".to_owned())
+        .spawn(|| {
+            if let Err(e) = watch_loop() {
+                tracing::warn!(error = %e, "剪贴板监视线程退出");
+            }
+        });
+
+    match spawned {
+        Ok(_) => {
+            // 只有真起来了才置位：`watching()` 决定脚本走 drain 还是退回
+            // 主线程轮询，报错了就别说自己在跑。
+            STARTED.set(()).ok();
+            tracing::info!("剪贴板监视线程已启动（Wayland，{POLL_MS}ms 一次）");
         }
-        let spawned = std::thread::Builder::new()
-            .name("zex-clip-watch".to_owned())
-            .spawn(|| {
-                if let Err(e) = watch_loop() {
-                    tracing::warn!(error = %e, "剪贴板监视线程退出");
-                }
-            });
-        if let Err(e) = spawned {
-            tracing::warn!(error = %e, "无法启动剪贴板监视线程，退回主线程轮询");
-        } else {
-            tracing::info!("剪贴板监视线程已启动（Wayland，{}ms 一次）", POLL_MS);
-        }
+        Err(e) => tracing::warn!(error = %e, "无法启动剪贴板监视线程，退回主线程轮询"),
     }
 }
+
+/// 非 Linux：没有后台监听线程。
+///
+/// 故意留空、也不置位 `STARTED` —— `watching()` 要如实回答"有没有线程在跑"，
+/// 脚本据此决定是走 `drain()` 还是退回主线程轮询。这里假装启动过，只会让
+/// 脚本对着一个永远空的队列空等。
+#[cfg(not(target_os = "linux"))]
+pub fn start() {}
 
 /// 往剪贴板里放一份内容（图片或文本）。
 ///

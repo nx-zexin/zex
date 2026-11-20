@@ -45,6 +45,11 @@ pub fn toggle_maximize(window: &mut Window) {
 
 #[cfg(windows)]
 mod win {
+    // 全 crate 唯一允许 unsafe 的地方：DragWindow / ShowWindowAsync 这些
+    // Win32 调用没有安全封装可用（见文件头那两条上游缺陷）。两个调用点，
+    // 都在本模块内的两个函数里，句柄拿不到就提前返回。
+    #![allow(unsafe_code)]
+
     use gpui_kit::Window;
     // 必须显式引 trait 并用 UFCS 调用：`Window` 自己有个同名固有方法
     // `window_handle()`，返回的是 gpui 内部的 `AnyWindowHandle`，不是 HWND。

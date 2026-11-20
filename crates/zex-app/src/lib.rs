@@ -3,7 +3,10 @@
 //! 本 crate 是唯一的「组合根」——只有这里可以同时看到所有 crate。
 //! 它持有 gpui（UI）与 tokio（内核）两个世界的桥接（见 docs/ARCHITECTURE.md §2）。
 
-#![forbid(unsafe_code)]
+// 用 deny 而不是 forbid：`window_ops` 里调 Win32 的那一小块必须 unsafe，
+// 而 forbid 连锁定它的 `allow` 都不许写（这正是 forbid 与 deny 的区别）。
+// 除此之外全 crate 仍然禁止 unsafe，且例外只有那一个模块（`mod win`）。
+#![deny(unsafe_code)]
 // 测试代码允许 unwrap/expect：断言失败就该 panic，生产代码里才禁止。
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 #![warn(missing_docs)]
