@@ -40,6 +40,13 @@ anyhow = "1"
 
 # ─── 异步 ───
 async-trait = "0.1"
+# 搜索。这三个就是 ripgrep 自己的库：grep 的引擎 + 按 .gitignore 走路。
+# 选它们而不是调 rg 二进制：Windows 上普通用户机器根本没有 rg，
+# 而"能不能搜内容"不该取决于用户装没装一个命令行工具。
+ignore = "0.4"
+grep-searcher = "0.1"
+grep-regex = "0.1"
+
 # 系统剪贴板。选 arboard 而不是调 xclip/wl-paste/pbpaste：
 # 那些命令在各平台名字不同、图标发行版里也不一定装了，
 # 而 arboard 在 X11 / Wayland / macOS / Windows 上都自己实现。

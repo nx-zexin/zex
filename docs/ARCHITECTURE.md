@@ -232,6 +232,7 @@ pub trait Tool: Send + Sync + 'static {
 | ✅ | `fs_write` | Reversible |
 | ✅ | `shell` | Impactful |
 | ✅ | `web_fetch` | ReadOnly |
+| ✅ | `grep` | ReadOnly（内置 ripgrep 引擎，不依赖系统里装没装 `rg`） |
 | ✅ | `clipboard_read` | ReadOnly（跨平台走 arboard，不依赖 xclip/pbpaste） |
 | ✅ | `clipboard_write` | Impactful（覆盖掉的剪贴板内容找不回来） |
 | ✅ | `ask` | ReadOnly（向用户提问） |

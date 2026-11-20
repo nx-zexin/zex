@@ -19,6 +19,9 @@ async-trait.workspace = true
 tokio.workspace = true
 reqwest.workspace = true
 arboard.workspace = true
+ignore.workspace = true
+grep-searcher.workspace = true
+grep-regex.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]

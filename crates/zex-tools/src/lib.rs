@@ -13,6 +13,7 @@
 
 pub mod clipboard;
 pub mod fs;
+pub mod grep;
 pub mod shell;
 pub mod web;
 
@@ -30,6 +31,8 @@ pub fn default_tools() -> Vec<Arc<dyn ErasedTool>> {
         Arc::new(fs::FsWrite),
         Arc::new(shell::Shell),
         Arc::new(web::WebFetch),
+        // 搜内容：自带 ripgrep 的引擎，不指望用户装过 rg
+        Arc::new(grep::Grep),
         // 剪贴板：用户说「我复制了一段…」时，比让他再贴一遍靠谱。
         // 读是 L0（静默），写是 L2（覆盖掉的东西找不回来）。
         Arc::new(clipboard::ClipboardRead),
