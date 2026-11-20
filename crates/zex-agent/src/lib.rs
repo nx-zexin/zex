@@ -789,8 +789,10 @@ impl Agent {
                 let after = context::estimate_history_tokens(&self.history);
                 tracing::info!(before, after, count = indices.len(), "已截断过长的工具结果");
                 // 只报有意义的节省：省下的还不如一条提示本身占的地方，
-                // 说出来只是噪音
-                if after + 32 < before {
+                // 说出来只是噪音。阈值取窗口的 1% —— 早先是 32 token，
+                // 于是「193458 → 193328」这种 0.07% 的截断也会刷一张卡片。
+                let saved = before.saturating_sub(after);
+                if saved * 100 >= self.compressor.budget().window {
                     self.emit(
                         CoreEvent::ContextCompacted {
                             session: self.session.clone(),

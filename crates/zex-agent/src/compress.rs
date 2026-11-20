@@ -78,37 +78,27 @@ impl Compressor {
         }
 
         let tokens = provider_tokens.unwrap_or_else(|| estimate_history_tokens(messages));
+        let over = tokens >= self.budget.compress_limit();
 
-        // 第一层：单条工具结果过长就先截断，不惊动 LLM
-        let max = self.budget.tool_result_max_tokens;
-        let oversized: Vec<usize> = messages
-            .iter()
-            .enumerate()
-            .filter_map(|(i, m)| match m {
-                Message::Tool { content, .. } => {
-                    let before = crate::context::estimate_tokens(content);
-                    if before <= max {
-                        return None;
-                    }
-                    // 关键：只看「截了还能不能变小」。
-                    // 已经截到下限的内容再截也是原样，若仍然按"超标"报，
-                    // 每一轮都会重新触发一次压缩，于是界面上刷出一串
-                    // 「已压缩 14679 → 14678」这种零收益的提示。
-                    let after =
-                        crate::context::estimate_tokens(&truncate_middle(content, max));
-                    (after < before).then_some(i)
-                }
-                _ => None,
-            })
-            .collect();
-        if !oversized.is_empty() {
-            return CompressionPlan::ShrinkToolResults { indices: oversized };
+        // 第一层：单条工具结果过长就先截断，不惊动 LLM。
+        //
+        // **只在整体已经够到压缩线时才做**。截断改的是历史中间的一段，
+        // 它后面所有消息的 prefix cache 随之作废，下一次请求整段按未命中
+        // 计费。早先这一层是无条件的：任何一条超过 1000 token 的工具结果
+        // 都会重写一次历史，于是 192k / 1M 这种离天花板还差得远的时候，
+        // 每步都刷一张「已压缩 193458 → 193328」—— 界面上是噪音，
+        // 账上是白烧的缓存。
+        if over {
+            let indices = self.oversized_tool_results(messages);
+            if !indices.is_empty() {
+                return CompressionPlan::ShrinkToolResults { indices };
+            }
         }
 
         // 冷却期内不主动压缩（紧急情况不受限）
         let cooling = self.turns_since_compress < self.budget.cooldown_turns;
         let emergency = tokens >= self.budget.emergency_limit();
-        if tokens < self.budget.compress_limit() || (cooling && !emergency) {
+        if !over || (cooling && !emergency) {
             return CompressionPlan::None;
         }
 
@@ -121,6 +111,30 @@ impl Compressor {
             drop_before,
             before_tokens: tokens,
         }
+    }
+
+    /// 找出「截了确实会变小」的工具结果下标。
+    ///
+    /// 已经截到下限的内容再截也是原样，若仍然按"超标"报，每一轮都会
+    /// 重新触发一次压缩，于是界面上刷出一串「已压缩 14679 → 14678」。
+    fn oversized_tool_results(&self, messages: &[Message]) -> Vec<usize> {
+        let max = self.budget.tool_result_max_tokens;
+        messages
+            .iter()
+            .enumerate()
+            .filter_map(|(i, m)| match m {
+                Message::Tool { content, .. } => {
+                    let before = crate::context::estimate_tokens(content);
+                    if before <= max {
+                        return None;
+                    }
+                    let after =
+                        crate::context::estimate_tokens(&truncate_middle(content, max));
+                    (after < before).then_some(i)
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     /// 找到"保留区"的起点。
@@ -382,7 +396,11 @@ mod tests {
 
     #[test]
     fn oversized_tool_result_is_shrunk_first() {
-        let c = Compressor::new(budget());
+        // 截断只在够到压缩线之后才做：窗口 6000 → 压缩线 4200，
+        // 而 20000 个 ASCII 字符约 5000 token，已在线上。
+        let mut b = budget();
+        b.window = 6_000;
+        let c = Compressor::new(b);
         let big = "x".repeat(20_000);
         let msgs = vec![
             Message::user("go"),
@@ -398,6 +416,28 @@ mod tests {
             CompressionPlan::ShrinkToolResults { indices } => assert_eq!(indices, vec![2]),
             other => panic!("期望先截断工具结果，得到 {other:?}"),
         }
+    }
+
+    #[test]
+    fn far_from_limit_leaves_history_alone() {
+        // 回归：曾经只要有一条工具结果超 1000 token 就重写历史，
+        // 即使总量才 5k / 1M。每次重写都会让后面所有消息的 prefix
+        // cache 失效，界面上还每步刷一张「已压缩 N → N-130」。
+        let mut b = budget();
+        b.window = 1_000_000;
+        let c = Compressor::new(b);
+        let big = "x".repeat(20_000);
+        let msgs = vec![
+            Message::user("go"),
+            asst("ok"),
+            Message::Tool {
+                call_id: ToolCallId::new("c1"),
+                name: Some("shell".into()),
+                content: big,
+                is_error: false,
+            },
+        ];
+        assert_eq!(c.plan(&msgs, None), CompressionPlan::None);
     }
 
     #[test]
@@ -439,7 +479,12 @@ mod tests {
 
     #[test]
     fn already_shrunk_result_does_not_retrigger() {
-        let c = Compressor::new(ContextBudget::default());
+        // 窗口 10000 → 压缩线 7000；8000 个汉字约 8000 token，在线上。
+        let c = Compressor::new(ContextBudget {
+            min_messages: 2,
+            window: 10_000,
+            ..Default::default()
+        });
         let big: String = "中".repeat(8000);
         let mut msgs = vec![
             Message::User {
