@@ -85,10 +85,18 @@ jobs:
       - name: zex-core 不得依赖 IO / 异步运行时 / UI
         run: |
           set -e
+          # 只看 [dependencies] 段，且跳过注释行。
+          #
+          # 不能整文件 grep：那个文件里 description 和提示注释本身就写着
+          # "不依赖 tokio / gpui-kit"，dev-dependencies 里还有一条合法的
+          # tokio（单元测试要 #[tokio::test]）。原先的写法让这个 job 从
+          # M0 起就必红 —— 守门的先把自己拦在门外了。
           forbidden='tokio|reqwest|rusqlite|gpui-kit|gpui\b|hyper|sqlx'
-          if grep -Eq "$forbidden" crates/zex-core/Cargo.toml; then
+          deps=$(awk '/^\[dependencies\]/{f=1; next} /^\[/{f=0} f' crates/zex-core/Cargo.toml \
+                 | grep -Ev '^[[:space:]]*#')
+          if echo "$deps" | grep -Eq "$forbidden"; then
             echo "::error::zex-core 依赖了禁止的 crate（见 docs/ARCHITECTURE.md §3）"
-            grep -En "$forbidden" crates/zex-core/Cargo.toml
+            echo "$deps" | grep -En "$forbidden"
             exit 1
           fi
 
