@@ -40,6 +40,7 @@ X 才立得住。若让奶白压在上面，橙色对角会被切断，整张图
 | `zex-small.svg` | 16–32px 专用：笔画 132→156、圆角 224→150 |
 | `zex-16/24/32.png` | 由 `zex-small.svg` 渲染 |
 | `zex-48/…/1024.png` | 由 `zex.svg` 渲染 |
+| `zex-titlebar.png` | 48px，标题栏里那个小图（显示 24px，2× 超采样）|
 | `../linux/` | `.desktop` 与安装脚本 |
 
 为什么要两套：16px 时笔画只剩 2 个像素、圆角占掉太多空间，标准版会糊。
@@ -51,6 +52,7 @@ X 才立得住。若让奶白压在上面，橙色对角会被切断，整张图
 cd assets/icon
 for s in 16 24 32; do rsvg-convert -w $s -h $s zex-small.svg -o zex-$s.png; done
 for s in 48 64 128 256 512 1024; do rsvg-convert -w $s -h $s zex.svg -o zex-$s.png; done
+rsvg-convert -w 48 -h 48 zex-small.svg -o zex-titlebar.png
 ```
 
 ## 接进系统

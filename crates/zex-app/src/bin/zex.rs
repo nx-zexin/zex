@@ -4651,22 +4651,10 @@ impl ChatView {
         // 品牌跟着标题栏走：窗口最上沿统一是标题栏，
         // 侧栏从那下面才开始
         bar = bar
-            .child(
-                div()
-                    .size(px(22.0))
-                    .rounded(px(6.0))
-                    .bg(rgb(BRAND))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(
-                        div()
-                            .text_size(px(13.0))
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(rgb(0xFFFFFF))
-                            .child("Z"),
-                    ),
-            )
+            // 应用图标（Z 与 X 共用一条对角），和窗口/任务栏那个是同一套几何。
+            // 走 `img` 而不是 `svg()`：gpui 的 svg 只取 alpha 当遮罩、单色渲染，
+            // 橙 Z 和奶白那条腿会被压成一个颜色 —— 双色 logo 只能走位图。
+            .child(gpui::img("zex-titlebar.png").flex_shrink_0().size(px(24.0)))
             .child(div().w(px(8.0)))
             .child(
                 div()
@@ -8355,6 +8343,13 @@ struct ZexAssets;
 
 impl AssetSource for ZexAssets {
     fn load(&self, path: &str) -> gpui_kit::Result<Option<std::borrow::Cow<'static, [u8]>>> {
+        // 标题栏的小图标。内嵌而不是读磁盘：它每帧都要画，走文件系统
+        // 既慢又会在安装目录被挪走后突然消失。
+        if path == "zex-titlebar.png" {
+            return Ok(Some(std::borrow::Cow::Borrowed(include_bytes!(
+                "../../../../assets/icon/zex-titlebar.png"
+            ))));
+        }
         if let Some(name) = path.strip_prefix("clip-thumbs/") {
             let plain = !name.is_empty()
                 && !name.contains('/')
