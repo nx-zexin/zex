@@ -363,12 +363,16 @@ mod tests {
 
     #[test]
     fn temp_dir_write_is_allowed() {
-        // 临时目录是正常工作位置：自动编辑下照常放行，不该因为"在 /tmp"
-        // 被额外升成强确认
+        // 临时目录是正常工作位置：自动编辑下照常放行，不该因为"在临时目录"
+        // 被额外升成强确认。
+        //
+        // 路径用平台的临时目录：写死 `/tmp` 在 Windows 上不是绝对路径
+        // （没有盘符），会被拼到 cwd 下面，于是这条测试测的就不是临时目录了。
+        let probe = std::env::temp_dir().join("zex-probe.txt");
         let p = policy();
         let v = p.evaluate(
             &spec("fs_write", Risk::Reversible),
-            &serde_json::json!({"path": "/tmp/zex-probe.txt"}),
+            &serde_json::json!({"path": probe.to_string_lossy()}),
             Mode::AutoEdit,
             &cwd(),
         );
@@ -377,10 +381,16 @@ mod tests {
 
     #[test]
     fn write_system_dir_is_denied() {
+        // 同上：Windows 的 `C:\Windows` 在 SYSTEM_DIRS 里，`/usr` 不在它那儿。
+        let target = if cfg!(windows) {
+            r"C:\Windows\System32\zex.exe"
+        } else {
+            "/usr/local/bin/zex"
+        };
         let p = policy();
         let v = p.evaluate(
             &spec("fs_write", Risk::Reversible),
-            &serde_json::json!({"path": "/usr/local/bin/zex"}),
+            &serde_json::json!({"path": target}),
             Mode::Confirm,
             &cwd(),
         );
