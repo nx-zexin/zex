@@ -608,8 +608,9 @@ fn zex_module(
                     (mime, bytes),
                     ("text/plain".to_string(), "\u{fffc}".as_bytes().to_vec()),
                 ];
-                crate::clip_watch::put(crate::clip_watch::PutContent::Bytes(sources));
-                Ok(HostValue::Bool(true))
+                Ok(HostValue::Bool(crate::clip_watch::put(
+                    crate::clip_watch::PutContent::Bytes(sources),
+                )))
             }
         })
         // 后台线程捕获到的变化。这里是"取走"语义：一次调用把队列清空，

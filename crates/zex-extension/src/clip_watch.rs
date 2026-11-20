@@ -157,7 +157,9 @@ pub fn start() {
 ///
 /// 新内容会取代旧的：用一个"代号"计数器让旧的服务线程自己退出，免得多个
 /// 线程抢着当所有者。
-pub fn put(content: PutContent) {
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn put(content: PutContent) -> bool {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     /// 当前有效的代号。旧线程发现代号变了就退出。
@@ -165,13 +167,27 @@ pub fn put(content: PutContent) {
 
     let Some(pipe) = server_channel() else {
         tracing::warn!("剪贴板服务通道不可用，无法写入剪贴板");
-        return;
+        return false;
     };
 
     let seq = GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
     if pipe.send((seq, content)).is_err() {
         tracing::warn!("剪贴板服务线程已退出，无法写入剪贴板");
+        return false;
     }
+    true
+}
+
+/// 非 Linux：还没有图片写入通道。
+///
+/// Windows/macOS 的剪贴板不像 Wayland 那样要"自己当所有者并持续服务"，
+/// 走 GPUI 自带的 `write_to_clipboard` 就够 —— 那是另一条要接的路，还没接。
+/// 这里如实返回 false，让脚本知道没写进去，而不是假报成功。
+#[cfg(not(target_os = "linux"))]
+#[must_use]
+pub fn put(_content: PutContent) -> bool {
+    tracing::warn!("这个平台的剪贴板图片写入还没接（见 clip_watch 模块文档）");
+    false
 }
 
 /// 送进服务线程的一件内容。

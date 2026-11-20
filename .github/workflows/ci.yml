@@ -45,14 +45,17 @@ jobs:
           shared-key: ${{ matrix.os }}
 
       # Linux 需要 gpui 的系统库
+      # 注意：`apt-get install` 的续行中间**不能插注释** —— bash 会把 `#`
+      # 当成一个包名传下去，整个步骤挂掉（exit 127）。说明都写在这里。
+      #
+      # libxkbcommon-x11-dev：gpui 的 X11 输入法那一支要链接它，少了这条
+      #   只有 `cargo test`（要生成可执行文件）会挂在 -lxkbcommon-x11。
       - name: 安装 Linux 依赖
         if: matrix.os == 'ubuntu-latest'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
             libxkbcommon-dev \
-            # 测试二进制链接期需要它（gpui 的 X11 输入法那一支）；
-            # 少了这条只有 `cargo test` 会挂在 -lxkbcommon-x11
             libxkbcommon-x11-dev \
             libwayland-dev \
             libx11-dev \
