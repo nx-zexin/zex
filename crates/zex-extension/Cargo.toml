@@ -20,6 +20,12 @@ zex-core.workspace = true
 # 扩展的 SQLite（见 store_db）。跟着 ui 一起编：没有 ui 就没有宿主，
 # 也就没有脚本能调它，但保留依赖让 `cargo test -p zex-extension` 始终能跑。
 rusqlite.workspace = true
+# 剪贴板监视线程：Wayland 下直接在后台读，不依赖 GPUI 的帧循环。
+# 只在 Linux 上链接 —— 其他平台退回"主线程轮询"那条老路（见 clip_watch.rs）。
+# arboard 在这个环境读不到 Wayland 剪贴板（它走了 X11），所以直接用底层这层。
+[target.'cfg(target_os = "linux")'.dependencies]
+wl-clipboard-rs = "0.9"
+
 # 网络三件套：HTTP 复用 reqwest，WebSocket 用 tokio-tungstenite，
 # 裸 socket 用 tokio::net。见 store_db 旁边的 net.rs。
 reqwest.workspace = true

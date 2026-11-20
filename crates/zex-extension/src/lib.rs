@@ -30,6 +30,12 @@ pub mod net;
 pub mod store_db;
 #[cfg(feature = "ui")]
 pub mod check;
+// 剪贴板图片：靠 gpui 的 ClipboardItem / Image，所以跟着 ui 一起编
+#[cfg(feature = "ui")]
+pub mod clip_image;
+// 剪贴板监视线程：窗口不可见时主线程不推进定时器，捕获必须在别的线程做
+#[cfg(feature = "ui")]
+pub mod clip_watch;
 
 #[cfg(feature = "ui")]
 pub mod host;

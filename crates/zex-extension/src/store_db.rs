@@ -126,7 +126,7 @@ fn install_authorizer(conn: &mut Connection) -> rusqlite::Result<()> {
 fn authorize(ctx: rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization {
     use rusqlite::hooks::{AuthAction, Authorization};
     match ctx.action {
-        // 建表 / 索引 / 视图、增删改查、事务
+        // 建表 / 索引 / 视图、增删改查、事务、改表结构
         AuthAction::CreateTable { .. }
         | AuthAction::DropTable { .. }
         | AuthAction::CreateIndex { .. }
@@ -145,6 +145,12 @@ fn authorize(ctx: rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authoriz
         | AuthAction::Select
         | AuthAction::Read { .. }
         | AuthAction::Transaction { .. }
+        // `CREATE INDEX` 收尾时会自己触发一次 `REINDEX`；
+        // 少了它，建索引就是 "not authorized"。
+        | AuthAction::Reindex { .. }
+        // `ALTER TABLE ... ADD COLUMN` 的动作。
+        // 少了它，补列的迁移会失败 —— 而迁移失败的表现是"历史打不开"。
+        | AuthAction::AlterTable { .. }
         | AuthAction::Savepoint { .. }
         | AuthAction::Function { .. }
         | AuthAction::Recursive => Authorization::Allow,
@@ -396,6 +402,46 @@ mod tests {
         let conn = db();
         let e = exec(&conn, "SELECT 1", &[]).unwrap_err();
         assert!(e.contains("query()"), "要指出该用哪个函数：{e}");
+    }
+
+    /// 索引和 ALTER 必须能用。
+    ///
+    /// 这两个不是"顺手加的"：`CREATE INDEX` 收尾时会自己触发一次 `REINDEX`，
+    /// `ALTER TABLE` 触发 `ALTER TABLE` 动作 —— 两者都曾不在白名单里，
+    /// 结果是建索引和补列全部 `not authorized`，而 `CREATE TABLE` 却能成功，
+    /// 于是表现为"表建了、索引没有、迁移失败、历史打不开"。
+    #[test]
+    fn index_and_alter_table_are_authorized() {
+        let conn = db();
+        exec(&conn, "CREATE TABLE clips (id INTEGER PRIMARY KEY, fp TEXT)", &[]).unwrap();
+
+        // 建索引（收尾会触发 REINDEX）
+        exec(&conn, "CREATE UNIQUE INDEX clips_fp ON clips(fp)", &[])
+            .expect("CREATE INDEX 必须被放行");
+
+        // 补列
+        exec(&conn, "ALTER TABLE clips ADD COLUMN w INTEGER NOT NULL DEFAULT 0", &[])
+            .expect("ALTER TABLE ADD COLUMN 必须被放行");
+        exec(&conn, "ALTER TABLE clips ADD COLUMN h INTEGER NOT NULL DEFAULT 0", &[])
+            .expect("第二条 ALTER 也必须被放行");
+
+        // 列真的加上了
+        let rows = query(&conn, "SELECT w, h FROM clips", &[]).unwrap();
+        assert!(rows.is_empty(), "空表应返回 0 行");
+    }
+
+    /// 放行索引和 ALTER 之后，跨库和 PRAGMA 仍然必须被挡。
+    #[test]
+    fn dangerous_actions_stay_denied() {
+        let conn = db();
+        for sql in [
+            "ATTACH DATABASE '/tmp/other.db' AS other",
+            "PRAGMA journal_mode",
+            "DETACH other",
+        ] {
+            let e = exec(&conn, sql, &[]).unwrap_err();
+            assert!(e.contains("not authorized"), "`{sql}` 应被拒，实际：{e}");
+        }
     }
 
     #[test]

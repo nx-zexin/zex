@@ -125,6 +125,10 @@ impl ExtensionHost {
         gpui_shell::set_storage_path(store);
         gpui_shell::set_capabilities(base_capabilities());
 
+        // 剪贴板监视线程：整个进程一个。它不碰 GPUI，所以放在这里启动
+        // 也不会和 App 的借用打架；重复调用是空操作。
+        crate::clip_watch::start();
+
         let runtime = ShellRuntime::new(cx)
             .map_err(|e| zex_core::Error::Other(format!("无法创建扩展运行时: {e}")))?;
 
@@ -347,6 +351,7 @@ impl ExtensionHost {
             self.dbs.clone(),
             self.nets.clone(),
             self.grants.clone(),
+            self.clip_grants.clone(),
         );
         module
             .validate()
@@ -361,6 +366,43 @@ pub fn module_name(ext_id: &str) -> String {
     format!("zex.{ext_id}")
 }
 
+/// 剪贴板的哪一半。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClipHalf {
+    Read,
+    Write,
+}
+
+/// 剪贴板权限没给时，把话说清楚 —— 用户要做的是"去点一下允许"，
+/// 不是去读代码。
+///
+/// 判据和 `capabilities_for` 用的是同一张表：用户点过允许，这里就通；
+/// 没点过或拒绝过，这里就拒。图片读写走的是同一份授权，不额外开口子。
+fn ensure_clipboard(
+    grants: &Mutex<std::collections::BTreeMap<String, bool>>,
+    app: &str,
+    half: ClipHalf,
+) -> std::result::Result<(), HostError> {
+    let allowed = grants
+        .lock()
+        .map_err(|_| HostError::from("剪贴板授权表中毒"))?
+        .get(app)
+        .copied()
+        .unwrap_or(false);
+
+    if allowed {
+        return Ok(());
+    }
+    let which = match half {
+        ClipHalf::Read => "读取",
+        ClipHalf::Write => "写入",
+    };
+    Err(HostError::from(format!(
+        "应用 `{app}` 没有剪贴板{which}权限。请在它的面板上点「允许剪贴板」，\
+         或在「设置 → 应用」里允许"
+    )))
+}
+
 /// 给脚本用的宿主模块。
 ///
 /// 边界是**纯数据**：进出都只有 null/布尔/数字/字符串/数组/对象，
@@ -373,6 +415,7 @@ fn zex_module(
     dbs: DbRegistry,
     nets: NetRegistry,
     grants: Arc<Mutex<std::collections::BTreeMap<String, Vec<String>>>>,
+    clip_grants: Arc<Mutex<std::collections::BTreeMap<String, bool>>>,
 ) -> HostModule {
     // 这个应用的网络世界。**建的时候白名单是空的**：真正生效的那份在
     // 每次取 hub 时按「清单申请 ∩ 用户授权」现算（见 `net_hub`）——
@@ -471,7 +514,32 @@ fn zex_module(
               */\n\
              export function dbBatch(\n\
                statements: Array<{{ sql: string; params?: unknown[] }}>,\n\
-             ): Promise<Array<{{ changes: number; lastInsertId: number }}>>;\n",
+             ): Promise<Array<{{ changes: number; lastInsertId: number }}>>;\n\
+             /**\n\
+              * 剪贴板里如果有**图片**，把它存成本机缩略文件并返回句柄；没有就是 null。\n\
+              * 返回的 path 可以直接交给 image() 画出来。\n\
+              */\n\
+             export function captureClipboardImage(): {{\n\
+               path: string;\n\
+               width: number;\n\
+               height: number;\n\
+               bytes: number;\n\
+             }} | null;\n\
+             /** 把 captureClipboardImage 存下的图放回剪贴板。 */\n\
+             export function putClipboardImage(path: string): boolean;\n\
+             /**\n\
+              * 取走后台线程捕获到的全部剪贴板变化（取一次就清空）。\n\
+              * 窗口不可见时主线程不跑定时器，靠这个接口才不会漏掉中间的复制。\n\
+              */\n\
+             export function drainClipboard(): Array<{{\n\
+               kind: string;\n\
+               body: string;\n\
+               width: number;\n\
+               height: number;\n\
+               atMs: number;\n\
+             }}>;\n\
+             /** 后台监视线程是否在跑（只有 Linux/Wayland 会起）。 */\n\
+             export function clipboardWatching(): boolean;\n",
         ))
         .async_function("ask", move |args| {
             let prompt = args.string(0)?.to_string();
@@ -486,6 +554,80 @@ fn zex_module(
                     Some(e) => Err(gpui_shell::HostError::from(e)),
                 }
             })
+        })
+        // ---- 剪贴板图片 ----
+        //
+        // 这两件事脚本自己做不到：`cx.read_from_clipboard()` 只回答文本
+        // （图片条目被 `text()` 跳过），`image()` 又只认资产根内的相对路径。
+        // 所以由宿主在中间搭一座桥：图存成资产根下的文件，脚本拿到的就是
+        // 一个能直接画出来的路径。详见 `clip_image` 模块头。
+        //
+        // 权限沿用剪贴板的两个布尔位：读图要 read，写回要 write，
+        // 与用户已经点过的那一次授权是同一份判断。
+        .function("captureClipboardImage", {
+            let (grants, app_id) = (clip_grants.clone(), app.clone());
+            move |_| {
+                ensure_clipboard(grants.as_ref(), &app_id, ClipHalf::Read)?;
+                let item = gpui_shell::with_current_app(|app| app.read_from_clipboard())
+                    .flatten();
+                let Some(shot) = crate::clip_image::capture(item) else {
+                    return Ok(HostValue::Null);
+                };
+                Ok(HostValue::Object(vec![
+                    ("path".into(), HostValue::from(shot.rel_path)),
+                    ("width".into(), HostValue::Number(f64::from(shot.width))),
+                    ("height".into(), HostValue::Number(f64::from(shot.height))),
+                    ("bytes".into(), HostValue::Number(shot.bytes as f64)),
+                ]))
+            }
+        })
+        // 放回剪贴板。
+        //
+        // **不走 GPUI 的 `write_to_clipboard`**：它在 Wayland 下只 offer 文本
+        // MIME 类型，图片会被写成空字符串（界面上"已复制"，粘出来什么都没有）。
+        // 这里交给 `clip_watch` 自己的服务线程，它直接和 compositor 打交道。
+        // 详见 `clip_watch::put` 的注释。
+        .function("putClipboardImage", {
+            let (grants, app_id) = (clip_grants.clone(), app.clone());
+            move |args| {
+                ensure_clipboard(grants.as_ref(), &app_id, ClipHalf::Write)?;
+                let path = args.string(0)?.to_string();
+                let Some(bytes) = crate::clip_image::bytes_for(&path) else {
+                    return Ok(HostValue::Bool(false));
+                };
+                let mime = crate::clip_image::format_of_name(&path).mime_type().to_string();
+
+                // 同时给一份文本：有些程序（编辑器、聊天框）只认 text/plain，
+                // 没有它就当作"剪贴板里没有可粘贴的东西"。
+                let sources = vec![
+                    (mime, bytes),
+                    ("text/plain".to_string(), "\u{fffc}".as_bytes().to_vec()),
+                ];
+                crate::clip_watch::put(crate::clip_watch::PutContent::Bytes(sources));
+                Ok(HostValue::Bool(true))
+            }
+        })
+        // 后台线程捕获到的变化。这里是"取走"语义：一次调用把队列清空，
+        // 脚本负责处理每一条 —— 它才知道哪些已经记过。
+        .function("drainClipboard", move |_| {
+            let items = crate::clip_watch::drain();
+            let rows: Vec<HostValue> = items
+                .into_iter()
+                .map(|e| {
+                    HostValue::Object(vec![
+                        ("kind".into(), HostValue::from(e.kind)),
+                        ("body".into(), HostValue::from(e.body)),
+                        ("width".into(), HostValue::Number(f64::from(e.width))),
+                        ("height".into(), HostValue::Number(f64::from(e.height))),
+                        // 捕获时刻：脚本用它排序，而不是自己取当前时间
+                        ("atMs".into(), HostValue::Number(e.at_ms as f64)),
+                    ])
+                })
+                .collect();
+            Ok(HostValue::Array(rows))
+        })
+        .function("clipboardWatching", |_| {
+            Ok(HostValue::Bool(crate::clip_watch::watching()))
         })
         .function("session", move |_| Ok(HostValue::from(id_session.clone())))
         .function("name", {
