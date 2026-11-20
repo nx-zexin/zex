@@ -511,22 +511,58 @@ fn is_system_path(norm: &str) -> bool {
 /// 系统临时目录：常见的工作位置，不应仅因为"不在 HOME 下"就被额外审批。
 const TEMP_DIRS: &[&str] = &["/tmp", "/var/tmp", "/dev/shm"];
 
-/// 运行期临时目录。
+/// 运行期临时目录（进程内只算一次：环境变量不会中途变）。
 ///
-/// Windows 的临时目录在 `%TEMP%`（通常是 `C:\Users\<u>\AppData\Local\Temp`），
-/// 不在上面那张常量表里，而且因用户而异 —— 所以现读环境变量。
-/// 漏掉它的后果和漏掉 `\\?\` 一样：往临时文件里写点东西也弹审批。
-fn temp_dirs() -> Vec<String> {
-    let mut dirs: Vec<String> = TEMP_DIRS.iter().map(|d| (*d).to_string()).collect();
-    for key in ["TEMP", "TMP"] {
-        if let Some(v) = std::env::var_os(key) {
-            let norm = normalize_path_str(&v.to_string_lossy());
-            if !norm.is_empty() && !dirs.contains(&norm) {
-                dirs.push(norm);
+/// 三件事要一起处理，少一样都会误判成"家目录之外"：
+///
+/// 1. **Win/macOS 的临时目录在环境变量里**：Windows 是 `%TEMP%`/`%TMP%`
+///    （通常是 `C:\Users\<u>\AppData\Local\Temp`），macOS 是 `$TMPDIR`
+///    （`/var/folders/xx/…/T/`）。都不在常量表里，且因用户而异。
+/// 2. **符号链接**：macOS 的 `/var` 指向 `/private/var`、`/tmp` 指向
+///    `/private/tmp`。而 `resolve_path` 的规则 4 会把路径 canonicalize ——
+///    于是待判的路径是 `/private/var/folders/…`，而这里若只登记
+///    `/var/folders/…`，前缀永远比不上。
+/// 3. 所以每个候选都登记**两种形式**：原样的，和 canonicalize 之后的。
+///
+/// 漏掉它们的后果都一样：往临时文件里写点东西也要弹审批。
+fn temp_dirs() -> &'static [String] {
+    static CACHE: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| {
+        let mut seeds: Vec<String> = TEMP_DIRS.iter().map(|d| (*d).to_string()).collect();
+        for key in ["TMPDIR", "TEMP", "TMP"] {
+            if let Some(v) = std::env::var_os(key) {
+                seeds.push(normalize_path_str(&v.to_string_lossy()));
             }
         }
-    }
-    dirs
+
+        let mut dirs: Vec<String> = Vec::new();
+        for seed in seeds {
+            // macOS 的 `$TMPDIR` 带尾斜杠（`/var/folders/xx/…/T/`）。
+            // 不去掉的话下面 `starts_with("{d}/")` 会拼出 `//`，永远比不上。
+            let seed = {
+                let t = seed.trim_end_matches('/');
+                if t.is_empty() {
+                    "/".to_string()
+                } else {
+                    t.to_string()
+                }
+            };
+            if seed.is_empty() {
+                continue;
+            }
+            if !dirs.contains(&seed) {
+                dirs.push(seed.clone());
+            }
+            // 解不开符号链接（目录不存在）就只留原样，不影响判断
+            if let Ok(canonical) = std::fs::canonicalize(&seed) {
+                let norm = normalize_path_str(&canonical.to_string_lossy());
+                if !norm.is_empty() && !dirs.contains(&norm) {
+                    dirs.push(norm);
+                }
+            }
+        }
+        dirs
+    })
 }
 
 /// 是否可能在主目录之外。
@@ -536,7 +572,7 @@ fn is_outside_home(norm: &str) -> bool {
     let home = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(|h| normalize_path_str(&h.to_string_lossy()));
-    is_outside_home_under(norm, home.as_deref(), &temp_dirs())
+    is_outside_home_under(norm, home.as_deref(), temp_dirs())
 }
 
 /// [`is_outside_home`] 的纯函数版本：家目录与临时目录由调用方给。
@@ -570,6 +606,16 @@ mod tests {
     /// 只看风险值，不关心上调性质的老测试用它。
     fn esc_risk(tool: &str, args: &Value, base: Risk) -> Risk {
         escalate(tool, args, base, cwd()).risk
+    }
+
+    #[test]
+    fn temp_dirs_have_no_trailing_slash() {
+        // macOS 的 `$TMPDIR` 形如 `/var/folders/xx/…/T/`（带尾斜杠）。
+        // 留着它，前缀比较会拼出 `…//` 而永远比不上 —— 于是往临时目录写
+        // 文件也会被当成"家目录之外"，白白多弹一次审批。
+        for d in temp_dirs() {
+            assert!(d == "/" || !d.ends_with('/'), "临时目录不该以斜杠结尾：{d}");
+        }
     }
 
     #[test]
