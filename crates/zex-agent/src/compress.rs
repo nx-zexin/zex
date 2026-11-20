@@ -651,11 +651,8 @@ mod tests {
         let shrunk = Compressor::apply_shrink(&msgs, &indices, max);
 
         // 第二次：已经截过了，不能再报同一批
-        match c.plan(&shrunk, None) {
-            CompressionPlan::ShrinkToolResults { .. } => {
-                panic!("已截断的内容不应重复触发压缩")
-            }
-            _ => {}
+        if let CompressionPlan::ShrinkToolResults { .. } = c.plan(&shrunk, None) {
+            panic!("已截断的内容不应重复触发压缩")
         }
     }
 

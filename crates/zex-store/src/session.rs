@@ -226,6 +226,30 @@ impl Store {
     }
 }
 
+/// 从库里读出来的模式字符串转回枚举。
+///
+/// 认不出来一律按 Normal：宁可多问一次，也不要因为一个坏值
+/// 静默变成"少问一次"。
+fn parse_mode(raw: String) -> zex_core::RunMode {
+    match raw.as_str() {
+        "plan" => zex_core::RunMode::Plan,
+        "auto_edit" => zex_core::RunMode::AutoEdit,
+        "full_access" => zex_core::RunMode::FullAccess,
+        // `normal` 是增加四档之前写入的旧值，等同于现在的「变更前确认」
+        _ => zex_core::RunMode::Confirm,
+    }
+}
+
+/// 枚举转存库字符串。
+fn mode_str(mode: zex_core::RunMode) -> &'static str {
+    match mode {
+        zex_core::RunMode::Confirm => "confirm",
+        zex_core::RunMode::AutoEdit => "auto_edit",
+        zex_core::RunMode::Plan => "plan",
+        zex_core::RunMode::FullAccess => "full_access",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -331,29 +355,5 @@ mod tests {
         let ses = s.create_session("x", "m", "/tmp").unwrap();
         s.delete_session(&ses.id).unwrap();
         assert!(s.get_session(&ses.id).unwrap().is_none());
-    }
-}
-
-/// 从库里读出来的模式字符串转回枚举。
-///
-/// 认不出来一律按 Normal：宁可多问一次，也不要因为一个坏值
-/// 静默变成"少问一次"。
-fn parse_mode(raw: String) -> zex_core::RunMode {
-    match raw.as_str() {
-        "plan" => zex_core::RunMode::Plan,
-        "auto_edit" => zex_core::RunMode::AutoEdit,
-        "full_access" => zex_core::RunMode::FullAccess,
-        // `normal` 是增加四档之前写入的旧值，等同于现在的「变更前确认」
-        _ => zex_core::RunMode::Confirm,
-    }
-}
-
-/// 枚举转存库字符串。
-fn mode_str(mode: zex_core::RunMode) -> &'static str {
-    match mode {
-        zex_core::RunMode::Confirm => "confirm",
-        zex_core::RunMode::AutoEdit => "auto_edit",
-        zex_core::RunMode::Plan => "plan",
-        zex_core::RunMode::FullAccess => "full_access",
     }
 }

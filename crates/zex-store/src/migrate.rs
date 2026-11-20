@@ -152,6 +152,64 @@ fn v2_tasks(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v3：子智能体名册。
+///
+/// 进程退出后团队是要恢复的 —— 否则用户辛苦派出的一队人，
+/// 关一次窗口就全没了。
+fn v3_sub_agents(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS sub_agents (
+            id          TEXT PRIMARY KEY,
+            role        TEXT NOT NULL,
+            description TEXT NOT NULL,
+            -- 每个子 agent 独占的会话，点进去能看它干了什么
+            session_id  TEXT NOT NULL,
+            status      TEXT NOT NULL,
+            -- 跑完的结果摘要
+            result      TEXT,
+            created_at  INTEGER NOT NULL,
+            updated_at  INTEGER NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_sub_agents_updated ON sub_agents(updated_at DESC);
+        "#,
+    )
+    .map_err(|e| Error::Store(format!("v3 迁移失败: {e}")))?;
+    Ok(())
+}
+
+/// v4：会话自己的运行模式。
+///
+/// 模式是**每个会话**的选择：一个会话在只读地读代码，另一个在放开改，
+/// 两者并存完全是合理用法。存在进程状态里会互相污染。
+fn v4_session_mode(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        ALTER TABLE sessions ADD COLUMN mode TEXT NOT NULL DEFAULT 'normal';
+        "#,
+    )
+    .map_err(|e| Error::Store(format!("v4 迁移失败: {e}")))?;
+    Ok(())
+}
+
+/// v5：子智能体记住它由哪个会话派生。
+///
+/// 在此之前团队列表是全局的：不管当前在看哪个会话，都会显示所有
+/// 子智能体。加这一列之后，团队只属于派出它的那个会话。
+/// 老数据留空串 —— 那些 agent 的归属已经无法追溯，宁可不显示，
+/// 也不要塞进当前会话假装是它的。
+fn v5_subagent_parent(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        ALTER TABLE sub_agents ADD COLUMN parent_session TEXT NOT NULL DEFAULT '';
+        CREATE INDEX IF NOT EXISTS idx_sub_agents_parent ON sub_agents(parent_session);
+        "#,
+    )
+    .map_err(|e| Error::Store(format!("v5 迁移失败: {e}")))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,62 +300,4 @@ mod tests {
         let err = run(&c).unwrap_err();
         assert!(matches!(err, Error::Store(_)));
     }
-}
-
-/// v3：子智能体名册。
-///
-/// 进程退出后团队是要恢复的 —— 否则用户辛苦派出的一队人，
-/// 关一次窗口就全没了。
-fn v3_sub_agents(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
-        r#"
-        CREATE TABLE IF NOT EXISTS sub_agents (
-            id          TEXT PRIMARY KEY,
-            role        TEXT NOT NULL,
-            description TEXT NOT NULL,
-            -- 每个子 agent 独占的会话，点进去能看它干了什么
-            session_id  TEXT NOT NULL,
-            status      TEXT NOT NULL,
-            -- 跑完的结果摘要
-            result      TEXT,
-            created_at  INTEGER NOT NULL,
-            updated_at  INTEGER NOT NULL
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_sub_agents_updated ON sub_agents(updated_at DESC);
-        "#,
-    )
-    .map_err(|e| Error::Store(format!("v3 迁移失败: {e}")))?;
-    Ok(())
-}
-
-/// v4：会话自己的运行模式。
-///
-/// 模式是**每个会话**的选择：一个会话在只读地读代码，另一个在放开改，
-/// 两者并存完全是合理用法。存在进程状态里会互相污染。
-fn v4_session_mode(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
-        r#"
-        ALTER TABLE sessions ADD COLUMN mode TEXT NOT NULL DEFAULT 'normal';
-        "#,
-    )
-    .map_err(|e| Error::Store(format!("v4 迁移失败: {e}")))?;
-    Ok(())
-}
-
-/// v5：子智能体记住它由哪个会话派生。
-///
-/// 在此之前团队列表是全局的：不管当前在看哪个会话，都会显示所有
-/// 子智能体。加这一列之后，团队只属于派出它的那个会话。
-/// 老数据留空串 —— 那些 agent 的归属已经无法追溯，宁可不显示，
-/// 也不要塞进当前会话假装是它的。
-fn v5_subagent_parent(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
-        r#"
-        ALTER TABLE sub_agents ADD COLUMN parent_session TEXT NOT NULL DEFAULT '';
-        CREATE INDEX IF NOT EXISTS idx_sub_agents_parent ON sub_agents(parent_session);
-        "#,
-    )
-    .map_err(|e| Error::Store(format!("v5 迁移失败: {e}")))?;
-    Ok(())
 }

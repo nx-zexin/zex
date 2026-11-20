@@ -254,6 +254,26 @@ impl Store {
     }
 }
 
+impl Store {
+    /// 当前是否有正在执行的任务或子智能体。
+    ///
+    /// 关窗时用它决定"能不能真的退出"。
+    pub fn has_running_work(&self) -> Result<bool> {
+        self.with_conn(|conn| {
+            let n: i64 = conn
+                .query_row(
+                    "SELECT
+                       (SELECT COUNT(*) FROM tasks WHERE status = 'running')
+                     + (SELECT COUNT(*) FROM sub_agents WHERE status = 'running')",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(|e| Error::Store(format!("统计运行中任务失败: {e}")))?;
+            Ok(n > 0)
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -321,25 +341,5 @@ mod tests {
 
         assert_eq!(s.mark_all_finished_seen().unwrap(), 1);
         assert_eq!(s.unseen_finished_count().unwrap(), 0);
-    }
-}
-
-impl Store {
-    /// 当前是否有正在执行的任务或子智能体。
-    ///
-    /// 关窗时用它决定"能不能真的退出"。
-    pub fn has_running_work(&self) -> Result<bool> {
-        self.with_conn(|conn| {
-            let n: i64 = conn
-                .query_row(
-                    "SELECT
-                       (SELECT COUNT(*) FROM tasks WHERE status = 'running')
-                     + (SELECT COUNT(*) FROM sub_agents WHERE status = 'running')",
-                    [],
-                    |r| r.get(0),
-                )
-                .map_err(|e| Error::Store(format!("统计运行中任务失败: {e}")))?;
-            Ok(n > 0)
-        })
     }
 }

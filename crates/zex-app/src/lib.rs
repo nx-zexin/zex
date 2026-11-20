@@ -24,18 +24,22 @@ pub use config::{
     save_file_config,
 };
 
+/// 连上 MCP 服务后的三样产物。
+///
+/// 三元组单独起个名字，是为了让调用点读起来是"拿到了 MCP 这一套东西"，
+/// 而不是一长串泛型。
+pub type McpWiring = (
+    Vec<Arc<dyn zex_core::tool::ErasedTool>>,
+    Vec<zex_mcp::ServerStatus>,
+    Option<Arc<zex_mcp::McpHub>>,
+);
+
 /// 连上配置里声明的所有 MCP 服务端。
 ///
 /// 放在这里而不是 `build_agent_resuming` 里：连接要 spawn 子进程
 /// 并等握手（几百毫秒到几秒），不该卡住 agent 构造。
 /// 调用方应放到后台线程执行，别阻塞 UI。
-pub fn connect_mcp_servers(
-    cfg: &FileConfig,
-) -> (
-    Vec<Arc<dyn zex_core::tool::ErasedTool>>,
-    Vec<zex_mcp::ServerStatus>,
-    Option<Arc<zex_mcp::McpHub>>,
-) {
+pub fn connect_mcp_servers(cfg: &FileConfig) -> McpWiring {
     if cfg.mcp_servers.is_empty() {
         return (Vec::new(), Vec::new(), None);
     }
@@ -421,7 +425,7 @@ pub fn build_ephemeral_agent_with_team(
 // ─── 内核线程 ───
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use tokio::sync::mpsc;
 use zex_agent::{Agent, AgentConfig, ApprovalBroker, ApprovalDecision};
 use zex_core::{CoreEvent, SessionId, UiCommand};
@@ -852,6 +856,19 @@ type SessionLocks = Arc<Mutex<HashMap<SessionId, Arc<tokio::sync::Mutex<()>>>>>;
 /// 改模式，而那时 `Agent` 在它自己的任务里，UI 够不着它。
 type ModeCells = Arc<Mutex<HashMap<SessionId, zex_core::ModeCell>>>;
 
+/// 取一张表锁；中毒就 panic。
+///
+/// 中毒意味着有线程在改表的时候挂了 —— 表里可能是半截状态。带着它继续
+/// 干活会看到自相矛盾的数据（比如名册里一半有任务一半没有），所以宁可
+/// 响亮地失败。日志缓冲那种"丢了也无所谓"的表才适合 `into_inner()` 硬撑
+/// （见 `ext_logs`）。
+fn lock_or_panic<'a, T>(m: &'a Mutex<T>, what: &str) -> MutexGuard<'a, T> {
+    match m.lock() {
+        Ok(guard) => guard,
+        Err(_) => panic!("{what}中毒"),
+    }
+}
+
 /// 取（必要时建）某个会话的模式句柄。
 fn mode_cell_for(
     cells: &ModeCells,
@@ -859,7 +876,7 @@ fn mode_cell_for(
     fallback: zex_core::RunMode,
 ) -> zex_core::ModeCell {
     // std 锁：这张表只在"取句柄"时碰一下，不跨 await 持有
-    let mut guard = cells.lock().expect("模式句柄表中毒");
+    let mut guard = lock_or_panic(cells, "模式句柄表");
     guard
         .entry(session.clone())
         .or_insert_with(|| zex_core::ModeCell::new(fallback))
@@ -895,7 +912,7 @@ async fn run_task(
     // 而且它们看到的上下文也不一致。tokio 的 Mutex 是公平的，
     // 先来的先拿 —— 所以顺带就有了队列语义。
     let lock = {
-        let mut held = locks.lock().expect("会话锁表中毒");
+        let mut held = lock_or_panic(&locks, "会话锁表");
         held.entry(session.clone())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()

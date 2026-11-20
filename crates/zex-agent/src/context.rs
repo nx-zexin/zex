@@ -168,6 +168,18 @@ pub fn estimate_history_tokens(msgs: &[Message]) -> usize {
     msgs.iter().map(estimate_message_tokens).sum()
 }
 
+/// 已知模型的上下文窗口（token）。
+///
+/// 来源：DeepSeek 官方定价页（2026-11）标注 deepseek-flash / deepseek-v4-pro
+/// 上下文 1M、输出上限 384K。其余 provider 的数字没查到出处，保持默认 128K。
+fn known_window(model: &str) -> Option<usize> {
+    let m = model.to_ascii_lowercase();
+    if m.starts_with("deepseek-flash") || m.starts_with("deepseek-v4-pro") {
+        return Some(1_000_000);
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -278,16 +290,4 @@ mod tests {
         assert_eq!(a, b);
         assert_eq!(Message::user("x").role(), Role::User);
     }
-}
-
-/// 已知模型的上下文窗口（token）。
-///
-/// 来源：DeepSeek 官方定价页（2026-11）标注 deepseek-flash / deepseek-v4-pro
-/// 上下文 1M、输出上限 384K。其余 provider 的数字没查到出处，保持默认 128K。
-fn known_window(model: &str) -> Option<usize> {
-    let m = model.to_ascii_lowercase();
-    if m.starts_with("deepseek-flash") || m.starts_with("deepseek-v4-pro") {
-        return Some(1_000_000);
-    }
-    None
 }

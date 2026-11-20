@@ -453,6 +453,11 @@ struct ChatView {
 }
 
 impl ChatView {
+    /// 十三个参数是"界面初始化要交进去的全部状态"。
+    ///
+    /// 抽 builder 得在 gpui 的 `Context` 生命周期里多绕一步（`new` 里立刻
+    /// 就要 `cx.spawn`），而调用点只有一处 —— 收益只有这条 lint 本身。
+    #[allow(clippy::too_many_arguments)]
     fn new(
         cmd_tx: mpsc::Sender<UiCommand>,
         broker: Arc<ApprovalBroker>,
@@ -897,13 +902,16 @@ impl ChatView {
             return;
         };
         let title = self.rename_input.read(cx).value().trim().to_string();
-        if !title.is_empty() {
-            if let Ok(_) = self.cmd_tx.try_send(UiCommand::RenameSession {
-                session: zex_core::SessionId::from(session),
-                title,
-            }) {
-                // 发出去了，等 SessionTitled 事件回来更新侧栏
-            }
+        if !title.is_empty()
+            && self
+                .cmd_tx
+                .try_send(UiCommand::RenameSession {
+                    session: zex_core::SessionId::from(session),
+                    title,
+                })
+                .is_ok()
+        {
+            // 发出去了，等 SessionTitled 事件回来更新侧栏
         }
         cx.notify();
     }
@@ -2547,17 +2555,19 @@ fn as_code_block(text: &str, lang: &str) -> String {
 /// 工具输出不是"代码片段"，套上卡片式的底和边只会让人以为
 /// 那是另一层可以点开的东西 —— 它就该是连成一片的正文。
 fn md_style_flat(scale: f32) -> TextViewStyle {
-    let mut s = StyleRefinement::default();
     // 白底托在灰卡上，再用一道浅边勾出范围：
     // 纯靠底色差分层在浅色主题下几乎看不出来
-    s.background = Some(rgb(BG_MAIN).into());
-    s.border_widths = EdgesRefinement {
-        top: Some(AbsoluteLength::from(px(1.))),
-        right: Some(AbsoluteLength::from(px(1.))),
-        bottom: Some(AbsoluteLength::from(px(1.))),
-        left: Some(AbsoluteLength::from(px(1.))),
+    let s = StyleRefinement {
+        background: Some(rgb(BG_MAIN).into()),
+        border_widths: EdgesRefinement {
+            top: Some(AbsoluteLength::from(px(1.))),
+            right: Some(AbsoluteLength::from(px(1.))),
+            bottom: Some(AbsoluteLength::from(px(1.))),
+            left: Some(AbsoluteLength::from(px(1.))),
+        },
+        border_color: Some(rgb(BORDER_SOFT).into()),
+        ..Default::default()
     };
-    s.border_color = Some(rgb(BORDER_SOFT).into());
     md_style(scale).code_block(s)
 }
 
@@ -2620,10 +2630,9 @@ fn md_style(scale: f32) -> TextViewStyle {
         })
         // 工具输出常整段包在代码块里：去掉默认的重底色，
         // 让它读起来还是"一段输出"，不是"一块代码"
-        .code_block({
-            let mut s = StyleRefinement::default();
-            s.background = Some(gpui_kit::Hsla::transparent_black().into());
-            s
+        .code_block(StyleRefinement {
+            background: Some(gpui_kit::Hsla::transparent_black().into()),
+            ..Default::default()
         });
     // 不设这个的话代码块永远是纯色文本：组件库拿 Arc 指针判断
     // 「调用方有没有换过主题」，指针相同就当没设置
@@ -3959,7 +3968,7 @@ impl ChatView {
         self.config.network_grants.insert(id.to_string(), list);
         // 闸门读的就是这张表：点了立刻生效，不用重启
         if let Some(host) = &self.ext_host {
-            sync_grants(&host, &self.config);
+            sync_grants(host, &self.config);
         }
         // 面板上的确认卡片收掉
         if let Some(rp) = &mut self.right_panel {

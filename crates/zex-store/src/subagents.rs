@@ -81,6 +81,11 @@ pub struct SubAgentRecord {
 
 impl Store {
     /// 写入或更新一条名册记录。
+    ///
+    /// 七个字段 + `&self` 正好越过 clippy 的 7 参线。抽个结构体只是把同样
+    /// 的字段搬进一个只活一行的临时值，九处调用点反而更啰嗦 —— 行记录本来
+    /// 就是一行一写，参数平铺是最直白的形状。
+    #[allow(clippy::too_many_arguments)]
     pub fn upsert_sub_agent(
         &self,
         id: &str,
