@@ -228,6 +228,8 @@ pub trait Tool: Send + Sync + 'static {
 | ✅ | `fs_write` | Reversible |
 | ✅ | `shell` | Impactful |
 | ✅ | `web_fetch` | ReadOnly |
+| ✅ | `clipboard_read` | ReadOnly（跨平台走 arboard，不依赖 xclip/pbpaste） |
+| ✅ | `clipboard_write` | Impactful（覆盖掉的剪贴板内容找不回来） |
 | ✅ | `ask` | ReadOnly（向用户提问） |
 | M1 | `fs_edit` `glob` `grep` | ReadOnly / Reversible |
 | M2 | `memory_*` `skill_*` | Reversible |

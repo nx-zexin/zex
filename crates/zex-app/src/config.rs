@@ -100,6 +100,17 @@ pub struct FileConfig {
     /// - 非空 —— 允许这些主机（会与清单申请取交集，清单改大了也不会自动扩权）。
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub network_grants: BTreeMap<String, Vec<String>>,
+    /// 用户对每个应用的**剪贴板授权**：应用 id → 准不准碰。
+    ///
+    /// 与 `network_grants` 同一套道理、独立一张表：清单里的
+    /// `capabilities.clipboard` 只是申请（模型也能写清单），这里才是放行。
+    /// 键在不在区分「还没问过」（挂载时弹确认）与「问过了」；
+    /// 值是用户那次点的结果 —— 拒绝也要记下来，不然每次打开都追问。
+    ///
+    /// 一个布尔而不是"读/写"两栏：清单已经写清楚申请了哪几样，
+    /// 用户这一下回答的是"准不准这个应用碰剪贴板"，没道理拆两次问。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub clipboard_grants: BTreeMap<String, bool>,
 }
 
 /// 解析后的运行时配置。

@@ -40,6 +40,12 @@ anyhow = "1"
 
 # ─── 异步 ───
 async-trait = "0.1"
+# 系统剪贴板。选 arboard 而不是调 xclip/wl-paste/pbpaste：
+# 那些命令在各平台名字不同、图标发行版里也不一定装了，
+# 而 arboard 在 X11 / Wayland / macOS / Windows 上都自己实现。
+arboard = { version = "3", default-features = false, features = [
+    "wayland-data-control",
+] }
 tokio = { version = "1", features = [
     "rt-multi-thread",
     "macros",

@@ -11,6 +11,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 #![warn(missing_docs)]
 
+pub mod clipboard;
 pub mod fs;
 pub mod shell;
 pub mod web;
@@ -21,7 +22,7 @@ use zex_core::tool::ErasedTool;
 
 /// 构建 M0 的工具集。
 ///
-/// M0 只有 4 个工具：能读、能写、能跑命令、能上网。
+/// 能读、能写、能跑命令、能上网、能看剪贴板。
 /// 这已经足够完成"帮我看看这个项目怎么跑起来"这类真实任务 —— 先窄后宽。
 pub fn default_tools() -> Vec<Arc<dyn ErasedTool>> {
     vec![
@@ -29,5 +30,9 @@ pub fn default_tools() -> Vec<Arc<dyn ErasedTool>> {
         Arc::new(fs::FsWrite),
         Arc::new(shell::Shell),
         Arc::new(web::WebFetch),
+        // 剪贴板：用户说「我复制了一段…」时，比让他再贴一遍靠谱。
+        // 读是 L0（静默），写是 L2（覆盖掉的东西找不回来）。
+        Arc::new(clipboard::ClipboardRead),
+        Arc::new(clipboard::ClipboardWrite),
     ]
 }

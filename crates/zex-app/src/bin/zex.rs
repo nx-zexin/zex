@@ -178,6 +178,11 @@ struct ExtensionPanel {
     status: String,
     /// 还没得到确认的网络申请（主机清单）。`Some` = 该弹确认卡片。
     net_request: Option<Vec<String>>,
+    /// 还没得到确认的剪贴板申请。`true` = 该弹确认卡片。
+    clip_request: bool,
+    /// 它申请了剪贴板的哪一半（卡片上的措辞要用）。
+    clip_read: bool,
+    clip_write: bool,
 }
 
 impl PanelTab {
@@ -631,6 +636,26 @@ impl ChatView {
                         .await;
                     this.update_in(cx, |this, window, cx| {
                         this.grant_network(&id, true, window, cx);
+                    })
+                    .ok();
+                })
+                .detach();
+            }
+        }
+
+        // 测试钩子：ZEX_AUTO_GRANT_CLIP=<id> 启动后替用户点一下「允许剪贴板」。
+        //
+        // 和网络那个钩子同一个理由：合成点击在这个环境里拉不动指针，
+        // 而"点了允许之后脚本立刻能读"正是这条能力的关键路径。
+        // 走的是按钮调用的同一个函数，所以验证的仍是配置写入 + 授权表刷新 + 重挂。
+        if let Ok(id) = std::env::var("ZEX_AUTO_GRANT_CLIP") {
+            if !id.trim().is_empty() {
+                cx.spawn_in(window, async move |this, cx| {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(1600))
+                        .await;
+                    this.update_in(cx, |this, window, cx| {
+                        this.grant_clipboard(&id, true, window, cx);
                     })
                     .ok();
                 })
@@ -2298,6 +2323,34 @@ fn grants_of(
     config.network_grants.clone()
 }
 
+/// 剪贴板授权表。
+fn clip_grants_of(
+    config: &zex_app::config::FileConfig,
+) -> std::collections::BTreeMap<String, bool> {
+    config.clipboard_grants.clone()
+}
+
+/// 两张授权表一起递给宿主。
+///
+/// 单开一个函数是因为之前踩过：三处 `set_grants` 各写一遍，加第二张表时
+/// 漏一处就是"点了允许却还是读不到"。授权只有"全都传过去"这一种正确姿势。
+fn sync_grants(host: &zex_extension::ExtensionHost, config: &zex_app::config::FileConfig) {
+    host.set_grants(grants_of(config));
+    host.set_clipboard_grants(clip_grants_of(config));
+}
+
+/// 要不要弹剪贴板确认？
+///
+/// 与网络不同，这里没有"清单长大了要重问"的分支：权限是一个布尔值，
+/// 不是一张会增删的名单。问过就记住了，拒绝也算记住。
+fn pending_clipboard(
+    config: &zex_app::config::FileConfig,
+    ext: &zex_extension::Extension,
+) -> bool {
+    let wants = ext.request.clipboard_read || ext.request.clipboard_write;
+    wants && !config.clipboard_grants.contains_key(&ext.id)
+}
+
 /// 加载这个应用时要不要弹网络确认？
 ///
 /// 三种情况要问：
@@ -3553,6 +3606,9 @@ impl ChatView {
         if let Some(hosts) = &e.net_request {
             col = col.child(self.render_net_request(e, hosts, cx));
         }
+        if e.clip_request {
+            col = col.child(self.render_clip_request(e, cx));
+        }
         col.child(self.render_extension_inner(e, cx))
             .into_any_element()
     }
@@ -3654,6 +3710,100 @@ impl ChatView {
             .into_any_element()
     }
 
+    /// 剪贴板确认卡片。
+    ///
+    /// 为什么单独一张而不是并进网络那张：两件事的风险不是一回事
+    /// （网络是往外发，剪贴板是往里看），用户对它们的判断也不一样。
+    /// 一张卡片上写两件事，最容易的结果是他只看懂一半就点了。
+    fn render_clip_request(&self, e: &ExtensionPanel, cx: &mut Context<Self>) -> AnyElement {
+        let allow_id = e.id.clone();
+        let deny_id = e.id.clone();
+        // 说清楚它到底要哪一半：只申请写的应用不该被当成"能看你剪贴板"
+        let what = match (e.clip_read, e.clip_write) {
+            (true, true) => "读取并修改你的剪贴板",
+            (true, false) => "读取你的剪贴板",
+            (false, true) => "往你的剪贴板里写内容",
+            (false, false) => "剪贴板",
+        };
+        div()
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .px_3()
+            .py_3()
+            .bg(rgb(BG_TOOL))
+            .border_b_1()
+            .border_color(rgb(BRAND))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(BRAND))
+                            .child(format!("`{}` 想{what}", e.id)),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(TEXT_DIM))
+                            .child("需你确认后才会生效"),
+                    ),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(TEXT_DIM))
+                    .child("剪贴板里可能有密码、私钥、别处复制来的私事。准许后它随时可读，随时可在侧栏撤销。"),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .px_2()
+                            .py_1()
+                            .rounded(px(5.0))
+                            .cursor_pointer()
+                            .bg(rgb(OK_SOFT))
+                            .text_xs()
+                            .text_color(rgb(OK))
+                            .hover(|st| st.bg(rgb(BG_HOVER)))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _: &MouseDownEvent, w, cx| {
+                                    this.grant_clipboard(&allow_id, true, w, cx);
+                                }),
+                            )
+                            .child("允许"),
+                    )
+                    .child(
+                        div()
+                            .px_2()
+                            .py_1()
+                            .rounded(px(5.0))
+                            .cursor_pointer()
+                            .text_xs()
+                            .text_color(rgb(TEXT_DIM))
+                            .hover(|st| st.bg(rgb(BG_HOVER)))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _: &MouseDownEvent, w, cx| {
+                                    this.grant_clipboard(&deny_id, false, w, cx);
+                                }),
+                            )
+                            .child("不允许"),
+                    ),
+            )
+            .into_any_element()
+    }
+
     /// 面板主体：脚本 View 或错误信息。
     fn render_extension_inner(&self, e: &ExtensionPanel, cx: &mut Context<Self>) -> AnyElement {
         let _ = cx;
@@ -3745,7 +3895,7 @@ impl ChatView {
         self.config.network_grants.insert(id.to_string(), list);
         // 闸门读的就是这张表：点了立刻生效，不用重启
         if let Some(host) = &self.ext_host {
-            host.set_grants(grants_of(&self.config));
+            sync_grants(&host, &self.config);
         }
         // 面板上的确认卡片收掉
         if let Some(rp) = &mut self.right_panel {
@@ -3769,6 +3919,34 @@ impl ChatView {
         if allow {
             self.remount_extension(id, window, cx);
         }
+    }
+
+    /// 剪贴板授权的允许 / 拒绝。
+    ///
+    /// 与网络那条路一样：写进配置、立刻推给宿主、收掉确认卡片、重挂面板。
+    /// 重挂是必须的 —— gpui-shell 的能力集是**建视图那一刻**读走的，
+    /// 已挂载的视图里 `navigator.clipboard` 仍然按上一份判。
+    fn grant_clipboard(&mut self, id: &str, allow: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.config.clipboard_grants.insert(id.to_string(), allow);
+        if let Some(host) = &self.ext_host {
+            sync_grants(host, &self.config);
+        }
+        if let Some(rp) = &mut self.right_panel {
+            if let Some(PanelTab::Extension(p)) = rp
+                .tabs
+                .iter_mut()
+                .find(|t| t.key() == format!("ext:{id}"))
+            {
+                p.clip_request = false;
+            }
+        }
+        let msg = if allow {
+            format!("已允许 `{id}` 使用剪贴板 —— 只放行清单申请的那一半，随时可撤销")
+        } else {
+            format!("已拒绝 `{id}` 的剪贴板申请，它调用时会被拦下（可随时改）")
+        };
+        self.persist_config(msg, cx);
+        self.remount_extension(id, window, cx);
     }
 
     /// 重新挂载一个已经打开的应用面板（改了授权/脚本之后用）。
@@ -3893,6 +4071,9 @@ impl ChatView {
                             p.error = None;
                             p.status = "就绪 · 已重载".into();
                             p.net_request = pending;
+                            p.clip_request = pending_clipboard(&self.config, &fresh);
+                            p.clip_read = fresh.request.clipboard_read;
+                            p.clip_write = fresh.request.clipboard_write;
                         }
                         Err(e) => {
                             // 重载失败保留上一版界面：改到一半语法错时，
@@ -3944,7 +4125,7 @@ impl ChatView {
             match zex_extension::ExtensionHost::new(cx, bridge) {
                 Ok(h) => {
                     // 授权表随宿主一起交过去：网络闸门认的就是它
-                    h.set_grants(grants_of(&self.config));
+                    sync_grants(&h, &self.config);
                     self.ext_host = Some(std::rc::Rc::new(h));
                 }
                 Err(e) => {
@@ -4027,7 +4208,7 @@ impl ChatView {
             match zex_extension::ExtensionHost::new(cx, bridge) {
                 Ok(h) => {
                     // 授权表随宿主一起交过去：网络闸门认的就是它
-                    h.set_grants(grants_of(&self.config));
+                    sync_grants(&h, &self.config);
                     self.ext_host = Some(std::rc::Rc::new(h));
                 }
                 Err(e) => {
@@ -4061,6 +4242,9 @@ impl ChatView {
             streaming: None,
             status,
             net_request: pending_net(&self.config, &ext),
+            clip_request: pending_clipboard(&self.config, &ext),
+            clip_read: ext.request.clipboard_read,
+            clip_write: ext.request.clipboard_write,
         });
         self.ext_mtimes.insert(ext.id.clone(), Self::ext_stamp(&ext));
         self.activate_or_push_tab(tab, cx);
@@ -6089,6 +6273,38 @@ impl ChatView {
                                     }),
                                 )
                                 .child(if approved { "撤销联网" } else { "允许联网" })
+                        } else {
+                            div()
+                        }
+                    })
+                    // 剪贴板的允许 / 撤销：同样只在真申请了才出现。
+                    // 与网络并列而不是合成一个"权限"按钮：用户撤销某一个
+                    // 权限时，不该顺手把另一个也关掉。
+                    .child({
+                        let id = ext.id.clone();
+                        let needs = ext.request.clipboard_read || ext.request.clipboard_write;
+                        let approved = self
+                            .config
+                            .clipboard_grants
+                            .get(&ext.id)
+                            .copied()
+                            .unwrap_or(false);
+                        if needs {
+                            div()
+                                .text_xs()
+                                .px_2()
+                                .py_1()
+                                .rounded(px(5.0))
+                                .cursor_pointer()
+                                .text_color(rgb(if approved { OK } else { DANGER }))
+                                .hover(|st| st.bg(rgb(BG_HOVER)))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _: &MouseDownEvent, w, cx| {
+                                        this.grant_clipboard(&id, !approved, w, cx);
+                                    }),
+                                )
+                                .child(if approved { "撤销剪贴板" } else { "允许剪贴板" })
                         } else {
                             div()
                         }

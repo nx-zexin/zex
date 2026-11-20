@@ -76,6 +76,13 @@ pub struct ExtensionHost {
     /// 共享一份 `Arc`：用户点「允许」之后，正在跑的应用**立刻**能联网，
     /// 不用重启、也不用重新挂载（每次取 hub 时现算交集）。
     grants: Arc<Mutex<std::collections::BTreeMap<String, Vec<String>>>>,
+    /// 用户对每个应用的**剪贴板授权**：应用 id → 是否允许。
+    ///
+    /// 与网络分开一张表：两者的授予理由不同（一个防外发，一个防偷看），
+    /// 合成一张表就会出现"允许联网顺带给了剪贴板"这种谁也没想过的结果。
+    /// 一个布尔值就够：清单里申请读还是写由 `CapabilityRequest` 记着，
+    /// 这里是"这个人准不准这个应用碰剪贴板"。
+    clip_grants: Arc<Mutex<std::collections::BTreeMap<String, bool>>>,
 }
 
 /// 已打开的库。
@@ -128,6 +135,7 @@ impl ExtensionHost {
             dbs: Arc::new(Mutex::new(HashMap::new())),
             nets: Arc::new(Mutex::new(HashMap::new())),
             grants: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
+            clip_grants: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
         })
     }
 
@@ -139,6 +147,23 @@ impl ExtensionHost {
     /// 一张只属于它的通行证 —— 别的应用拿不到（它们各自挂载时各算各的）。
     fn capabilities_for(&self, ext: &Extension) -> Capabilities {
         let mut caps = base_capabilities();
+
+        // 剪贴板：清单申请 ∩ 用户授权，且读、写分开判。
+        // 上游把它做成脚本里的 `cx.read_from_clipboard()` /
+        // `cx.write_to_clipboard(text)`（同步，只能从 host call 里调），
+        // 读写各有各的能力位，所以这里能精确到"准它写、不准它读"。
+        let clip_allowed = self
+            .clip_grants
+            .lock()
+            .ok()
+            .and_then(|g| g.get(&ext.id).copied())
+            .unwrap_or(false);
+        if clip_allowed {
+            caps = caps
+                .clipboard_read(ext.request.clipboard_read)
+                .clipboard_write(ext.request.clipboard_write);
+        }
+
         let declared = &ext.request.network_hosts;
         if declared.is_empty() {
             return caps;
@@ -191,6 +216,20 @@ impl ExtensionHost {
         grants: std::collections::BTreeMap<String, Vec<String>>,
     ) {
         if let Ok(mut guard) = self.grants.lock() {
+            *guard = grants;
+        }
+    }
+
+    /// 把"每个应用准不准碰剪贴板"交给宿主。
+    ///
+    /// 与 `set_grants` 分开传：网络是"允许连哪些主机"，剪贴板是"准不准碰"，
+    /// 一个列表一个布尔，硬塞进同一个类型只会让两边都变难读。
+    /// 不传等于全拒 —— 授权表没到之前，任何应用都读不到剪贴板。
+    pub fn set_clipboard_grants(
+        &self,
+        grants: std::collections::BTreeMap<String, bool>,
+    ) {
+        if let Ok(mut guard) = self.clip_grants.lock() {
             *guard = grants;
         }
     }

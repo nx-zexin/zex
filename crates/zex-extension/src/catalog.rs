@@ -117,8 +117,14 @@ pub struct CapabilityRequest {
     pub execute: Option<Vec<String>>,
     /// 可访问的网络主机。
     pub network_hosts: Vec<String>,
-    /// 是否要剪贴板。
-    pub clipboard: bool,
+    /// 是否要读剪贴板。
+    ///
+    /// 与 `clipboard_write` 分开：读是把用户剪贴板里的东西交给脚本
+    /// （可能含密码），写只是覆盖剪贴板。两者的风险不是一回事，
+    /// 合成一个布尔值会让"只想提供复制按钮"的应用也被当成能读。
+    pub clipboard_read: bool,
+    /// 是否要写剪贴板。
+    pub clipboard_write: bool,
     /// 是否要 localStorage。
     pub storage: bool,
     /// 是否要 `process.exit`。
@@ -132,7 +138,8 @@ impl CapabilityRequest {
             && self.fs_write.is_empty()
             && self.execute.is_none()
             && self.network_hosts.is_empty()
-            && !self.clipboard
+            && !self.clipboard_read
+            && !self.clipboard_write
             && !self.storage
             && !self.exit
     }
@@ -179,8 +186,11 @@ impl CapabilityRequest {
         if !self.network_hosts.is_empty() {
             bits.push(format!("网络 {} 个主机", self.network_hosts.len()));
         }
-        if self.clipboard {
-            bits.push("剪贴板".to_string());
+        match (self.clipboard_read, self.clipboard_write) {
+            (true, true) => bits.push("剪贴板 读+写".to_string()),
+            (true, false) => bits.push("剪贴板 读".to_string()),
+            (false, true) => bits.push("剪贴板 写".to_string()),
+            (false, false) => {}
         }
         if self.storage {
             bits.push("存储".to_string());
@@ -363,12 +373,17 @@ fn parse_request(text: &str) -> CapabilityRequest {
         fs_write: strings(fs.and_then(|f| f.get("write"))),
         execute: exec,
         network_hosts: strings(network.and_then(|n| n.get("hosts"))),
-        clipboard: caps
+        // 上游清单的写法是 `"clipboard": {"read": true, "write": true}`。
+        // 读、写分别记：给出去的权利越小，用户点"允许"时越敢点。
+        clipboard_read: caps
             .get("clipboard")
-            .map(|c| {
-                c.get("read").and_then(|v| v.as_bool()).unwrap_or(false)
-                    || c.get("write").and_then(|v| v.as_bool()).unwrap_or(false)
-            })
+            .and_then(|c| c.get("read"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        clipboard_write: caps
+            .get("clipboard")
+            .and_then(|c| c.get("write"))
+            .and_then(|v| v.as_bool())
             .unwrap_or(false),
         // 上游这个字段默认给 true；这里按"没写就是没要"处理，
         // 因为我们的实现里存储也要显式授予
@@ -591,6 +606,27 @@ mod capability_tests {
         let r = parse(r#"{"fs":{"read":["a"],"write":["b"]},"clipboard":{"read":true}}"#);
         let s = r.summary();
         assert!(s.contains("读 1 处") && s.contains("写 1 处") && s.contains("剪贴板"), "{s}");
+    }
+
+    #[test]
+    fn clipboard_read_and_write_are_separate() {
+        // 只想提供「复制」按钮的扩展不应该连带拿到读权限：
+        // 两份权利合成一个布尔值，用户点「允许」时根本看不出来。
+        let only_write = parse(r#"{"clipboard":{"write":true}}"#);
+        assert!(only_write.clipboard_write && !only_write.clipboard_read);
+        assert_eq!(only_write.summary(), "剪贴板 写");
+
+        let only_read = parse(r#"{"clipboard":{"read":true}}"#);
+        assert!(only_read.clipboard_read && !only_read.clipboard_write);
+        assert_eq!(only_read.summary(), "剪贴板 读");
+
+        let both = parse(r#"{"clipboard":{"read":true,"write":true}}"#);
+        assert_eq!(both.summary(), "剪贴板 读+写");
+
+        // 一个子键都没写时两个都是 false，而不是“写了这个键就算要”
+        let empty = parse(r#"{"clipboard":{}}"#);
+        assert!(!empty.clipboard_read && !empty.clipboard_write);
+        assert!(empty.is_empty());
     }
 
     #[test]

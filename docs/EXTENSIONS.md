@@ -193,7 +193,8 @@ agent 会写 `main.js` → `ext_install` 登记 → `ext_check` 自检 → 报�
 |---|---|
 | `storage` → `localStorage` | ✅ 生效，落盘在 `~/.zex/state/extensions-store.json`（全局共享一份） |
 | `network` → `fetch` / `httpRequest` / WS / TCP | ✅ 生效，按应用：清单 ∩ 用户允许（见上节） |
-| `fs` / `clipboard` / `execute` | ❌ 只解析、展示、留痕 |
+| `clipboard` → `cx.read_from_clipboard()` / `cx.write_to_clipboard()` | ✅ 生效，按应用：清单申请的那一半 ∩ 用户允许 |
+| `fs` / `execute` | ❌ 只解析、展示、留痕 |
 
 存储之所以能给，是因为它不需要"按应用隔离才有意义"：宿主建运行时调 `set_storage_path` + `set_capabilities(storage)`，两行成对就有——少任一行脚本一碰 `localStorage` 就抛错，报错还看不出另一边没配。
 
@@ -202,10 +203,46 @@ agent 会写 `main.js` → `ext_install` 登记 → `ext_check` 自检 → 报�
 没申请存储的应用一样能用。要每应用一份文件得换成上游 `plugin::Plugin::load`，
 那是一整套插件生命周期，先不值当。
 
-`fs` / `clipboard` / `execute` 仍然只是「申请 → 展示 → 留痕」：它们比网络更
-难按应用切（一个路径授权要落到 `Grant` 句柄上，剪贴板根本没法按应用隔离），
+`fs` / `execute` 仍然只是「申请 → 展示 → 留痕」：它们比网络更难按应用切
+（一个路径授权要落到 `Grant` 句柄上，还要防 `../` 绕过、防符号链接逃逸），
 等 per-app 策略铺开再逐个接。`config.json` 里还留着 `approved_extensions`
 （早期"审阅过"的痕迹），网络早已改由 `network_grants` 判定。
+
+### 剪贴板：能做到按应用，是因为上游把能力冻结在视图上
+
+剪贴板此前被当成"没法按应用隔离"的例子，实测是错的。`mount_application`
+取的是**建视图那一刻**的默认 Policy，而 `Policy` 的注释写得很清楚：能力位是
+视图**唯一冻结**的东西，挂载后再改默认值只影响下一个视图。所以
+`capabilities_for()` 把「清单申请 ∩ 用户授权」装成默认、挂载、再换回空集，
+就等于给这个应用发了一张只属于它的通行证。
+
+实测过的两种状态（同一个脚本、同一份清单，只改 `config.json`）：
+
+```
+clipboard_grants: {"clip-probe": true}   → cx.read_from_clipboard() 返回文本
+clipboard_grants: {"clip-probe": false}  → 抛 "reading the clipboard is not granted…"
+无该键                                     → 挂载时弹确认卡片，未点之前也是拒绝
+```
+
+读、写是两个独立的能力位，所以「只给复制按钮」的扩展拿不到读权限：
+
+| 清单里写的 | 用户点允许后它拿到 | 卡片上写的是 |
+|---|---|---|
+| `{"clipboard": {"read": true}}` | 只能读 | 想读取你的剪贴板 |
+| `{"clipboard": {"write": true}}` | 只能写 | 想往你的剪贴板里写内容 |
+| 两个都写 | 读 + 写 | 想读取并修改你的剪贴板 |
+
+脚本侧是同步调用，只能在 host call 里用（render、事件回调、任务），
+顶层模块作用域调用会报 "needs a live host call"：
+
+```js
+export default class App extends View {
+  render(cx) {
+    const t = cx.read_from_clipboard();   // 没有文本时返回 undefined
+    return div().child(t ?? "剪贴板是空的");
+  }
+}
+```
 
 ## 侧边栏入口
 
