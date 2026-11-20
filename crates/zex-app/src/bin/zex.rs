@@ -2482,6 +2482,20 @@ fn end_reason_text(reason: &zex_core::EndReason, steps: u32, elapsed_ms: u64) ->
     }
 }
 
+/// 窗口/任务栏图标。
+///
+/// 图标是 `assets/icon/zex.svg` 那一套（Z 与 X 共用一条对角：Z 的三笔在上层，
+/// X 的另一条腿压在下面，交叉处橙色压过去）。这里嵌 256px 的 PNG：
+/// 任务栏最大也就显示到 128，再大只是白占内存。
+///
+/// 解不出来就返回 `None` —— 少个图标不该让应用起不来。
+fn window_icon() -> Option<std::sync::Arc<image::RgbaImage>> {
+    const PNG: &[u8] = include_bytes!("../../../../assets/icon/zex-256.png");
+    image::load_from_memory(PNG)
+        .ok()
+        .map(|img| std::sync::Arc::new(img.to_rgba8()))
+}
+
 /// 一个应用的图标：`icon.svg` 有就按主题色画出来，没有返回 `None`。
 ///
 /// 为什么是 `Option`：回退方案在两个调用点不一样 —— 侧边栏退成一个小圆点
@@ -8441,6 +8455,11 @@ fn main() {
             apply_platform_font(cx);
 
             let options = WindowOptions {
+                // X11 从 `icon` 读窗口图标；Wayland 不看它，改由 compositor
+                // 按 `app_id` 去 .desktop 里找 `Icon=zex`（见 assets/linux）。
+                // 两条路都铺好，任务栏在两个会话类型下才都有图标。
+                icon: window_icon(),
+                app_id: Some("zex".into()),
                 window_bounds: Some(WindowBounds::Windowed(Bounds::new(
                     point(px(80.0), px(60.0)),
                     size(px(1280.0), px(820.0)),

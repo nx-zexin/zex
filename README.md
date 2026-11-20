@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/icon/zex.svg" width="112" alt="Zex">
+</p>
+
 # Zex
 
 Zex 是一个运行在本机的桌面数字助理，使用 Rust 与 gpui 实现，模型侧支持 OpenAI 兼容接口与

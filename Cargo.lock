@@ -10796,6 +10796,7 @@ dependencies = [
  "async-trait",
  "gpui-kit",
  "gpui-shell",
+ "image",
  "raw-window-handle",
  "reqwest",
  "schemars",

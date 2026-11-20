@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Zex
+GenericName=桌面数字助理
+Comment=运行在本机的桌面数字助理
+Exec=zex
+Icon=zex
+Terminal=false
+Categories=Development;Utility;
+Keywords=assistant;ai;agent;zex;
+# 必须和 WindowOptions.app_id 一致：Wayland 下 compositor 靠它把窗口
+# 和这个 .desktop 对上，对不上就没有图标，任务栏里也是一坨无名的东西。
+StartupWMClass=zex

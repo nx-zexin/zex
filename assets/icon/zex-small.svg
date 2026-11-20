@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Zex 图标 · 小尺寸版（16~32px 用）。
+
+  和 zex.svg 是同一套几何，只做两处光学补偿：
+  - 笔画 132 → 156：16px 时笔画只剩 2 个像素，不加重就糊成一条
+  - 圆角 224 → 150：圆角太大，小尺寸下会把字形吃进弧线里
+
+  大尺寸别用这个 —— 笔画看着会偏重。
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <rect width="1024" height="1024" rx="150" fill="#1A1A1A"/>
+  <path d="M 233 322 L 791 702" fill="none" stroke="#FEF3E2"
+        stroke-width="146" stroke-linecap="butt"/>
+  <path d="M 180 286 H 844 L 180 738 H 844" fill="none" stroke="#F59E0B"
+        stroke-width="156" stroke-linecap="butt" stroke-linejoin="miter"/>
+</svg>

@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Zex 图标。
+
+  几何：只有四条笔画 —— 上横、下横、一条橙色对角、一条奶白反向斜线。
+
+      Z = 顶横 + 对角(右上→左下) + 底横      一笔连写
+      X = 同一条对角 + 反向斜线(左上→右下)
+
+  两个字母共用那条对角，所以这一张图同时是 Z 和 X：第一眼是 Z，
+  第二眼看得出奶油色的那条斜线与橙色对角交叉成了 X。
+
+  反向斜线的两端收在横幅内部（内缩 62），让它不外露 ——
+  露出去会在横幅角上留下锯齿状的小三角。
+
+  颜色取自应用的品牌变量：BRAND / BRAND_SOFT / TEXT。
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <rect width="1024" height="1024" rx="224" fill="#1A1A1A"/>
+  <!-- X 的另一条腿：压在 Z 下面，交叉处让橙色压过来 -->
+  <path d="M 247 327 L 777 697" fill="none" stroke="#FEF3E2"
+        stroke-width="132" stroke-linecap="butt"/>
+  <!-- Z：顶横 + 对角 + 底横，一笔连写 -->
+  <path d="M 196 292 H 828 L 196 732 H 828" fill="none" stroke="#F59E0B"
+        stroke-width="132" stroke-linecap="butt" stroke-linejoin="miter"/>
+</svg>

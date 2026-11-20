@@ -42,6 +42,7 @@ serde_json.workspace = true
 async-trait.workspace = true
 schemars.workspace = true
 reqwest.workspace = true
+image.workspace = true
 
 # 自绘标题栏的拖动 / 最大化还原直接调 Win32（见 src/window_ops.rs）
 [target.'cfg(windows)'.dependencies]

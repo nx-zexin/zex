@@ -101,6 +101,11 @@ tracing-core = "0.1"
 # ─── 杂项 ───
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
 
+# 图片解码。gpui-pre 本来就依赖它，这里显式声明只是为了拿 `RgbaImage`——
+# 窗口图标要的是解码后的像素（见 zex-app 的 window_icon）。
+# 只开 png：图标是唯一的用途，没必要把 jpeg/webp/tiff 全套 codec 编进来。
+image = { version = "0.25", default-features = false, features = ["png"] }
+
 # ─── UI ───
 gpui-kit = { version = "0.9", features = ["syntect", "assets"] }
 
