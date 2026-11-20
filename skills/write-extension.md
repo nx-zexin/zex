@@ -1,6 +1,6 @@
 ---
 name: write-extension
-description: 给 zex 写一个应用（脚本面板/独立小应用），含模块划分、宿主接口、本地存储与 SQLite、图标规范和三条必踩的坑
+description: 给 zex 写一个应用（脚本面板/独立小应用），含模块划分、宿主接口、本地存储与 SQLite、剪贴板、图标规范和三条必踩的坑
 ---
 
 # 给 zex 写应用
@@ -282,6 +282,90 @@ await tcpClose(id);
 - 白名单按**主机名**判，不做 IP 二次校验。所以别把"申请了 A 域名"当成
   "绝对不会连到别的 IP"；写清单时按最小范围写。
 
+## 剪贴板：能读能写，但要用户点一次
+
+剪贴板**不是**宿主模块的导出，是 `cx` 上的方法。别写
+`import { read_from_clipboard } from "zex.<id>"` —— 那样整个模块都加载不了，
+`ext_check` 报的是 `SyntaxError: Could not find export 'read_from_clipboard'
+in module 'zex.<id>'`（这个错十有八九就是找错地方了）：
+
+```js
+const text = cx.read_from_clipboard();   // string | undefined
+cx.write_to_clipboard("要复制的文本");    // 返回 undefined
+```
+
+两个都是**同步**的（不返回 Promise）。只申请了写、没申请读的应用，
+`read_from_clipboard` 会抛错 —— 读写是两个独立的能力位。
+
+### 清单里分开写
+
+```json
+{ "capabilities": { "clipboard": { "read": true, "write": true } } }
+```
+
+只做「复制」按钮就只写 `write`；只做「从剪贴板导入」就只写 `read`。
+**别为了省事两个都写** —— 用户看到的确认卡片会写明"想读取你的剪贴板"还是
+"想往你的剪贴板里写内容"，申请宽了等于让他更难判断该不该点。
+
+### 同样是两层：清单申请 + 用户授权
+
+和网络一个道理（清单是模型写的，不能自己生效）：
+
+- 没点过「允许」→ 调用直接抛 `reading the clipboard is not granted;
+  declare capabilities.clipboard.read in the manifest`；
+- 点了允许 → 按清单申请的那一半放行：只申请写就只拿到写；
+- 点了「不允许」→ 一直拒绝，不再追问。
+
+所以看到 `not granted` 时的正确反应是**请用户去确认**，不是去改清单：
+
+```
+这个应用想读剪贴板，需要你在它的面板上点「允许」（或 设置 → 应用 → 允许剪贴板）
+```
+
+### 三个坑
+
+1. **`undefined` 不是错误。** 空剪贴板、或者里面是图片/文件而不是文本时，
+   读出来是 `undefined`。别把它当"授权失败"，两者要分开处理：
+
+   ```js
+   const t = cx.read_from_clipboard();
+   if (t === undefined) return div().child("剪贴板里没有文字");
+   ```
+
+2. **别在 `render()` 里写剪贴板。** `render` 会被反复调用，写一次就是覆盖
+   用户剪贴板一次。写只放在明确的用户动作里（按钮的 `on_click`）。
+
+3. **只在你真要的时候读。** 没有长度上限，用户可能复制了一整份日志进来。
+   别在每次渲染都读一遍再塞进 state —— 让"从剪贴板导入"是一个按钮。
+
+### 一个能抄的写法
+
+```js
+import { View, div } from "gpui-kit";
+import { h_flex, v_flex, Button } from "gpui-base";
+
+export default class Notes extends View {
+  init() { this.text = ""; }
+
+  render(cx) {
+    const c = cx.theme().colors;
+    return v_flex().size_full().gap(10).p(16).bg(c.background)
+      .child(div().text_sm().child(this.text || "（还没有内容）"))
+      .child(h_flex().gap(8)
+        .child(Button.new("paste").h(30).px(12).rounded(6).bg(c.primary)
+          .on_click((_e, ecx) => {
+            // 只在用户点的时候读，不在 render 里读
+            this.text = ecx.read_from_clipboard() ?? "";
+            ecx.notify();
+          })
+          .child(div().text_color(c.primary_foreground).child("粘贴")))
+        .child(Button.new("copy").h(30).px(12).rounded(6).bg(c.secondary)
+          .on_click((_e, ecx) => { ecx.write_to_clipboard(this.text); })
+          .child(div().text_color(c.secondary_foreground).child("复制"))));
+  }
+}
+```
+
 ## 宿主接口
 
 ```js
@@ -304,7 +388,8 @@ import { ask, reply, busy, name, session, dbExec, dbQuery, dbBatch } from "zex.<
 | `tcpConnect/tcpSend/tcpRecv/tcpClose` | 裸 TCP（详见「网络」） |
 
 另外 `window.localStorage` / `window.sessionStorage` 可用，但它们不是模块导出，
-是 `window` 上的（详见「本地存储」）。
+是 `window` 上的（详见「本地存储」）。**剪贴板也不在这张表里** ——
+它是 `cx.read_from_clipboard()` / `cx.write_to_clipboard()`（详见上一节）。
 
 模块名带 id 不是可选：宿主模块按名唯一，共用名字会互相顶掉。
 
@@ -367,14 +452,16 @@ export default class App extends View {
 |---|---|
 | 画界面（`gpui-kit` / `gpui-base`） | 读文件（`fs` 未开放） |
 | 调 agent（`ask` / `reply`） | 改宿主界面（只能画自己的面板） |
-| 本地存储（`localStorage`，全局共享一份） | 剪贴板、子进程（未开放） |
+| 本地存储（`localStorage`，全局共享一份） | 子进程（未开放） |
 | 网络：HTTP / WS / TCP（清单申请 ∩ 用户允许） | 监听端口（只能做客户端） |
+| 剪贴板：读 / 写（`cx.read_from_clipboard()` / `cx.write_to_clipboard()`，清单申请 ∩ 用户允许） | 读剪贴板里的图片和文件（只有文本） |
 | SQLite（`dbExec` / `dbQuery` / `dbBatch`，一应用一库） | 碰 zex 自己的库（作者器挡 `ATTACH`） |
 
 清单里的 `capabilities` **声明**可以写，用户能在应用页看到你要什么。
-`storage` 直接生效；`network` 要用户点「允许」（清单与授权取交集才算数）；
-`fs` / `clipboard` / `execute` 写了也不生效 —— 直接告诉用户"这个能力当前不支持"，
-别绕（比如用 `ask` 让 agent 去读文件）。
+`storage` 直接生效；`network` 和 `clipboard` 要用户点「允许」（清单与授权取交集
+才算数，剪贴板的读写还各自独立）；`fs` / `execute` 写了也不生效 ——
+直接告诉用户"这个能力当前不支持"，别绕（比如用 `ask` 让 agent 去读文件、
+再让它把内容写进剪贴板，那绕过了用户对文件权限的判断）。
 
 ## 写完怎么验证
 
