@@ -1027,7 +1027,11 @@ impl Agent {
     /// 直接问"会不会拦我"的入口，给 `dispatch_gated` 和测试共用 ——
     /// 两边各抄一份判定顺序，迟早会走岔。
     fn judge_for(&self, spec: &zex_core::tool::ToolSpec, args: &serde_json::Value) -> Verdict {
-        self.policy.evaluate(spec, args, self.mode.get())
+        // cwd 必须传下去：模型给的路径常常是相对的（`src/main.rs`）或
+        // `~/x`，不带上工作目录，权限层就只能当成"哪都不在" → 误判成
+        // 越界 → 连「完全访问」都要弹审批。
+        self.policy
+            .evaluate(spec, args, self.mode.get(), &self.cfg.cwd)
     }
 
     /// 按工具名与参数问一次判定结论（不改任何状态）。

@@ -26,6 +26,7 @@ pub mod rules;
 pub mod secret;
 
 use serde_json::Value;
+use std::path::Path;
 use zex_core::{Risk, ToolSpec};
 use zex_store::Store;
 
@@ -114,10 +115,10 @@ impl Policy {
     /// 模式约束放在靠前的位置，是因为它是**全局约定**：
     /// 用户说"现在只看"，那就不该有任何写操作被放出去 ——
     /// 包括那些本来会被 grant 放行的。
-    pub fn evaluate(&self, spec: &ToolSpec, args: &Value, mode: Mode) -> Verdict {
+    pub fn evaluate(&self, spec: &ToolSpec, args: &Value, mode: Mode, cwd: &Path) -> Verdict {
         // ─── 第 1 步：硬 Deny 表 ───
         // 不可配置、不可被 grant 覆盖、不可被"跳过确认"覆盖
-        if let Some(reason) = rules::hard_deny(spec.name, args) {
+        if let Some(reason) = rules::hard_deny(spec.name, args, cwd) {
             return Verdict::Deny { reason };
         }
 
@@ -130,12 +131,12 @@ impl Policy {
         }
 
         // ─── 第 3 步：规则上调风险（只上调，不下调）───
-        let effective = rules::escalate(spec.name, args, spec.risk);
-        let escalated = effective > spec.risk;
+        let esc = rules::escalate(spec.name, args, spec.risk, cwd);
+        let effective = esc.risk;
 
         // ─── 第 4 步：grant 匹配（只对 L0–L2 有效，L3 永不匹配）───
         // 被规则上调的调用不查 grant："同类操作以前批准过"不能覆盖新出现的风险形态。
-        if effective.grantable() && !escalated {
+        if esc.bump.is_none() && effective.grantable() {
             if let Ok(grants) = self.store.active_grants_for(spec.name) {
                 for g in grants {
                     if glob::matches(&g.pattern, args) {
@@ -148,9 +149,14 @@ impl Policy {
             }
         }
 
-        if escalated {
-            // 被规则上调的调用一律要问，**任何模式都不豁免**：
-            // "完全访问"放宽的是常规命令，不是换了张脸的高危形态。
+        // 上调分两种，处理不一样：
+        //
+        // - **Dangerous**（sudo / rm -rf / / curl|sh / 强制推送）：任何模式都要问，
+        //   「完全访问」放宽的是常规命令，不是换了张脸的高危形态。
+        // - **Location**（只是不在家目录下）：交给下面的模式矩阵。「完全访问」
+        //   就该放行 —— 用户在 `D:\proj` 或 `/srv/app` 里干活是常态，
+        //   为“路径不在 HOME 下”每次都弹审批，等于把这个模式废了。
+        if esc.bump == Some(rules::Bump::Dangerous) {
             let bump = match mode_verdict(Mode::Confirm, effective) {
                 Verdict::Ask {
                     grantable,
@@ -160,7 +166,7 @@ impl Policy {
                 Verdict::Allow { .. } | Verdict::Deny { .. } => (false, false),
             };
             return Verdict::Ask {
-                reason: rules::escalation_reason(spec.name, args)
+                reason: rules::escalation_reason(spec.name, args, cwd)
                     .unwrap_or_else(|| format!("`{}` 本次参数命中风险规则，需要确认", spec.name)),
                 grantable: bump.0,
                 double_confirm: bump.1,
@@ -245,6 +251,25 @@ fn mode_verdict(mode: Mode, risk: Risk) -> Verdict {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    /// 测试用的工作目录：**真实家目录下的子目录**。
+    ///
+    /// 不能写死一个假路径（如 `/home/u/proj`）：那样相对路径解析出来的
+    /// 绝对位置本来就在家目录之外，权限层上调风险反而是**正确**的，
+    /// 测试就钉不住我们真正想守的规则。
+    fn cwd() -> PathBuf {
+        home()
+            .unwrap_or_else(|| PathBuf::from("/tmp"))
+            .join("zex-proj")
+    }
+
+    /// 家目录；极端环境拿不到时退回 /tmp。
+    fn home() -> Option<PathBuf> {
+        std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(PathBuf::from)
+    }
 
     fn spec(name: &'static str, risk: Risk) -> ToolSpec {
         ToolSpec {
@@ -268,8 +293,69 @@ mod tests {
             &spec("fs_write", Risk::Reversible),
             &serde_json::json!({"path": "/srv/zex-probe.txt"}),
             Mode::Confirm,
+            &cwd(),
         );
         assert!(matches!(v, Verdict::Ask { .. }), "应为 Ask，实际 {v:?}");
+    }
+
+    #[test]
+    fn full_access_allows_writing_a_relative_path() {
+        // 回归：模型给的是 `src/main.rs` 这种相对路径，权限层拿它和家目录
+        // 直接比 → "看起来在外面" → 风险上调 → 「完全访问」也要批准。
+        // 用户看到的就是"我明明选了完全访问，写个文件还弹窗"。
+        let p = policy();
+        for path in ["src/main.rs", "./a.txt", "~/proj/a.txt", "a/../b.txt"] {
+            let v = p.evaluate(
+                &spec("fs_write", Risk::Reversible),
+                &serde_json::json!({"path": path, "content": "x"}),
+                Mode::FullAccess,
+                &cwd(),
+            );
+            assert!(v.is_allow(), "`{path}` 在完全访问下应放行，得到 {v:?}");
+        }
+    }
+
+    #[test]
+    fn auto_edit_allows_relative_path_writes() {
+        // 同一类误判也让「自动编辑」失效：写个相对路径也变成"有影响"要问。
+        let p = policy();
+        let v = p.evaluate(
+            &spec("fs_write", Risk::Reversible),
+            &serde_json::json!({"path": "src/lib.rs", "content": "x"}),
+            Mode::AutoEdit,
+            &cwd(),
+        );
+        assert!(v.is_allow(), "自动编辑下写工作目录内的文件应放行，得到 {v:?}");
+    }
+
+    #[test]
+    fn full_access_still_asks_for_a_dangerous_command() {
+        // 另一头不能松：「完全访问」豁免的是"位置"，不是"危险形态"。
+        // `git push --force` 不在硬拒绝表里，但属于危险形态 —— 任何模式都问。
+        let p = policy();
+        let v = p.evaluate(
+            &spec("shell", Risk::Impactful),
+            &serde_json::json!({"command": "git push --force origin main"}),
+            Mode::FullAccess,
+            &cwd(),
+        );
+        assert!(
+            matches!(v, Verdict::Ask { .. }),
+            "强制推送在完全访问下也要问，得到 {v:?}"
+        );
+    }
+
+    #[test]
+    fn confirm_mode_still_asks_for_a_relative_path_write() {
+        // 位置不再"升级"，但该问的还是要问：Confirm 下 L1 本来就问。
+        let p = policy();
+        let v = p.evaluate(
+            &spec("fs_write", Risk::Reversible),
+            &serde_json::json!({"path": "src/main.rs", "content": "x"}),
+            Mode::Confirm,
+            &cwd(),
+        );
+        assert!(matches!(v, Verdict::Ask { .. }), "得到 {v:?}");
     }
 
     #[test]
@@ -281,6 +367,7 @@ mod tests {
             &spec("fs_write", Risk::Reversible),
             &serde_json::json!({"path": "/tmp/zex-probe.txt"}),
             Mode::AutoEdit,
+            &cwd(),
         );
         assert!(v.is_allow(), "得到 {v:?}");
     }
@@ -292,6 +379,7 @@ mod tests {
             &spec("fs_write", Risk::Reversible),
             &serde_json::json!({"path": "/usr/local/bin/zex"}),
             Mode::Confirm,
+            &cwd(),
         );
         assert!(matches!(v, Verdict::Deny { .. }), "应为 Deny，实际 {v:?}");
     }
@@ -303,6 +391,7 @@ mod tests {
             &spec("fs_read", Risk::ReadOnly),
             &serde_json::json!({}),
             Mode::Confirm,
+            &cwd(),
         );
         assert!(v.is_allow());
         assert!(!v.needs_snapshot());
@@ -316,6 +405,7 @@ mod tests {
             &spec("fs_write", Risk::Reversible),
             &serde_json::json!({}),
             Mode::AutoEdit,
+            &cwd(),
         );
         assert!(v.is_allow());
         assert!(v.needs_snapshot());
@@ -329,6 +419,7 @@ mod tests {
             &spec("fs_write", Risk::Reversible),
             &serde_json::json!({}),
             Mode::Confirm,
+            &cwd(),
         );
         assert!(matches!(v, Verdict::Ask { .. }), "得到 {v:?}");
     }
@@ -339,12 +430,12 @@ mod tests {
         let p = policy();
         // L0：任何模式都放行
         for m in Mode::all() {
-            let v = p.evaluate(&spec("fs_read", Risk::ReadOnly), &serde_json::json!({}), m);
+            let v = p.evaluate(&spec("fs_read", Risk::ReadOnly), &serde_json::json!({}), m, &cwd());
             assert!(v.is_allow(), "{m:?} 下 L0 应放行，得到 {v:?}");
         }
         // L1：只有 Confirm 会问
         for m in Mode::all() {
-            let v = p.evaluate(&spec("fs_write", Risk::Reversible), &serde_json::json!({}), m);
+            let v = p.evaluate(&spec("fs_write", Risk::Reversible), &serde_json::json!({}), m, &cwd());
             match m {
                 Mode::Confirm => assert!(matches!(v, Verdict::Ask { .. }), "{m:?}"),
                 Mode::Plan => assert!(matches!(v, Verdict::Deny { .. }), "{m:?}"),
@@ -357,6 +448,7 @@ mod tests {
                 &spec("shell", Risk::Impactful),
                 &serde_json::json!({"command": "echo hi"}),
                 m,
+                &cwd(),
             );
             match m {
                 Mode::FullAccess => assert!(v.is_allow(), "完全访问下 L2 应放行，得到 {v:?}"),
@@ -379,6 +471,7 @@ mod tests {
                 &spec("shell", Risk::Destructive),
                 &serde_json::json!({"command": "true"}),
                 m,
+                &cwd(),
             );
             match m {
                 Mode::Plan => assert!(matches!(v, Verdict::Deny { .. }), "{m:?}"),
@@ -404,6 +497,7 @@ mod tests {
             &spec("shell", Risk::Impactful),
             &serde_json::json!({"command": "echo hi"}),
             Mode::Confirm,
+            &cwd(),
         );
         assert!(matches!(
             v,
@@ -422,6 +516,7 @@ mod tests {
             &spec("shell", Risk::Destructive),
             &serde_json::json!({"command": "mkfs.ext4 /dev/sda"}),
             Mode::Confirm,
+            &cwd(),
         );
         match v {
             Verdict::Deny { .. } => {} // 也可能被硬 Deny 拦掉
@@ -444,6 +539,7 @@ mod tests {
             &spec("fs_write", Risk::Reversible),
             &serde_json::json!({}),
             Mode::Plan,
+            &cwd(),
         );
         assert!(matches!(v, Verdict::Deny { .. }));
     }
@@ -455,6 +551,7 @@ mod tests {
             &spec("fs_read", Risk::ReadOnly),
             &serde_json::json!({}),
             Mode::Plan,
+            &cwd(),
         );
         assert!(v.is_allow());
     }
@@ -470,6 +567,7 @@ mod tests {
             &spec("shell", Risk::Impactful),
             &serde_json::json!({"command": "git status"}),
             Mode::Confirm,
+            &cwd(),
         );
         match v {
             Verdict::Allow {
@@ -491,6 +589,7 @@ mod tests {
             &spec("shell", Risk::Impactful),
             &serde_json::json!({"command": "rm -rf build"}),
             Mode::Confirm,
+            &cwd(),
         );
         assert!(matches!(v, Verdict::Ask { .. }));
     }
@@ -507,6 +606,7 @@ mod tests {
             &spec("fs_write", Risk::Reversible),
             &serde_json::json!({"path": "/home/u/.zex/.env", "content": "x"}),
             Mode::Confirm,
+            &cwd(),
         );
         assert!(
             matches!(v, Verdict::Deny { .. }),
@@ -523,6 +623,7 @@ mod tests {
             &spec("fs_write", Risk::Reversible),
             &serde_json::json!({"path": "/srv/data/x.txt"}),
             Mode::Plan,
+            &cwd(),
         );
         assert!(
             matches!(v, Verdict::Deny { .. }),
@@ -542,6 +643,7 @@ mod tests {
             &spec("fs_write", Risk::Reversible),
             &serde_json::json!({"path": "a.txt"}),
             Mode::Plan,
+            &cwd(),
         );
         assert!(
             matches!(v, Verdict::Deny { .. }),
@@ -558,6 +660,7 @@ mod tests {
             &spec("fs_write", Risk::Reversible),
             &serde_json::json!({"path": "/tmp/x.txt"}),
             Mode::Confirm,
+            &cwd(),
         );
         assert!(
             matches!(v, Verdict::Ask { double_confirm: false, .. }),
