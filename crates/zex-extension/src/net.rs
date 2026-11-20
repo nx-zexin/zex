@@ -571,7 +571,7 @@ async fn http_on(inner: &Arc<Inner>, req: HttpRequest) -> Result<HttpResponse, S
 }
 
 async fn tcp_connect_on(inner: &Arc<Inner>, host: &str, port: u16) -> Result<ConnId, String> {
-    guard_now(inner, &host, port)?;
+    guard_now(inner, host, port)?;
     inner.ensure_room().await?;
 
     let stream = tokio::net::TcpStream::connect((host, port))

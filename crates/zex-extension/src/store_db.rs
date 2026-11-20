@@ -234,11 +234,7 @@ pub fn query(
     params: &[JsValue],
 ) -> Result<Vec<Vec<(String, JsValue)>>, String> {
     let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
-    let names: Vec<String> = stmt
-        .column_names()
-        .into_iter()
-        .map(str::to_string)
-        .collect();
+    let names: Vec<String> = stmt.column_names().map(str::to_string).collect();
     let args = bindings(params);
     let mut rows = stmt
         .query(rusqlite::params_from_iter(args))

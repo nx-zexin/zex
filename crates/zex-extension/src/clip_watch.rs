@@ -331,7 +331,7 @@ fn watch_loop() -> std::result::Result<(), String> {
         let image_mime = IMAGE_PREFERENCE
             .iter()
             .find(|m| has(m))
-            .map(|m| *m)
+            .copied()
             .or_else(|| {
                 // 优先级表里都没有时，退到"排序后取第一个"—— 至少是确定的
                 let mut all: Vec<&str> = types
@@ -366,7 +366,7 @@ fn watch_loop() -> std::result::Result<(), String> {
         }
 
         // ---- 文本 ----
-        let text_mime = TEXT_PREFERENCE.iter().find(|m| has(m)).map(|m| *m);
+        let text_mime = TEXT_PREFERENCE.iter().find(|m| has(m)).copied();
         if let Some(mime) = text_mime {
             if let Some(bytes) = read_mime(mime) {
                 if let Ok(text) = String::from_utf8(bytes) {
