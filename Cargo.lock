@@ -10820,6 +10820,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "tracing",
+ "wl-clipboard-rs",
  "zex-core",
 ]
 
@@ -10889,6 +10890,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.21",
  "zex-core",
 ]

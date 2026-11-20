@@ -140,11 +140,32 @@ impl SkillRegistry {
             Err(_) => return out,
         };
 
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("md") {
-                continue;
-            }
+        // 先收集路径再排序，而不是边读边解析。
+        //
+        // 两个理由，都是"同一份目录在不同机器上要给出同一个结果"：
+        //
+        // 1. **跳点文件。** 内置技能升级时会在旁边留一份
+        //    `.bundled-backup-<name>.md`，它是同一个技能的旧版本（同样的
+        //    `name`、旧的 `description`）。读进来就成了两个同名技能，
+        //    去重时留下哪个全看目录顺序 —— 表现是"提示词里的技能描述
+        //    忽新忽旧"。
+        // 2. **排序。** `read_dir` 的顺序由文件系统决定，ext4 和 APFS 不一样。
+        //    同名去重"保留第一个"这条规则要可复现，输入就得是排好序的。
+        let mut paths: Vec<std::path::PathBuf> = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("md"))
+            .filter(|path| {
+                // 点文件一律跳过：备份、编辑器交换文件、隐藏笔记都不是技能
+                !path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with('.'))
+            })
+            .collect();
+        paths.sort();
+
+        for path in paths {
             match std::fs::read_to_string(&path) {
                 Ok(text) => out.skills.push(Skill::parse(&text, path)),
                 Err(e) => out.warnings.push(format!("{}: {e}", path.display())),
@@ -247,6 +268,64 @@ impl zex_core::tool::Tool for LoadSkill {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 写一个技能文件。
+    fn write_skill(dir: &Path, file: &str, name: &str, desc: &str) {
+        std::fs::write(
+            dir.join(file),
+            format!("---\nname: {name}\ndescription: {desc}\n---\n\n正文\n"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn load_skips_dotfiles() {
+        // 回归：内置技能升级会留下 `.bundled-backup-x.md`（同名、旧描述），
+        // 早先它也会被当成技能读进来，去重时留下哪个全看目录顺序 ——
+        // 表现是提示词里的技能描述忽新忽旧。
+        let dir = tempfile::tempdir().unwrap();
+        write_skill(dir.path(), "x.md", "x", "新版描述");
+        write_skill(dir.path(), ".bundled-backup-x.md", "x", "旧版描述");
+        write_skill(dir.path(), ".x.md.swp", "x", "编辑器交换文件");
+        std::fs::write(dir.path(), "").ok();
+
+        let reg = SkillRegistry::load(dir.path());
+        assert_eq!(reg.all().len(), 1, "只该留下真文件：{:?}", reg.all());
+        assert_eq!(reg.all()[0].description, "新版描述");
+    }
+
+    #[test]
+    fn load_ignores_non_markdown() {
+        let dir = tempfile::tempdir().unwrap();
+        write_skill(dir.path(), "a.md", "a", "A");
+        std::fs::write(dir.path().join("notes.txt"), "不是技能").unwrap();
+        std::fs::create_dir(dir.path().join("sub.md")).unwrap();
+
+        let reg = SkillRegistry::load(dir.path());
+        assert_eq!(reg.all().len(), 1);
+    }
+
+    #[test]
+    fn load_is_sorted_and_deduplicated_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        // 文件名顺序和技能名顺序故意不一致，验证按 name 排
+        write_skill(dir.path(), "z.md", "aaa", "先");
+        write_skill(dir.path(), "a.md", "zzz", "后");
+        write_skill(dir.path(), "dup.md", "aaa", "重复的");
+
+        let reg = SkillRegistry::load(dir.path());
+        let names: Vec<_> = reg.all().iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["aaa", "zzz"]);
+        // 同名保留文件名排序后的第一个（a.md 之前是 dup.md? 不 —— dup < z，
+        // 所以 aaa 这条应该来自 dup.md）
+        assert_eq!(reg.all()[0].description, "重复的");
+    }
+
+    #[test]
+    fn load_of_a_missing_directory_is_empty_not_an_error() {
+        let reg = SkillRegistry::load(Path::new("/nonexistent/zex-skills"));
+        assert!(reg.all().is_empty());
+    }
 
     #[test]
     fn parses_frontmatter() {
