@@ -556,13 +556,6 @@ mod tests {
 mod capability_tests {
     use super::*;
 
-    const WITH_CAPS: &str = r#"{
-      "demo": {
-        "id": "demo", "name": "D",
-        "models": {}
-      }
-    }"#;
-
     fn parse(caps_json: &str) -> CapabilityRequest {
         parse_request(&format!(
             r#"{{"id":"x","name":"X","capabilities":{caps_json}}}"#

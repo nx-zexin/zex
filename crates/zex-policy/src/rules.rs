@@ -154,7 +154,7 @@ pub fn escalate(tool: &str, args: &Value, base: Risk, cwd: &std::path::Path) -> 
 /// | `../../x`、`a/../b` | 词法消解，不要求文件存在 |
 /// | `\\?\C:\x`（Windows canonicalize 的产物） | 剥掉 verbatim 前缀 |
 fn resolve_for_policy(raw: &str, cwd: &std::path::Path) -> String {
-    use std::path::{Component, Path, PathBuf};
+    use std::path::{Component, PathBuf};
 
     let raw = raw.trim();
     let home = std::env::var_os("HOME")

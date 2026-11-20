@@ -232,10 +232,6 @@ pub fn build_agent_resuming(
     build_agent_resuming_with(cfg, cwd, Vec::new())
 }
 
-/// 同上，但额外挂上一些工具（例如 MCP 服务提供的）。
-///
-/// 单独开一个函数而不是给原函数加参数：`build_agent_resuming`
-/// 已经是 CLI / GUI 共用的稳定入口，加参数会牵动所有调用点。
 /// 所有 builder 共用的内核配置。
 ///
 /// 单独抽出来是因为踩过：CLI 那条路（`build_agent_with_team`）曾经自己
@@ -254,6 +250,10 @@ fn agent_config_for(
         .with_model_params(cfg.model_params.temperature, cfg.model_params.max_tokens)
 }
 
+/// 同上，但额外挂上一些工具（例如 MCP 服务提供的）。
+///
+/// 单独开一个函数而不是给原函数加参数：`build_agent_resuming`
+/// 已经是 CLI / GUI 共用的稳定入口，加参数会牵动所有调用点。
 pub fn build_agent_resuming_with(
     cfg: &ResolvedConfig,
     cwd: PathBuf,
