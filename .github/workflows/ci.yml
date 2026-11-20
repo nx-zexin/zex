@@ -4,6 +4,8 @@ on:
   push:
     branches: [master, main]
   pull_request:
+  # 手动触发：想立刻验证一次出包链路时用（package-windows 只在 tag / 手动时跑）
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -107,3 +109,51 @@ jobs:
             echo "::error::三平台代码里的 todo!() 在 Linux 上永远跑不到，在 Windows 上一跑就崩（docs/PLATFORM.md §3）"
             exit 1
           fi
+
+  # ─────────────────────────────────────────────────────────────
+  # Windows 发布包。
+  #
+  # 为什么在 Windows runner 上编、而不是从 Linux 交叉编译：
+  # gpui-pre + wgpu(30) + windows(0.54) 这层是 D3D12/DirectComposition/COM，
+  # ABI 上要走 MSVC 才稳；而且产物必须在 Windows 上做签名与安装验证，
+  # 交叉编译只能省掉"一台机器"，省不掉"一次真机验证"。
+  # 详见上一次讨论的结论与 docs/PLATFORM.md。
+  #
+  # 只在打 tag 或手动触发时跑：release 编译（gpui + wgpu 全量优化）
+  # 比 check 慢一个量级，PR 上没必要每次都付这笔钱。
+  # ─────────────────────────────────────────────────────────────
+  package-windows:
+    name: Windows 发布包
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    # 三平台测试全绿才出包：一个平台挂了的版本不该有安装包
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 缓存
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: windows-package
+
+      - name: 编译（release）
+        run: cargo build -p zex-app --bin zex --release
+
+      # 单个 exe 就是完整程序：图标库和内置技能都是 include_bytes!/include_str!
+      # 编进二进制的，运行期只往 ~/.zex 里写数据。所以这里不打包资源目录，
+      # 少一个"装错了版本"的失败面。
+      - name: 整理产物
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target\release\zex.exe dist\
+          Get-Item dist\zex.exe | Select-Object Name, Length
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zex-windows-x64
+          path: dist/zex.exe
+          if-no-files-found: error
