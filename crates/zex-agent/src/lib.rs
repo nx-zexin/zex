@@ -240,9 +240,29 @@ impl Agent {
         //   tool messages responding to each 'tool_call_id'
         // 所以装载完先补一遍，再让它参与任何请求。
         let mut history = history;
+        // 中断留下的半截历史：补出来的结果顺手写回库里。
+        //
+        // 不写回也能跑（下一轮发请求前还会再修），但那样**每次启动都会
+        // 再修一遍**，日志里就永远挂着一行"历史不完整，已补齐" —— 看着
+        // 像每次都在坏。只在安全时写：被修的那条 assistant 必须是库里
+        // 最后一条（中断的常态），这样补出来的结果就是新尾巴。
+        let before_len = history.len();
+        let tail_is_orphan = matches!(
+            history.last(),
+            Some(Message::Assistant { tool_calls, .. }) if !tool_calls.is_empty()
+        );
         let healed = crate::compress::heal_tool_pairs(&mut history);
         if healed > 0 {
             tracing::warn!(healed, "历史里的工具调用配对不完整，已补齐");
+            if tail_is_orphan {
+                for msg in &history[before_len..] {
+                    let tokens = context::estimate_message_tokens(msg);
+                    if let Err(e) = store.append_message(&session, msg, tokens) {
+                        tracing::warn!(error = %e, "补出来的工具结果没能写回库");
+                        break;
+                    }
+                }
+            }
         }
         // 工具结果预算跟着模型的输出上限走。放在这个**唯一的**装配点上，
         // 而不是各个 builder 里：`cfg.max_tokens` 有四个写入点（构造默认值、
@@ -1525,9 +1545,16 @@ mod tests {
             .unwrap();
         // 结果没来得及写
 
-        let resumed = Agent::resume(test_cfg(), vec![], store, sid).unwrap();
+        let resumed = Agent::resume(test_cfg(), vec![], store.clone(), sid.clone()).unwrap();
         let h = resumed.history();
         assert_eq!(h.len(), 3, "缺的那条结果应该被补上：{h:?}");
+        // 补出来的那条要落库，否则每次启动都要再修一遍
+        let persisted = store.load_messages(&sid).unwrap();
+        assert_eq!(persisted.len(), 3, "库里也该是三条：{persisted:?}");
+        assert!(matches!(
+            &persisted[2].message,
+            Message::Tool { is_error: true, .. }
+        ));
         match &h[2] {
             Message::Tool { call_id, is_error, content, .. } => {
                 assert_eq!(call_id.to_string(), "call-1");
