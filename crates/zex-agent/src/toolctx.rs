@@ -204,8 +204,22 @@ mod tests {
 
     #[test]
     fn absolute_path_is_kept() {
-        let p = resolve_path(Path::new("/home/u"), "/etc/hosts");
-        assert_eq!(p, PathBuf::from("/etc/hosts"));
+        // 只钉意图：给了绝对路径就不再拼到 cwd 下面。
+        //
+        // 不能断言字面值 —— resolve_path 的第 4 条规则是"存在就解符号链接"，
+        // 而 macOS 上 `/etc` 正是 `/private/etc` 的链接，于是结果会变成
+        // `/private/etc/hosts`。那是**正确**行为，测试不该把它钉死。
+        let (cwd, abs) = if cfg!(windows) {
+            (
+                PathBuf::from(r"C:\proj"),
+                PathBuf::from(r"C:\Windows\hosts"),
+            )
+        } else {
+            (PathBuf::from("/home/u"), PathBuf::from("/etc/hosts"))
+        };
+        let p = resolve_path(&cwd, &abs.to_string_lossy());
+        assert!(!p.starts_with(&cwd), "绝对路径被拼到了 cwd 下：{p:?}");
+        assert_eq!(p.file_name().and_then(|n| n.to_str()), Some("hosts"));
     }
 
     #[test]
@@ -217,8 +231,16 @@ mod tests {
 
     #[test]
     fn parent_dir_cannot_escape_root() {
-        let p = resolve_path(Path::new("/"), "../../..");
-        assert_eq!(p, PathBuf::from("/"));
+        // `..` 爬到根就停住：根没有父目录。
+        //
+        // 起点用"当前目录所在盘的根"而不是 `Path::new("/")`：后者在 Windows
+        // 上是个没有盘符的相对路径，语义和 Linux 完全不同。
+        let root = std::env::current_dir()
+            .ok()
+            .and_then(|d| d.ancestors().last().map(Path::to_path_buf))
+            .unwrap_or_else(|| PathBuf::from("/"));
+        let p = resolve_path(&root, "../../..");
+        assert!(p.parent().is_none(), "`..` 越界后仍有父目录：{p:?}");
     }
 
     #[test]
