@@ -12,6 +12,8 @@ pub mod config;
 pub mod ext_logs;
 pub mod ext_tools;
 pub mod models_dev;
+/// 自绘标题栏的窗口动作（拖动 / 最大化还原）。Windows 上绕过 gpui 的两个缺陷。
+pub mod window_ops;
 
 use std::path::PathBuf;
 

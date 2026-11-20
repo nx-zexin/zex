@@ -10759,6 +10759,7 @@ version = "0.1.2"
 dependencies = [
  "async-trait",
  "gpui-kit",
+ "raw-window-handle",
  "reqwest",
  "schemars",
  "serde",
@@ -10767,6 +10768,7 @@ dependencies = [
  "tracing",
  "tracing-core",
  "tracing-subscriber",
+ "windows 0.62.2",
  "zex-agent",
  "zex-core",
  "zex-extension",

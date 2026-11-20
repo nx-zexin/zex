@@ -43,6 +43,17 @@ async-trait = "0.1"
 # 系统剪贴板。选 arboard 而不是调 xclip/wl-paste/pbpaste：
 # 那些命令在各平台名字不同、图标发行版里也不一定装了，
 # 而 arboard 在 X11 / Wayland / macOS / Windows 上都自己实现。
+# 自绘标题栏在 Windows 上要直接调 Win32（gpui 的 start_window_move
+# 在 Windows 是空函数、zoom 不会还原）。版本跟着 gpui-pre-windows 走 0.62，
+# 免得同一棵树里再多一份 windows。
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+] }
+# 从 gpui 的 Window 里取 HWND。gpui 用的就是这个版本。
+raw-window-handle = "0.6"
+
 arboard = { version = "3", default-features = false, features = [
     "wayland-data-control",
 ] }

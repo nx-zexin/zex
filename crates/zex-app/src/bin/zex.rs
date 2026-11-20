@@ -4547,10 +4547,12 @@ impl ChatView {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|_this, ev: &MouseDownEvent, window, cx| {
+                    // Windows 上必须走 window_ops：gpui 的
+                    // start_window_move 在那边是空函数，zoom 不会还原。
                     if ev.click_count == 2 {
-                        window.zoom_window();
+                        zex_app::window_ops::toggle_maximize(window);
                     } else {
-                        window.start_window_move();
+                        zex_app::window_ops::start_drag(window);
                     }
                     cx.stop_propagation();
                 }),
@@ -4640,7 +4642,7 @@ impl ChatView {
                         IconName::Square
                     },
                     false,
-                    |w| w.zoom_window(),
+                    zex_app::window_ops::toggle_maximize,
                     cx,
                 ))
                 .child(btn(IconName::Close, true, |w| w.remove_window(), cx));
@@ -8255,6 +8257,50 @@ fn load_sessions(store: &zex_store::Store) -> Vec<SessionItem> {
         .collect()
 }
 
+/// 应用目录之外，界面上的图片只有两个来源：
+///
+/// - `gpui-kit` 内置的 Lucide 图标库（`icons/*.svg`）；
+/// - 剪贴板缩略图（`clip-thumbs/*`），落在 `~/.zex/state/clip-thumbs`。
+///
+/// 为什么要自己写一个：`gpui_kit::assets::AllAssets` 是一个编译进二进制的
+/// 静态目录，`image()` 能画的只有里面那些图标。而剪贴板图片是运行期才出现的
+/// 文件，必须先有一个能从磁盘读的资产源，脚本里的
+/// `image("clip-thumbs/xxx.png")` 才有东西可取。
+///
+/// 前缀映射是这一个 AssetSource 的全部职责，所以校验只做一件必要的事：
+/// 名字里不许出现路径分隔或 `..`，免得脚本借它读到缩略图目录以外的文件。
+struct ZexAssets;
+
+impl AssetSource for ZexAssets {
+    fn load(&self, path: &str) -> gpui_kit::Result<Option<std::borrow::Cow<'static, [u8]>>> {
+        if let Some(name) = path.strip_prefix("clip-thumbs/") {
+            let plain = !name.is_empty()
+                && !name.contains('/')
+                && !name.contains('\\')
+                && !name.contains("..")
+                && !name.starts_with('.');
+            if plain {
+                let file = zex_extension::clip_image::dir().join(name);
+                match std::fs::read(&file) {
+                    Ok(bytes) => return Ok(Some(std::borrow::Cow::Owned(bytes))),
+                    // 文件不在就是"没有这个资产"，交给下面的内置库再试一次：
+                    // 返回 Err 会让整帧渲染失败，而一张缩略图被清理掉
+                    // 不该有这个后果。
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        tracing::warn!(path = %file.display(), error = %e, "读取剪贴板缩略图失败");
+                    }
+                }
+            }
+        }
+        gpui_kit::assets::AllAssets.load(path)
+    }
+
+    fn list(&self, path: &str) -> gpui_kit::Result<Vec<gpui_kit::SharedString>> {
+        gpui_kit::assets::AllAssets.list(path)
+    }
+}
+
 fn main() {
     // 两层：一层给人看的终端输出（受 RUST_LOG 控制），
     // 一层给模型看的扩展日志缓冲（不受 RUST_LOG 控制）。
@@ -8318,7 +8364,7 @@ fn main() {
     let cmd_tx = handles.cmd_tx.clone();
     let mut event_rx = handles.event_rx;
 
-    gpui_kit::application().with_assets(gpui_kit::assets::AllAssets).run(move |cx| {
+    gpui_kit::application().with_assets(ZexAssets).run(move |cx| {
         gpui_kit::init(cx);
         // 设计稿是浅色主题
         gpui_kit::component::Theme::change(
