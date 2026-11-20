@@ -59,10 +59,20 @@ mod tests {
 
         let text = std::fs::read_to_string(&path).unwrap();
         // 三个模块各要有自己的声明块：少了任何一个，模型就会猜错 import 来源
-        assert!(text.contains("declare module \"gpui-kit\""), "缺 gpui-kit 声明");
-        assert!(text.contains("declare module \"gpui-base\""), "缺 gpui-base 声明");
+        assert!(
+            text.contains("declare module \"gpui-kit\""),
+            "缺 gpui-kit 声明"
+        );
+        assert!(
+            text.contains("declare module \"gpui-base\""),
+            "缺 gpui-base 声明"
+        );
         // 文件得足够大：两万多行的 API 清单，几百字节说明生成器没跑起来
-        assert!(text.len() > 100_000, "声明文件太小，只有 {} 字节", text.len());
+        assert!(
+            text.len() > 100_000,
+            "声明文件太小，只有 {} 字节",
+            text.len()
+        );
         // 关键 API 得在里面，否则模型查不到就还是会猜
         for needle in ["v_flex", "on_click", "read_from_clipboard", "View"] {
             assert!(text.contains(needle), "声明里找不到 `{needle}`");

@@ -409,10 +409,7 @@ mod tests {
     use super::*;
 
     fn temp_root(tag: &str) -> PathBuf {
-        let p = std::env::temp_dir().join(format!(
-            "zex-ext-test-{tag}-{}",
-            std::process::id()
-        ));
+        let p = std::env::temp_dir().join(format!("zex-ext-test-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
         p
@@ -472,7 +469,12 @@ mod tests {
     #[test]
     fn rejects_entry_escaping_directory() {
         let root = temp_root("escape");
-        write_ext(&root, "evil", r#"{"id":"evil","name":"E","entry":"../../etc/x.js"}"#, "");
+        write_ext(
+            &root,
+            "evil",
+            r#"{"id":"evil","name":"E","entry":"../../etc/x.js"}"#,
+            "",
+        );
         assert!(scan(&root).is_empty(), "逃出目录的 entry 必须被拒");
     }
 
@@ -543,7 +545,10 @@ mod tests {
         write_ext(&root, "zz", r#"{"id":"b","name":"B"}"#, "");
         write_ext(&root, "aa", r#"{"id":"a","name":"A"}"#, "");
         let list = scan(&root);
-        assert_eq!(list.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), ["a", "b"]);
+        assert_eq!(
+            list.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+            ["a", "b"]
+        );
     }
 }
 
@@ -573,8 +578,10 @@ mod capability_tests {
 
     #[test]
     fn reads_fs_and_network_lists() {
-        let r = parse(r#"{"fs":{"read":["${dataDir}","/tmp/a"],"write":["${dataDir}"]},
-                          "network":{"hosts":["api.example.com"]}}"#);
+        let r = parse(
+            r#"{"fs":{"read":["${dataDir}","/tmp/a"],"write":["${dataDir}"]},
+                          "network":{"hosts":["api.example.com"]}}"#,
+        );
         assert_eq!(r.fs_read.len(), 2);
         assert_eq!(r.fs_write.len(), 1);
         assert_eq!(r.network_hosts, ["api.example.com"]);
@@ -585,7 +592,10 @@ mod capability_tests {
     #[test]
     fn execute_accepts_list_and_star() {
         let listed = parse(r#"{"fs":{"execute":["git","rg"]}}"#);
-        assert_eq!(listed.execute.as_deref(), Some(&["git".to_string(), "rg".to_string()][..]));
+        assert_eq!(
+            listed.execute.as_deref(),
+            Some(&["git".to_string(), "rg".to_string()][..])
+        );
         assert!(listed.broad().is_empty());
 
         let star = parse(r#"{"fs":{"execute":"*"}}"#);
@@ -596,8 +606,14 @@ mod capability_tests {
     fn flags_home_directory_and_any_host_as_broad() {
         let r = parse(r#"{"fs":{"read":["${homeDir}"]},"network":{"hosts":["*"]}}"#);
         let broad = r.broad();
-        assert!(broad.iter().any(|b| b.contains("家目录")), "拿到：{broad:?}");
-        assert!(broad.iter().any(|b| b.contains("任意网络主机")), "拿到：{broad:?}");
+        assert!(
+            broad.iter().any(|b| b.contains("家目录")),
+            "拿到：{broad:?}"
+        );
+        assert!(
+            broad.iter().any(|b| b.contains("任意网络主机")),
+            "拿到：{broad:?}"
+        );
     }
 
     #[test]
@@ -605,7 +621,10 @@ mod capability_tests {
         assert_eq!(CapabilityRequest::default().summary(), "");
         let r = parse(r#"{"fs":{"read":["a"],"write":["b"]},"clipboard":{"read":true}}"#);
         let s = r.summary();
-        assert!(s.contains("读 1 处") && s.contains("写 1 处") && s.contains("剪贴板"), "{s}");
+        assert!(
+            s.contains("读 1 处") && s.contains("写 1 处") && s.contains("剪贴板"),
+            "{s}"
+        );
     }
 
     #[test]

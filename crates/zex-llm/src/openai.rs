@@ -270,20 +270,12 @@ pub async fn stream_chat(
 
         loop {
             // 空闲超时：服务端挂住连接不发数据时，光靠 read_timeout 兜不住
-            let next = match tokio::time::timeout(
-                crate::STREAM_IDLE_TIMEOUT,
-                stream.next(),
-            )
-            .await
-            {
+            let next = match tokio::time::timeout(crate::STREAM_IDLE_TIMEOUT, stream.next()).await {
                 Ok(v) => v,
                 Err(_) => {
                     let _ = tx
                         .send(Err(Error::llm_retryable(
-                            format!(
-                                "服务端 {:?} 没有任何响应",
-                                crate::STREAM_IDLE_TIMEOUT
-                            ),
+                            format!("服务端 {:?} 没有任何响应", crate::STREAM_IDLE_TIMEOUT),
                             None,
                         )))
                         .await;
@@ -512,6 +504,9 @@ mod thinking_body_tests {
     #[test]
     fn off_omits_reasoning_field() {
         let b = body(ThinkingEffort::Off);
-        assert!(b.get("reasoning_effort").is_none(), "选不思考时不应发该字段");
+        assert!(
+            b.get("reasoning_effort").is_none(),
+            "选不思考时不应发该字段"
+        );
     }
 }

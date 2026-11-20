@@ -82,7 +82,8 @@ impl CheckReport {
 /// 那里看不到 UI 视图；把表做成全局，两边都能拿到同一份，
 /// 也不必为了这一件事给所有构造函数加参数。
 fn pending() -> &'static Mutex<HashMap<String, oneshot::Sender<CheckReport>>> {
-    static PENDING: OnceLock<Mutex<HashMap<String, oneshot::Sender<CheckReport>>>> = OnceLock::new();
+    static PENDING: OnceLock<Mutex<HashMap<String, oneshot::Sender<CheckReport>>>> =
+        OnceLock::new();
     PENDING.get_or_init(|| Mutex::new(HashMap::new()))
 }
 

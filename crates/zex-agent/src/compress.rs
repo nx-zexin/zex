@@ -16,7 +16,7 @@
 
 use zex_core::{Message, ToolCallId};
 
-use crate::context::{estimate_history_tokens, ContextBudget};
+use crate::context::{ContextBudget, estimate_history_tokens};
 
 /// 压缩计划的种类。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,7 +50,11 @@ pub struct Compressor {
 impl Compressor {
     /// 新建。
     pub fn new(budget: ContextBudget) -> Self {
-        Compressor { budget, summary: None, turns_since_compress: u32::MAX }
+        Compressor {
+            budget,
+            summary: None,
+            turns_since_compress: u32::MAX,
+        }
     }
 
     /// 当前摘要。
@@ -128,8 +132,7 @@ impl Compressor {
                     if before <= max {
                         return None;
                     }
-                    let after =
-                        crate::context::estimate_tokens(&truncate_middle(content, max));
+                    let after = crate::context::estimate_tokens(&truncate_middle(content, max));
                     (after < before).then_some(i)
                 }
                 _ => None,
@@ -186,14 +189,16 @@ impl Compressor {
     }
 
     /// 应用截断计划（纯函数）。
-    pub fn apply_shrink(
-        messages: &[Message],
-        indices: &[usize],
-        budget: usize,
-    ) -> Vec<Message> {
+    pub fn apply_shrink(messages: &[Message], indices: &[usize], budget: usize) -> Vec<Message> {
         let mut out = messages.to_vec();
         for &i in indices {
-            if let Message::Tool { call_id, name, content, is_error } = &out[i] {
+            if let Message::Tool {
+                call_id,
+                name,
+                content,
+                is_error,
+            } = &out[i]
+            {
                 out[i] = Message::Tool {
                     call_id: call_id.clone(),
                     name: name.clone(),
@@ -337,7 +342,10 @@ pub fn heal_tool_pairs(messages: &mut Vec<Message>) -> usize {
 
     while i < messages.len() {
         match &messages[i] {
-            Message::Assistant { content, tool_calls } if !tool_calls.is_empty() => {
+            Message::Assistant {
+                content,
+                tool_calls,
+            } if !tool_calls.is_empty() => {
                 let content = content.clone();
                 let calls = tool_calls.clone();
 
@@ -394,7 +402,10 @@ pub fn heal_tool_pairs(messages: &mut Vec<Message>) -> usize {
                 // 不认识任何调用的结果（上一轮被砍掉的残留）直接丢
                 healed += used.iter().filter(|u| !**u).count();
 
-                out.push(Message::Assistant { content, tool_calls: calls });
+                out.push(Message::Assistant {
+                    content,
+                    tool_calls: calls,
+                });
                 out.extend(ordered);
                 i = j;
             }
@@ -492,7 +503,10 @@ mod tests {
     use zex_core::{Part, ToolCall, ToolCallId};
 
     fn budget() -> ContextBudget {
-        ContextBudget { min_messages: 2, ..Default::default() }
+        ContextBudget {
+            min_messages: 2,
+            ..Default::default()
+        }
     }
 
     fn call(id: &str) -> zex_core::ToolCall {
@@ -504,7 +518,10 @@ mod tests {
     }
 
     fn asst(text: &str) -> Message {
-        Message::Assistant { content: vec![Part::text(text)], tool_calls: vec![] }
+        Message::Assistant {
+            content: vec![Part::text(text)],
+            tool_calls: vec![],
+        }
     }
 
     #[test]
@@ -562,7 +579,9 @@ mod tests {
 
     #[test]
     fn shrink_keeps_head_and_tail() {
-        let big: String = (0..10_000).map(|i| char::from(b'a' + (i % 26) as u8)).collect();
+        let big: String = (0..10_000)
+            .map(|i| char::from(b'a' + (i % 26) as u8))
+            .collect();
         let msgs = vec![Message::Tool {
             call_id: ToolCallId::new("c"),
             name: None,
@@ -591,10 +610,7 @@ mod tests {
         let max = ContextBudget::default().tool_result_max_tokens;
         let out = Compressor::apply_shrink(&msgs, &[0], max);
         let after = crate::context::estimate_tokens(&out[0].text());
-        assert!(
-            after <= max,
-            "截断后应落在阈值内，实际 {after} > {max}"
-        );
+        assert!(after <= max, "截断后应落在阈值内，实际 {after} > {max}");
     }
 
     #[test]
@@ -606,14 +622,16 @@ mod tests {
             ..Default::default()
         });
         let big: String = "中".repeat(8000);
-        let mut msgs = vec![
-            Message::User {
-                content: vec![zex_core::Part::Text { text: "开始".into() }],
-            },
-        ];
+        let mut msgs = vec![Message::User {
+            content: vec![zex_core::Part::Text {
+                text: "开始".into(),
+            }],
+        }];
         for i in 0..4 {
             msgs.push(Message::Assistant {
-                content: vec![zex_core::Part::Text { text: format!("第 {i} 步") }],
+                content: vec![zex_core::Part::Text {
+                    text: format!("第 {i} 步"),
+                }],
                 tool_calls: vec![],
             });
         }
@@ -662,7 +680,12 @@ mod tests {
         assert_eq!(healed, 1, "只该补一条");
         assert_eq!(msgs.len(), 4);
         match &msgs[3] {
-            Message::Tool { call_id, is_error, content, .. } => {
+            Message::Tool {
+                call_id,
+                is_error,
+                content,
+                ..
+            } => {
                 assert_eq!(*call_id, ToolCallId::new("b"));
                 assert!(is_error, "补的这条必须标成失败，否则模型以为它跑过了");
                 assert!(content.contains("未执行"), "要写明原因：{content}");
@@ -745,14 +768,20 @@ mod tests {
     fn heal_is_a_no_op_on_a_healthy_history() {
         let mut msgs = vec![
             Message::user("跑一下"),
-            Message::Assistant { content: vec![], tool_calls: vec![call("a")] },
+            Message::Assistant {
+                content: vec![],
+                tool_calls: vec![call("a")],
+            },
             Message::Tool {
                 call_id: ToolCallId::new("a"),
                 name: None,
                 content: "结果".into(),
                 is_error: false,
             },
-            Message::Assistant { content: vec![Part::text("好了")], tool_calls: vec![] },
+            Message::Assistant {
+                content: vec![Part::text("好了")],
+                tool_calls: vec![],
+            },
         ];
         let before = msgs.clone();
         assert_eq!(heal_tool_pairs(&mut msgs), 0);
@@ -768,8 +797,12 @@ mod tests {
         // 造足够多的 turn 且总 token 超阈值
         let mut msgs = Vec::new();
         for i in 0..20 {
-            msgs.push(Message::user(format!("question number {i} with some padding text")));
-            msgs.push(asst(&format!("answer {i} also with padding to inflate tokens")));
+            msgs.push(Message::user(format!(
+                "question number {i} with some padding text"
+            )));
+            msgs.push(asst(&format!(
+                "answer {i} also with padding to inflate tokens"
+            )));
         }
         match c.plan(&msgs, None) {
             CompressionPlan::Summarize { drop_before, .. } => {
@@ -922,7 +955,10 @@ mod tests {
             tool_calls: vec![tool_call("gone")],
         }];
         repair_tool_pairs(&mut msgs);
-        assert!(msgs.is_empty(), "空正文且调用全被去掉的 assistant 消息应删除");
+        assert!(
+            msgs.is_empty(),
+            "空正文且调用全被去掉的 assistant 消息应删除"
+        );
     }
 
     #[test]

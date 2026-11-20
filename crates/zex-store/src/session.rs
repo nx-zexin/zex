@@ -235,10 +235,17 @@ mod tests {
         let s = Store::in_memory().unwrap();
         let ses = s.create_session("模式", "deepseek-chat", "/tmp").unwrap();
         // 新会话默认按风险确认，不是"啥都放行"
-        assert_eq!(s.get_session(&ses.id).unwrap().unwrap().mode, zex_core::RunMode::Confirm);
+        assert_eq!(
+            s.get_session(&ses.id).unwrap().unwrap().mode,
+            zex_core::RunMode::Confirm
+        );
 
-        s.set_session_mode(&ses.id, zex_core::RunMode::Plan).unwrap();
-        assert_eq!(s.get_session(&ses.id).unwrap().unwrap().mode, zex_core::RunMode::Plan);
+        s.set_session_mode(&ses.id, zex_core::RunMode::Plan)
+            .unwrap();
+        assert_eq!(
+            s.get_session(&ses.id).unwrap().unwrap().mode,
+            zex_core::RunMode::Plan
+        );
 
         // 列表查询也要带上，否则切会话时读不回来
         let listed = s.list_visible_sessions(10).unwrap();

@@ -254,11 +254,20 @@ impl zex_core::tool::Tool for LoadSkill {
         match self.registry.get(&args.name) {
             Some(s) => Ok(zex_core::tool::ToolOutput::ok(s.body.clone())),
             None => {
-                let names: Vec<&str> = self.registry.all().iter().map(|s| s.name.as_str()).collect();
+                let names: Vec<&str> = self
+                    .registry
+                    .all()
+                    .iter()
+                    .map(|s| s.name.as_str())
+                    .collect();
                 Ok(zex_core::tool::ToolOutput::err(if names.is_empty() {
                     "当前没有任何技能。".to_string()
                 } else {
-                    format!("没有 `{}` 这个技能。可用的有：{}", args.name, names.join(", "))
+                    format!(
+                        "没有 `{}` 这个技能。可用的有：{}",
+                        args.name,
+                        names.join(", ")
+                    )
                 }))
             }
         }

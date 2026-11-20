@@ -24,8 +24,8 @@
 
 use std::collections::HashMap;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -241,11 +241,7 @@ impl McpClient {
     }
 
     /// 调用一个工具。
-    pub async fn call_tool(
-        &self,
-        tool: &str,
-        args: serde_json::Value,
-    ) -> Result<CallResult> {
+    pub async fn call_tool(&self, tool: &str, args: serde_json::Value) -> Result<CallResult> {
         let result = self
             .request(
                 "tools/call",
@@ -334,16 +330,12 @@ impl McpClient {
                         .to_string(),
                 });
             }
-            return Ok(v
-                .get("result")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null));
+            return Ok(v.get("result").cloned().unwrap_or(serde_json::Value::Null));
         }
     }
 
     async fn send_raw(&self, msg: &serde_json::Value) -> Result<()> {
-        let mut line =
-            serde_json::to_string(msg).map_err(|e| Error::Protocol(e.to_string()))?;
+        let mut line = serde_json::to_string(msg).map_err(|e| Error::Protocol(e.to_string()))?;
         line.push('\n');
         let mut stdin = self.stdin.lock().await;
         stdin
@@ -371,8 +363,7 @@ mod tests {
 
     #[test]
     fn server_config_defaults() {
-        let cfg: ServerConfig =
-            serde_json::from_str(r#"{"command":"npx"}"#).expect("应能解析");
+        let cfg: ServerConfig = serde_json::from_str(r#"{"command":"npx"}"#).expect("应能解析");
         assert_eq!(cfg.command, "npx");
         assert!(cfg.args.is_empty());
         assert!(cfg.env.is_empty());
@@ -486,7 +477,11 @@ impl zex_core::tool::ErasedTool for McpTool {
 /// 单个服务失败不影响其它：某个 MCP 服务装坏了不该让整个应用起不来。
 pub fn connect_all(
     configs: &std::collections::BTreeMap<String, ServerConfig>,
-) -> (Vec<Arc<dyn zex_core::tool::ErasedTool>>, Vec<ServerStatus>, Arc<McpHub>) {
+) -> (
+    Vec<Arc<dyn zex_core::tool::ErasedTool>>,
+    Vec<ServerStatus>,
+    Arc<McpHub>,
+) {
     let hub = match McpHub::new() {
         Ok(h) => Arc::new(h),
         Err(e) => {
@@ -499,7 +494,7 @@ pub fn connect_all(
                     tool_count: 0,
                 }],
                 Arc::new(McpHub::new().expect("MCP runtime 建不起来")),
-            )
+            );
         }
     };
     let (tools, status) = hub.run(connect_inner(configs, hub.clone()));
@@ -554,7 +549,12 @@ async fn connect_inner(
 
         let n = infos.len();
         for info in &infos {
-            tools.push(Arc::new(McpTool::new(hub.clone(), client.clone(), name, info)));
+            tools.push(Arc::new(McpTool::new(
+                hub.clone(),
+                client.clone(),
+                name,
+                info,
+            )));
         }
         // client 交给工具持有，不再主动关闭：进程随应用退出
         status.push(ServerStatus {

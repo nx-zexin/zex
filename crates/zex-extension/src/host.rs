@@ -215,10 +215,7 @@ impl ExtensionHost {
     ///
     /// 不传也行：那样所有应用的网络调用都会被拒，并提示去确认。
     /// UI 启动时、以及每次用户点「允许 / 撤销」之后各同步一次。
-    pub fn set_grants(
-        &self,
-        grants: std::collections::BTreeMap<String, Vec<String>>,
-    ) {
+    pub fn set_grants(&self, grants: std::collections::BTreeMap<String, Vec<String>>) {
         if let Ok(mut guard) = self.grants.lock() {
             *guard = grants;
         }
@@ -229,10 +226,7 @@ impl ExtensionHost {
     /// 与 `set_grants` 分开传：网络是"允许连哪些主机"，剪贴板是"准不准碰"，
     /// 一个列表一个布尔，硬塞进同一个类型只会让两边都变难读。
     /// 不传等于全拒 —— 授权表没到之前，任何应用都读不到剪贴板。
-    pub fn set_clipboard_grants(
-        &self,
-        grants: std::collections::BTreeMap<String, bool>,
-    ) {
+    pub fn set_clipboard_grants(&self, grants: std::collections::BTreeMap<String, bool>) {
         if let Ok(mut guard) = self.clip_grants.lock() {
             *guard = grants;
         }
@@ -278,7 +272,13 @@ impl ExtensionHost {
     ///
     /// 由 UI 线程在 `TurnEnded` 时调用。刷新是必需的：脚本的 render
     /// 只在"描述过期"时重跑，宿主改了脚本会读的状态就得明说一次。
-    pub fn deliver(&self, session: &str, text: &str, view: &mut gpui::Entity<ScriptView>, cx: &mut gpui::App) {
+    pub fn deliver(
+        &self,
+        session: &str,
+        text: &str,
+        view: &mut gpui::Entity<ScriptView>,
+        cx: &mut gpui::App,
+    ) {
         {
             let mut held = match self.replies.lock() {
                 Ok(g) => g,
@@ -293,7 +293,11 @@ impl ExtensionHost {
     pub fn reply_for(&self, session: &str) -> String {
         match self.replies.lock() {
             Ok(g) => g.get(session).cloned().unwrap_or_default(),
-            Err(poisoned) => poisoned.into_inner().get(session).cloned().unwrap_or_default(),
+            Err(poisoned) => poisoned
+                .into_inner()
+                .get(session)
+                .cloned()
+                .unwrap_or_default(),
         }
     }
 
@@ -568,8 +572,7 @@ fn zex_module(
             let (grants, app_id) = (clip_grants.clone(), app.clone());
             move |_| {
                 ensure_clipboard(grants.as_ref(), &app_id, ClipHalf::Read)?;
-                let item = gpui_shell::with_current_app(|app| app.read_from_clipboard())
-                    .flatten();
+                let item = gpui_shell::with_current_app(|app| app.read_from_clipboard()).flatten();
                 let Some(shot) = crate::clip_image::capture(item) else {
                     return Ok(HostValue::Null);
                 };
@@ -595,7 +598,9 @@ fn zex_module(
                 let Some(bytes) = crate::clip_image::bytes_for(&path) else {
                     return Ok(HostValue::Bool(false));
                 };
-                let mime = crate::clip_image::format_of_name(&path).mime_type().to_string();
+                let mime = crate::clip_image::format_of_name(&path)
+                    .mime_type()
+                    .to_string();
 
                 // 同时给一份文本：有些程序（编辑器、聊天框）只认 text/plain，
                 // 没有它就当作"剪贴板里没有可粘贴的东西"。
@@ -637,7 +642,11 @@ fn zex_module(
         .function("reply", move |_| {
             let text = match reply_map.lock() {
                 Ok(g) => g.get(&reply_session).cloned().unwrap_or_default(),
-                Err(p) => p.into_inner().get(&reply_session).cloned().unwrap_or_default(),
+                Err(p) => p
+                    .into_inner()
+                    .get(&reply_session)
+                    .cloned()
+                    .unwrap_or_default(),
             };
             Ok(HostValue::from(text))
         })
@@ -680,7 +689,10 @@ fn zex_module(
                 let port = args.integer(1)? as u16;
                 let hub = net_hub(&registry, &app, &declared, &grants, ready.clone())?;
                 Ok(async move {
-                    let id = hub.tcp_connect(&host, port).await.map_err(HostError::from)?;
+                    let id = hub
+                        .tcp_connect(&host, port)
+                        .await
+                        .map_err(HostError::from)?;
                     Ok(HostValue::from(id))
                 })
             }
@@ -849,8 +861,7 @@ fn zex_module(
                 let conn = open_db(&dbs, &id)?;
                 Ok(async move {
                     let mut guard = lock_conn(&conn)?;
-                    let out =
-                        store_db::batch(&mut guard, &items).map_err(HostError::from)?;
+                    let out = store_db::batch(&mut guard, &items).map_err(HostError::from)?;
                     Ok(HostValue::Array(out.into_iter().map(exec_result).collect()))
                 })
             }
@@ -893,13 +904,13 @@ fn net_hub(
             return Err(HostError::from(format!(
                 "应用 `{app}` 申请访问网络（申请：{}），但还没得到确认。请在它的面板上点「允许」",
                 declared.join("、")
-            )))
+            )));
         }
         Some(list) if list.is_empty() => {
             return Err(HostError::from(format!(
                 "你拒绝过应用 `{app}` 的网络访问（申请：{}）。要改的话在「设置 → 应用」里允许",
                 declared.join("、")
-            )))
+            )));
         }
         Some(list) => crate::net::intersect(declared, &list),
     };
@@ -914,9 +925,7 @@ fn net_hub(
     let policy = crate::net::NetPolicy::parse(&effective)
         .map_err(|e| HostError::from(format!("白名单写法有误：{e}")))?;
 
-    let mut map = nets
-        .lock()
-        .map_err(|_| HostError::from("网络表中毒"))?;
+    let mut map = nets.lock().map_err(|_| HostError::from("网络表中毒"))?;
     let hub = match map.get(app) {
         Some(hub) => hub.clone(),
         None => {
@@ -933,9 +942,7 @@ fn net_hub(
 }
 
 /// `httpRequest({...})` 的参数。
-fn http_spec(
-    value: Option<&HostValue>,
-) -> std::result::Result<crate::net::HttpRequest, HostError> {
+fn http_spec(value: Option<&HostValue>) -> std::result::Result<crate::net::HttpRequest, HostError> {
     let Some(HostValue::Object(entries)) = value else {
         return Err(HostError::from("httpRequest 需要一个对象参数"));
     };
@@ -1005,10 +1012,11 @@ fn recv_value(r: crate::net::Recv) -> HostValue {
 ///
 /// 这里只接受应用 id，路径由 [`Extension::db_file`] 拼 —— 脚本给不出
 /// 第二个参数，也就没有"打开别的文件"这条路。
-fn open_db(dbs: &DbRegistry, id: &str) -> std::result::Result<Arc<Mutex<rusqlite::Connection>>, HostError> {
-    let mut map = dbs
-        .lock()
-        .map_err(|_| HostError::from("库连接表中毒"))?;
+fn open_db(
+    dbs: &DbRegistry,
+    id: &str,
+) -> std::result::Result<Arc<Mutex<rusqlite::Connection>>, HostError> {
+    let mut map = dbs.lock().map_err(|_| HostError::from("库连接表中毒"))?;
     if let Some(conn) = map.get(id) {
         return Ok(conn.clone());
     }
@@ -1067,9 +1075,7 @@ fn to_js_value(v: &HostValue) -> JsValue {
         HostValue::Str(s) => JsValue::Str(s.clone()),
         // 数组和对象存成 JSON 文本：SQLite 没有嵌套类型，而"存一坨结构化
         // 数据"是脚本最常干的事，让它自己 JSON.stringify 一遍太啰嗦
-        HostValue::Array(_) | HostValue::Object(_) => {
-            JsValue::Json(to_json(v).to_string())
-        }
+        HostValue::Array(_) | HostValue::Object(_) => JsValue::Json(to_json(v).to_string()),
     }
 }
 
@@ -1102,7 +1108,9 @@ fn host_value(v: JsValue) -> HostValue {
 }
 
 /// `dbBatch` 的参数：`[{sql, params?}, ...]`。
-fn batch_items(value: Option<&HostValue>) -> std::result::Result<Vec<(String, Vec<JsValue>)>, HostError> {
+fn batch_items(
+    value: Option<&HostValue>,
+) -> std::result::Result<Vec<(String, Vec<JsValue>)>, HostError> {
     let Some(HostValue::Array(items)) = value else {
         return Err(HostError::from("dbBatch 需要语句数组"));
     };

@@ -261,7 +261,9 @@ mod tests {
 
     #[test]
     fn non_png_reports_no_dimensions() {
-        let bytes = vec![0xFF, 0xD8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let bytes = vec![
+            0xFF, 0xD8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
         assert_eq!(dimensions(&bytes, ImageFormat::Jpeg), (0, 0));
     }
 
@@ -275,7 +277,10 @@ mod tests {
 
     #[test]
     fn detects_format_from_magic_bytes() {
-        assert_eq!(format_of(Path::new("x"), &[0xFF, 0xD8, 0, 0]), ImageFormat::Jpeg);
+        assert_eq!(
+            format_of(Path::new("x"), &[0xFF, 0xD8, 0, 0]),
+            ImageFormat::Jpeg
+        );
         assert_eq!(format_of(Path::new("x"), b"RIFF____"), ImageFormat::Webp);
         assert_eq!(format_of(Path::new("x"), b"GIF89a"), ImageFormat::Gif);
         assert_eq!(format_of(Path::new("x"), b"\x89PNG"), ImageFormat::Png);

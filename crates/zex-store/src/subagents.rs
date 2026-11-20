@@ -9,7 +9,7 @@ use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use zex_core::{Error, Result};
 
-use crate::{now, Store};
+use crate::{Store, now};
 
 /// 子智能体在库里的状态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -194,8 +194,10 @@ mod tests {
             "写代码",
             "ses_1",
             "ses_parent",
-            SubAgentState::Running, None)
-            .unwrap();
+            SubAgentState::Running,
+            None,
+        )
+        .unwrap();
         let list = s.list_sub_agents().unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].id, "a1");
@@ -211,8 +213,10 @@ mod tests {
             "写代码",
             "ses_1",
             "ses_parent",
-            SubAgentState::Running, None)
-            .unwrap();
+            SubAgentState::Running,
+            None,
+        )
+        .unwrap();
         s.upsert_sub_agent(
             "a1",
             "coder",
@@ -238,16 +242,20 @@ mod tests {
             "x",
             "ses_1",
             "ses_parent",
-            SubAgentState::Running, None)
-            .unwrap();
+            SubAgentState::Running,
+            None,
+        )
+        .unwrap();
         s.upsert_sub_agent(
             "a2",
             "coder",
             "y",
             "ses_2",
             "ses_parent",
-            SubAgentState::Completed, Some("ok"))
-            .unwrap();
+            SubAgentState::Completed,
+            Some("ok"),
+        )
+        .unwrap();
         assert_eq!(s.interrupt_orphan_sub_agents().unwrap(), 1);
         let list = s.list_sub_agents().unwrap();
         let a1 = list.iter().find(|r| r.id == "a1").unwrap();
@@ -265,8 +273,10 @@ mod tests {
             "x",
             "ses_1",
             "ses_parent",
-            SubAgentState::Running, None)
-            .unwrap();
+            SubAgentState::Running,
+            None,
+        )
+        .unwrap();
         s.delete_sub_agent("a1").unwrap();
         assert!(s.list_sub_agents().unwrap().is_empty());
     }
@@ -285,20 +295,22 @@ mod restart_tests {
         {
             let s = Store::open(&path).unwrap();
             s.upsert_sub_agent(
-            "coder-1",
-            "coder",
-            "查依赖",
-            "ses_a",
-            "ses_parent",
-            SubAgentState::Running, None)
-                .unwrap();
+                "coder-1",
+                "coder",
+                "查依赖",
+                "ses_a",
+                "ses_parent",
+                SubAgentState::Running,
+                None,
+            )
+            .unwrap();
             s.upsert_sub_agent(
-            "reviewer-1",
-            "reviewer",
-            "审代码",
-            "ses_b",
-            "ses_parent",
-            SubAgentState::Completed,
+                "reviewer-1",
+                "reviewer",
+                "审代码",
+                "ses_b",
+                "ses_parent",
+                SubAgentState::Completed,
                 Some("没问题"),
             )
             .unwrap();

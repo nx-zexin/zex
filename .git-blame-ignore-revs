@@ -1,0 +1,2 @@
+# 纯格式提交：blame 时跳过这些 commit，避免每行都指到"cargo fmt"
+# 启用：git config blame.ignoreRevsFile .git-blame-ignore-revs

@@ -24,8 +24,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::{mpsc, oneshot};
-use zex_core::event::UiCommand;
 use zex_core::SessionId;
+use zex_core::event::UiCommand;
 
 /// 一次等待中的回包。
 type Waiter = oneshot::Sender<Reply>;
@@ -165,7 +165,10 @@ mod tests {
         let cmd = rx.recv().await.expect("命令应发出");
         match cmd {
             UiCommand::UserPrompt {
-                session, text, model, ..
+                session,
+                text,
+                model,
+                ..
             } => {
                 assert_eq!(session.as_str(), "ext-demo");
                 assert_eq!(text, "你好");

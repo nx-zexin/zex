@@ -325,7 +325,10 @@ mod tests {
             Mode::AutoEdit,
             &cwd(),
         );
-        assert!(v.is_allow(), "自动编辑下写工作目录内的文件应放行，得到 {v:?}");
+        assert!(
+            v.is_allow(),
+            "自动编辑下写工作目录内的文件应放行，得到 {v:?}"
+        );
     }
 
     #[test]
@@ -430,12 +433,22 @@ mod tests {
         let p = policy();
         // L0：任何模式都放行
         for m in Mode::all() {
-            let v = p.evaluate(&spec("fs_read", Risk::ReadOnly), &serde_json::json!({}), m, &cwd());
+            let v = p.evaluate(
+                &spec("fs_read", Risk::ReadOnly),
+                &serde_json::json!({}),
+                m,
+                &cwd(),
+            );
             assert!(v.is_allow(), "{m:?} 下 L0 应放行，得到 {v:?}");
         }
         // L1：只有 Confirm 会问
         for m in Mode::all() {
-            let v = p.evaluate(&spec("fs_write", Risk::Reversible), &serde_json::json!({}), m, &cwd());
+            let v = p.evaluate(
+                &spec("fs_write", Risk::Reversible),
+                &serde_json::json!({}),
+                m,
+                &cwd(),
+            );
             match m {
                 Mode::Confirm => assert!(matches!(v, Verdict::Ask { .. }), "{m:?}"),
                 Mode::Plan => assert!(matches!(v, Verdict::Deny { .. }), "{m:?}"),
@@ -453,7 +466,10 @@ mod tests {
             match m {
                 Mode::FullAccess => assert!(v.is_allow(), "完全访问下 L2 应放行，得到 {v:?}"),
                 Mode::Plan => assert!(matches!(v, Verdict::Deny { .. }), "{m:?}"),
-                _ => assert!(matches!(v, Verdict::Ask { .. }), "{m:?} 下 L2 应问，得到 {v:?}"),
+                _ => assert!(
+                    matches!(v, Verdict::Ask { .. }),
+                    "{m:?} 下 L2 应问，得到 {v:?}"
+                ),
             }
         }
         // 切模式时 UI 靠这个决定"正挂着的那条要不要自动放行"：
@@ -462,7 +478,10 @@ mod tests {
         assert!(auto_allows(Mode::AutoEdit, Risk::Reversible));
         assert!(!auto_allows(Mode::AutoEdit, Risk::Impactful));
         assert!(!auto_allows(Mode::Confirm, Risk::Reversible));
-        assert!(!auto_allows(Mode::FullAccess, Risk::Destructive), "完全访问也不放行不可逆");
+        assert!(
+            !auto_allows(Mode::FullAccess, Risk::Destructive),
+            "完全访问也不放行不可逆"
+        );
         assert!(auto_allows(Mode::Confirm, Risk::ReadOnly), "只读不需要许可");
 
         // L3：除 Plan(直接拒) 外一律强确认，FullAccess 也不例外
@@ -663,7 +682,13 @@ mod tests {
             &cwd(),
         );
         assert!(
-            matches!(v, Verdict::Ask { double_confirm: false, .. }),
+            matches!(
+                v,
+                Verdict::Ask {
+                    double_confirm: false,
+                    ..
+                }
+            ),
             "/tmp 不应被额外加码，得到 {v:?}"
         );
     }

@@ -101,7 +101,13 @@ impl Tool for ClipboardWrite {
 
 /// 读一段文本；空剪贴板或非文本内容都返回空串。
 async fn read_text() -> Result<String> {
-    run(move || arboard::Clipboard::new().map_err(err_text)?.get_text().map_err(err_text)).await
+    run(move || {
+        arboard::Clipboard::new()
+            .map_err(err_text)?
+            .get_text()
+            .map_err(err_text)
+    })
+    .await
 }
 
 /// 写入文本。
@@ -166,8 +172,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn missing_display_fails_with_a_readable_message() {
-        if std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some()
-        {
+        if std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some() {
             return;
         }
         let err = read_text().await.unwrap_err().to_string();

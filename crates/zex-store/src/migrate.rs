@@ -177,7 +177,14 @@ mod tests {
         names.sort();
         assert_eq!(
             names,
-            vec!["audit", "grants", "messages", "sessions", "sub_agents", "tasks"]
+            vec![
+                "audit",
+                "grants",
+                "messages",
+                "sessions",
+                "sub_agents",
+                "tasks"
+            ]
         );
     }
 

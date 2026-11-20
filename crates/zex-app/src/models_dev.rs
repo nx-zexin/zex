@@ -319,7 +319,9 @@ fn str_field(obj: &serde_json::Map<String, serde_json::Value>, key: &str) -> Opt
 }
 
 fn bool_field(obj: &serde_json::Map<String, serde_json::Value>, key: &str) -> bool {
-    obj.get(key).and_then(serde_json::Value::as_bool).unwrap_or(false)
+    obj.get(key)
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
 }
 
 /// 缓存文件位置：`~/.zex/cache/models-dev.json`。

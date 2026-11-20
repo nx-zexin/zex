@@ -8,7 +8,7 @@ use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use zex_core::{Error, Result};
 
-use crate::{now, Store};
+use crate::{Store, now};
 
 /// 任务状态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -189,7 +189,11 @@ impl Store {
     }
 
     /// 按状态列出任务（新的在前）。
-    pub fn list_tasks_by_status(&self, statuses: &[TaskStatus], limit: usize) -> Result<Vec<TaskRecord>> {
+    pub fn list_tasks_by_status(
+        &self,
+        statuses: &[TaskStatus],
+        limit: usize,
+    ) -> Result<Vec<TaskRecord>> {
         if statuses.is_empty() {
             return Ok(Vec::new());
         }
@@ -212,23 +216,24 @@ impl Store {
                 .prepare(&sql)
                 .map_err(|e| Error::Store(format!("查询任务失败: {e}")))?;
             let rows = stmt
-                .query_map(rusqlite::params_from_iter(
-                    statuses.iter().map(|s| s.as_str()),
-                ), |r| {
-                    Ok(TaskRecord {
-                        id: r.get(0)?,
-                        session_id: r.get(1)?,
-                        prompt: r.get(2)?,
-                        title: r.get(3)?,
-                        status: TaskStatus::parse(&r.get::<_, String>(4)?),
-                        created_at: r.get(5)?,
-                        started_at: r.get(6)?,
-                        ended_at: r.get(7)?,
-                        summary: r.get(8)?,
-                        error: r.get(9)?,
-                        seen: r.get::<_, i64>(10)? != 0,
-                    })
-                })
+                .query_map(
+                    rusqlite::params_from_iter(statuses.iter().map(|s| s.as_str())),
+                    |r| {
+                        Ok(TaskRecord {
+                            id: r.get(0)?,
+                            session_id: r.get(1)?,
+                            prompt: r.get(2)?,
+                            title: r.get(3)?,
+                            status: TaskStatus::parse(&r.get::<_, String>(4)?),
+                            created_at: r.get(5)?,
+                            started_at: r.get(6)?,
+                            ended_at: r.get(7)?,
+                            summary: r.get(8)?,
+                            error: r.get(9)?,
+                            seen: r.get::<_, i64>(10)? != 0,
+                        })
+                    },
+                )
                 .map_err(|e| Error::Store(format!("读取任务失败: {e}")))?;
             rows.collect::<rusqlite::Result<Vec<_>>>()
                 .map_err(|e| Error::Store(format!("读取任务失败: {e}")))
@@ -295,7 +300,13 @@ mod tests {
 
         let failed = s.list_tasks_by_status(&[TaskStatus::Failed], 10).unwrap();
         assert_eq!(failed.len(), 1);
-        assert!(failed[0].error.as_deref().unwrap_or("").contains("进程退出"));
+        assert!(
+            failed[0]
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("进程退出")
+        );
     }
 
     #[test]

@@ -12,10 +12,10 @@
 #![warn(missing_docs)]
 
 pub mod approval;
-pub mod subagent;
 pub mod compress;
 pub mod context;
 pub mod prompt;
+pub mod subagent;
 pub mod toolctx;
 
 use std::path::PathBuf;
@@ -128,11 +128,7 @@ impl AgentConfig {
     }
 
     /// 套用一组采样参数；`None` 的项保持不变。
-    pub fn with_model_params(
-        mut self,
-        temperature: Option<f32>,
-        max_tokens: Option<u32>,
-    ) -> Self {
+    pub fn with_model_params(mut self, temperature: Option<f32>, max_tokens: Option<u32>) -> Self {
         if let Some(t) = temperature {
             self.temperature = Some(t);
         }
@@ -453,7 +449,14 @@ impl Agent {
             thinking: zex_llm::ThinkingEffort::Off,
         };
 
-        let mut stream = match zex_llm::stream_chat(&self.http, &self.cfg.provider, &self.cfg.model, req).await {
+        let mut stream = match zex_llm::stream_chat(
+            &self.http,
+            &self.cfg.provider,
+            &self.cfg.model,
+            req,
+        )
+        .await
+        {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(target: "autotitle", error = %e, "起名请求失败");
@@ -490,9 +493,9 @@ impl Agent {
 
     /// 开一个新会话，`Agent::new` 时那样留一个空壳。
     pub fn new_session(&mut self) -> Result<()> {
-        let session = self
-            .store
-            .create_session("", &self.cfg.model, &self.cfg.cwd.display().to_string())?;
+        let session =
+            self.store
+                .create_session("", &self.cfg.model, &self.cfg.cwd.display().to_string())?;
         self.session = session.id;
         self.history.clear();
         self.usage = Usage::default();
@@ -644,26 +647,26 @@ impl Agent {
             // `max_steps != 0 &&`，结果改了默认值之后两边对不上 ——
             // 0（不限）被守卫判成"已到上限"，第一轮就停。
             match step_budget(step, &self.cfg, round) {
-                    StepBudget::Unlimited => {}
-                    StepBudget::Continue { round: next } => {
-                        round = next;
-                        step = 0;
-                        // 让用户知道这不是结束，也解释了为什么还在动
-                        self.emit(
-                            CoreEvent::Warning {
-                                message: format!(
-                                    "已达单轮 {} 步上限，自动继续（{}/{}）",
-                                    self.cfg.max_steps, round, self.cfg.max_continue_rounds
-                                ),
-                            },
-                            events,
-                        );
-                        continue;
-                    }
-                    StepBudget::Stop { total } => {
-                        end_reason = EndReason::MaxSteps { limit: total };
-                        break;
-                    }
+                StepBudget::Unlimited => {}
+                StepBudget::Continue { round: next } => {
+                    round = next;
+                    step = 0;
+                    // 让用户知道这不是结束，也解释了为什么还在动
+                    self.emit(
+                        CoreEvent::Warning {
+                            message: format!(
+                                "已达单轮 {} 步上限，自动继续（{}/{}）",
+                                self.cfg.max_steps, round, self.cfg.max_continue_rounds
+                            ),
+                        },
+                        events,
+                    );
+                    continue;
+                }
+                StepBudget::Stop { total } => {
+                    end_reason = EndReason::MaxSteps { limit: total };
+                    break;
+                }
             }
             step += 1;
             total_steps += 1;
@@ -709,8 +712,12 @@ impl Agent {
                         },
                         events,
                     );
-                    self.stream_once(truncation_retry_request(&self.build_request()), &turn, events)
-                        .await
+                    self.stream_once(
+                        truncation_retry_request(&self.build_request()),
+                        &turn,
+                        events,
+                    )
+                    .await
                 }
                 Err(e) => Err(e),
             };
@@ -843,11 +850,7 @@ impl Agent {
     /// 按预算判断是否需要压缩，需要则执行。
     ///
     /// 两档策略：先截断过长的工具结果（不惊动 LLM），再走摘要。
-    async fn maybe_compress(
-        &mut self,
-        turn: &TurnId,
-        events: Option<&mpsc::Sender<CoreEvent>>,
-    ) {
+    async fn maybe_compress(&mut self, turn: &TurnId, events: Option<&mpsc::Sender<CoreEvent>>) {
         let before = context::estimate_history_tokens(&self.history);
         let plan = self.compressor.plan(&self.history, None);
 
@@ -881,7 +884,9 @@ impl Agent {
 
                 // 先取出 history，避免与 compressor 的可变借用冲突
                 let history = std::mem::take(&mut self.history);
-                self.history = self.compressor.apply_summary(&history, drop_before, summary);
+                self.history = self
+                    .compressor
+                    .apply_summary(&history, drop_before, summary);
                 let after = context::estimate_history_tokens(&self.history);
 
                 tracing::info!(before, after, dropped = drop_before, "已压缩上下文");
@@ -953,7 +958,14 @@ impl Agent {
         // 记住这一轮的输出上限：截断报错要把它写进去，否则用户和模型
         // 只知道"被截断了"，不知道顶在哪儿、该往哪调
         let max_tokens = req.max_tokens;
-        let mut stream = match zex_llm::stream_chat(&self.http, &self.cfg.provider, &self.cfg.model, req).await {
+        let mut stream = match zex_llm::stream_chat(
+            &self.http,
+            &self.cfg.provider,
+            &self.cfg.model,
+            req,
+        )
+        .await
+        {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(target: "autotitle", error = %e, "起名请求失败");
@@ -1406,14 +1418,8 @@ mod tests {
             StepBudget::Unlimited,
             "没到上限不该触发任何动作"
         );
-        assert_eq!(
-            step_budget(25, &cfg, 0),
-            StepBudget::Continue { round: 1 }
-        );
-        assert_eq!(
-            step_budget(25, &cfg, 2),
-            StepBudget::Continue { round: 3 }
-        );
+        assert_eq!(step_budget(25, &cfg, 0), StepBudget::Continue { round: 1 });
+        assert_eq!(step_budget(25, &cfg, 2), StepBudget::Continue { round: 3 });
         assert_eq!(
             step_budget(25, &cfg, 3),
             StepBudget::Stop { total: 100 },
@@ -1435,7 +1441,10 @@ mod tests {
         assert_eq!(human_elapsed(Duration::from_secs(9)), "9 秒");
         assert_eq!(human_elapsed(Duration::from_secs(80)), "1 分 20 秒");
         // 长任务就是这个量级，得让人一眼看懂
-        assert_eq!(human_elapsed(Duration::from_secs(3 * 3600 + 25 * 60)), "3 小时 25 分");
+        assert_eq!(
+            human_elapsed(Duration::from_secs(3 * 3600 + 25 * 60)),
+            "3 小时 25 分"
+        );
     }
 
     #[test]
@@ -1538,7 +1547,9 @@ mod tests {
         let store = Store::in_memory().unwrap();
         let agent = Agent::new(test_cfg(), vec![], store.clone()).unwrap();
         let sid = agent.session_id().clone();
-        store.append_message(&sid, &Message::user("读一下"), 1).unwrap();
+        store
+            .append_message(&sid, &Message::user("读一下"), 1)
+            .unwrap();
         store
             .append_message(
                 &sid,
@@ -1566,7 +1577,12 @@ mod tests {
             Message::Tool { is_error: true, .. }
         ));
         match &h[2] {
-            Message::Tool { call_id, is_error, content, .. } => {
+            Message::Tool {
+                call_id,
+                is_error,
+                content,
+                ..
+            } => {
                 assert_eq!(call_id.to_string(), "call-1");
                 assert!(is_error);
                 assert!(content.contains("未执行"), "{content}");
@@ -1580,15 +1596,21 @@ mod tests {
         let store = Store::in_memory().unwrap();
         let mut agent = Agent::new(test_cfg(), vec![], store.clone()).unwrap();
         let a = agent.session_id().clone();
-        store.append_message(&a, &Message::user("在 A 里"), 1).unwrap();
+        store
+            .append_message(&a, &Message::user("在 A 里"), 1)
+            .unwrap();
         agent.history.push(Message::user("在 A 里"));
 
         // 另起一个会话，写两条
         let other = Agent::new(test_cfg(), vec![], store.clone()).unwrap();
         let b = other.session_id().clone();
         assert_ne!(a, b, "两次 new 应得到不同会话");
-        store.append_message(&b, &Message::user("在 B 里"), 1).unwrap();
-        store.append_message(&b, &Message::user("B 的第二条"), 1).unwrap();
+        store
+            .append_message(&b, &Message::user("在 B 里"), 1)
+            .unwrap();
+        store
+            .append_message(&b, &Message::user("B 的第二条"), 1)
+            .unwrap();
 
         agent.switch_session(b.clone()).unwrap();
 
@@ -1676,4 +1698,3 @@ fn truncation_retry_request(req: &ChatRequest) -> ChatRequest {
     }
     next
 }
-

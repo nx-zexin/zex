@@ -26,10 +26,10 @@
 
 pub mod bridge;
 pub mod catalog;
-pub mod net;
-pub mod store_db;
 #[cfg(feature = "ui")]
 pub mod check;
+pub mod net;
+pub mod store_db;
 // 剪贴板图片：靠 gpui 的 ClipboardItem / Image，所以跟着 ui 一起编
 #[cfg(feature = "ui")]
 pub mod clip_image;
@@ -41,13 +41,13 @@ pub mod clip_watch;
 pub mod host;
 
 pub use bridge::{AgentBridge, Reply};
+pub use catalog::{Extension, extensions_dir, scan, scan_default};
 #[cfg(feature = "ui")]
 pub use check::CheckReport;
 #[cfg(feature = "ui")]
-pub use host::ExtensionHost;
-#[cfg(feature = "ui")]
 pub use gpui_shell::ScriptView;
-pub use catalog::{Extension, extensions_dir, scan, scan_default};
+#[cfg(feature = "ui")]
+pub use host::ExtensionHost;
 
 /// 给脚本看的宿主模块名。
 ///

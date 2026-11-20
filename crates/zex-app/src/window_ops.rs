@@ -53,7 +53,7 @@ mod win {
     use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
     use windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
     use windows::Win32::UI::WindowsAndMessaging::{
-        IsZoomed, SendMessageW, ShowWindowAsync, HTCAPTION, SW_MAXIMIZE, SW_RESTORE,
+        HTCAPTION, IsZoomed, SW_MAXIMIZE, SW_RESTORE, SendMessageW, ShowWindowAsync,
         WM_NCLBUTTONDOWN,
     };
 
@@ -62,9 +62,7 @@ mod win {
     fn hwnd(window: &Window) -> Option<HWND> {
         let handle = HasWindowHandle::window_handle(window).ok()?;
         match handle.as_raw() {
-            RawWindowHandle::Win32(raw) => {
-                Some(HWND(raw.hwnd.get() as *mut core::ffi::c_void))
-            }
+            RawWindowHandle::Win32(raw) => Some(HWND(raw.hwnd.get() as *mut core::ffi::c_void)),
             _ => None,
         }
     }

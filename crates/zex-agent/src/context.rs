@@ -92,10 +92,8 @@ impl ContextBudget {
     /// 都砍成残包（下限 1000，也是历史默认值）；而真的填了 512k 也不是
     /// “能不能读懂”的问题了，是往窗口里灌 —— 封顶在 64k。
     pub fn with_output_tokens(mut self, max_tokens: u32) -> Self {
-        self.tool_result_max_tokens = (max_tokens as usize).clamp(
-            TOOL_RESULT_FLOOR_TOKENS,
-            TOOL_RESULT_CEILING_TOKENS,
-        );
+        self.tool_result_max_tokens =
+            (max_tokens as usize).clamp(TOOL_RESULT_FLOOR_TOKENS, TOOL_RESULT_CEILING_TOKENS);
         self
     }
 }

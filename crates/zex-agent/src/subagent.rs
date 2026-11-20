@@ -291,14 +291,9 @@ impl AgentRegistry {
         if let Ok(Some(s)) = deps.store.get_session(&session) {
             resume_cfg.mode = s.mode;
         }
-        let mut agent = Agent::resume(
-            resume_cfg,
-            deps.tools.clone(),
-            deps.store.clone(),
-            session,
-        )?
-        .with_shared_approvals(deps.broker.clone())
-        .with_cancel_flag(cancel);
+        let mut agent = Agent::resume(resume_cfg, deps.tools.clone(), deps.store.clone(), session)?
+            .with_shared_approvals(deps.broker.clone())
+            .with_cancel_flag(cancel);
 
         let ev_tx = deps.ev_tx.clone();
         let this = self.clone();
@@ -379,9 +374,7 @@ impl AgentRegistry {
                     result: a.result,
                 })
                 .collect();
-            let _ = deps
-                .ev_tx
-                .try_send(CoreEvent::TeamUpdated { agents });
+            let _ = deps.ev_tx.try_send(CoreEvent::TeamUpdated { agents });
         }
     }
 
@@ -563,7 +556,10 @@ impl Tool for TeamStatus {
         for a in &list {
             out.push_str(&format!(
                 "· {}（{}）— {}\n  {}",
-                a.id, a.role, a.status.label(), a.description
+                a.id,
+                a.role,
+                a.status.label(),
+                a.description
             ));
             if let SubAgentStatus::Failed(e) = &a.status {
                 out.push_str(&format!("\n  错误：{e}"));
@@ -605,10 +601,7 @@ impl Tool for WaitForAgents {
 
     async fn call(&self, _cx: &dyn ToolCtx, args: WaitArgs) -> Result<ToolOutput> {
         let secs = args.timeout_seconds.unwrap_or(300).min(1800);
-        let list = self
-            .registry
-            .wait_all(Duration::from_secs(secs))
-            .await;
+        let list = self.registry.wait_all(Duration::from_secs(secs)).await;
         if list.is_empty() {
             return Ok(ToolOutput::ok("没有子智能体需要等待。"));
         }

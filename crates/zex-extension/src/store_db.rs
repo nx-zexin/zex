@@ -26,8 +26,8 @@
 
 use std::path::{Path, PathBuf};
 
-use rusqlite::types::Value as SqlValue;
 use rusqlite::Connection;
+use rusqlite::types::Value as SqlValue;
 
 /// 库文件所在目录（`~/.zex/state/db`）。
 pub const DB_DIR: &str = "db";
@@ -208,11 +208,7 @@ pub struct ExecResult {
 }
 
 /// 执行一条写语句。
-pub fn exec(
-    conn: &Connection,
-    sql: &str,
-    params: &[JsValue],
-) -> Result<ExecResult, String> {
+pub fn exec(conn: &Connection, sql: &str, params: &[JsValue]) -> Result<ExecResult, String> {
     let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
     if stmt.column_count() > 0 {
         // SELECT 走 exec 是脚本写错了，得说清楚，别让它以为"执行成功但没数据"
@@ -268,7 +264,10 @@ pub fn query(
 ///
 /// 任一条失败就整体回滚，并把那条的错误原样抛回去 —— 脚本需要知道
 /// 是哪一条坏了，而不是笼统的"事务失败"。
-pub fn batch(conn: &mut Connection, items: &[(String, Vec<JsValue>)]) -> Result<Vec<ExecResult>, String> {
+pub fn batch(
+    conn: &mut Connection,
+    items: &[(String, Vec<JsValue>)],
+) -> Result<Vec<ExecResult>, String> {
     let tx = conn.transaction().map_err(|e| e.to_string())?;
     let mut out = Vec::with_capacity(items.len());
     for (sql, params) in items {
@@ -379,7 +378,11 @@ mod tests {
         exec(&conn, "INSERT INTO n VALUES (?)", &[JsValue::Number(7.0)]).unwrap();
         exec(&conn, "INSERT INTO n VALUES (?)", &[JsValue::Number(7.5)]).unwrap();
         let rows = query(&conn, "SELECT typeof(v) FROM n", &[]).unwrap();
-        assert_eq!(rows[0][0].1, JsValue::Str("integer".into()), "7.0 该存成整数");
+        assert_eq!(
+            rows[0][0].1,
+            JsValue::Str("integer".into()),
+            "7.0 该存成整数"
+        );
         assert_eq!(rows[1][0].1, JsValue::Str("real".into()), "7.5 才是实数");
     }
 
@@ -413,17 +416,30 @@ mod tests {
     #[test]
     fn index_and_alter_table_are_authorized() {
         let conn = db();
-        exec(&conn, "CREATE TABLE clips (id INTEGER PRIMARY KEY, fp TEXT)", &[]).unwrap();
+        exec(
+            &conn,
+            "CREATE TABLE clips (id INTEGER PRIMARY KEY, fp TEXT)",
+            &[],
+        )
+        .unwrap();
 
         // 建索引（收尾会触发 REINDEX）
         exec(&conn, "CREATE UNIQUE INDEX clips_fp ON clips(fp)", &[])
             .expect("CREATE INDEX 必须被放行");
 
         // 补列
-        exec(&conn, "ALTER TABLE clips ADD COLUMN w INTEGER NOT NULL DEFAULT 0", &[])
-            .expect("ALTER TABLE ADD COLUMN 必须被放行");
-        exec(&conn, "ALTER TABLE clips ADD COLUMN h INTEGER NOT NULL DEFAULT 0", &[])
-            .expect("第二条 ALTER 也必须被放行");
+        exec(
+            &conn,
+            "ALTER TABLE clips ADD COLUMN w INTEGER NOT NULL DEFAULT 0",
+            &[],
+        )
+        .expect("ALTER TABLE ADD COLUMN 必须被放行");
+        exec(
+            &conn,
+            "ALTER TABLE clips ADD COLUMN h INTEGER NOT NULL DEFAULT 0",
+            &[],
+        )
+        .expect("第二条 ALTER 也必须被放行");
 
         // 列真的加上了
         let rows = query(&conn, "SELECT w, h FROM clips", &[]).unwrap();

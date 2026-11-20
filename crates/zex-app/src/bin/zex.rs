@@ -12,9 +12,9 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::Icon;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
+use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerState};
-use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::component::text::{TextView, TextViewStyle, markdown};
 use gpui_kit::*;
 
@@ -474,13 +474,17 @@ impl ChatView {
         // 在 active_session 被移进结构体之前先把历史捞出来
         let restored_history = load_input_history(&store, &active_session);
         // provider 表单的几个框：常驻，打开表单时填值
-        let pf_name = cx.new(|cx| InputState::new(window, cx).placeholder("provider 名，如 deepseek"));
-        let pf_kind = cx.new(|cx| InputState::new(window, cx).placeholder("openai-compat 或 anthropic"));
-        let pf_base_url = cx.new(|cx| InputState::new(window, cx).placeholder("https://api.example.com/v1"));
-        let pf_key_env = cx.new(|cx| InputState::new(window, cx).placeholder("环境变量名，如 DEEPSEEK_API_KEY"));
+        let pf_name =
+            cx.new(|cx| InputState::new(window, cx).placeholder("provider 名，如 deepseek"));
+        let pf_kind =
+            cx.new(|cx| InputState::new(window, cx).placeholder("openai-compat 或 anthropic"));
+        let pf_base_url =
+            cx.new(|cx| InputState::new(window, cx).placeholder("https://api.example.com/v1"));
+        let pf_key_env =
+            cx.new(|cx| InputState::new(window, cx).placeholder("环境变量名，如 DEEPSEEK_API_KEY"));
         let pf_model = cx.new(|cx| InputState::new(window, cx).placeholder("模型名，如 gpt-4o"));
-        let md_provider_q =
-            cx.new(|cx| InputState::new(window, cx).placeholder("搜索 provider，如 deepseek / kimi"));
+        let md_provider_q = cx
+            .new(|cx| InputState::new(window, cx).placeholder("搜索 provider，如 deepseek / kimi"));
         let md_model_q =
             cx.new(|cx| InputState::new(window, cx).placeholder("搜索模型，如 flash / haiku"));
         let pf_temperature =
@@ -495,38 +499,42 @@ impl ChatView {
 
         // Enter 发送，Shift+Enter 换行。输入框自己无法区分这两者的语义，
         // 由外层决定"按下回车意味着提交"。
-        cx.subscribe_in(&input, window, |this, _input, ev: &InputEvent, window, cx| {
-            if let InputEvent::PressEnter { shift, .. } = ev {
-                if !shift {
-                    this.submit(window, cx);
+        cx.subscribe_in(
+            &input,
+            window,
+            |this, _input, ev: &InputEvent, window, cx| {
+                if let InputEvent::PressEnter { shift, .. } = ev {
+                    if !shift {
+                        this.submit(window, cx);
+                    }
                 }
-            }
-            // 焦点变化要重绘，否则高亮边框不跟手
-            if matches!(ev, InputEvent::Focus | InputEvent::Blur) {
-                cx.notify();
-            }
-            // 以 / 开头就亮出命令菜单
-            if let InputEvent::Change = ev {
-                let v = this.input.read(cx).value();
-                // 一次增加几百字基本只可能是粘贴 —— 提一句，
-                // 免得用户以为界面卡了
-                let len = v.chars().count();
-                if len > this.last_input_len + 500 {
-                    this.status = format!("已插入 {} 字", len - this.last_input_len);
+                // 焦点变化要重绘，否则高亮边框不跟手
+                if matches!(ev, InputEvent::Focus | InputEvent::Blur) {
+                    cx.notify();
                 }
-                this.last_input_len = len;
-                let v = v.trim_start();
-                this.slash_open = v.starts_with('/') && !v.contains(' ');
-                // 候选集变了，游标回到第一项
-                this.menu_cursor = 0;
-                // @ 提到最后一个 @ 之后的词
-                let at = v.rfind('@').map(|i| &v[i + 1..]);
-                this.at_open = at.map(|t| !t.contains(' ')).unwrap_or(false);
-                if this.at_open {
-                    this.ensure_file_index();
+                // 以 / 开头就亮出命令菜单
+                if let InputEvent::Change = ev {
+                    let v = this.input.read(cx).value();
+                    // 一次增加几百字基本只可能是粘贴 —— 提一句，
+                    // 免得用户以为界面卡了
+                    let len = v.chars().count();
+                    if len > this.last_input_len + 500 {
+                        this.status = format!("已插入 {} 字", len - this.last_input_len);
+                    }
+                    this.last_input_len = len;
+                    let v = v.trim_start();
+                    this.slash_open = v.starts_with('/') && !v.contains(' ');
+                    // 候选集变了，游标回到第一项
+                    this.menu_cursor = 0;
+                    // @ 提到最后一个 @ 之后的词
+                    let at = v.rfind('@').map(|i| &v[i + 1..]);
+                    this.at_open = at.map(|t| !t.contains(' ')).unwrap_or(false);
+                    if this.at_open {
+                        this.ensure_file_index();
+                    }
                 }
-            }
-        })
+            },
+        )
         .detach();
 
         // 模型输入框：回车确认，Esc 取消
@@ -890,13 +898,10 @@ impl ChatView {
         };
         let title = self.rename_input.read(cx).value().trim().to_string();
         if !title.is_empty() {
-            if let Ok(_) = self
-                .cmd_tx
-                .try_send(UiCommand::RenameSession {
-                    session: zex_core::SessionId::from(session),
-                    title,
-                })
-            {
+            if let Ok(_) = self.cmd_tx.try_send(UiCommand::RenameSession {
+                session: zex_core::SessionId::from(session),
+                title,
+            }) {
                 // 发出去了，等 SessionTitled 事件回来更新侧栏
             }
         }
@@ -1036,30 +1041,28 @@ impl ChatView {
                 row = row.bg(rgb(BG_HOVER));
             }
             menu = menu.child(
-                row
-                    .child(
-                        div()
-                            .text_xs()
-                            .child(if self.slash_open {
-                                "›"
-                            } else if self.at_open {
-                                "📄"
-                            } else {
-                                "↺"
-                            }),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .text_xs()
-                            .text_color(if picked { rgb(TEXT) } else { rgb(TEXT_MUTED) })
-                            .overflow_hidden()
-                            .child(label),
-                    )
-                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, window, cx| {
+                row.child(div().text_xs().child(if self.slash_open {
+                    "›"
+                } else if self.at_open {
+                    "📄"
+                } else {
+                    "↺"
+                }))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .text_xs()
+                        .text_color(if picked { rgb(TEXT) } else { rgb(TEXT_MUTED) })
+                        .overflow_hidden()
+                        .child(label),
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, window, cx| {
                         this.menu_pick(idx, window, cx);
-                    })),
+                    }),
+                ),
             );
         }
         Some(menu.into_any_element())
@@ -1149,8 +1152,16 @@ impl ChatView {
             return;
         }
         const SKIP: &[&str] = &[
-            ".git", "target", "node_modules", "dist", "build", ".venv", "__pycache__",
-            ".next", ".cache", "vendor",
+            ".git",
+            "target",
+            "node_modules",
+            "dist",
+            "build",
+            ".venv",
+            "__pycache__",
+            ".next",
+            ".cache",
+            "vendor",
         ];
         const MAX: usize = 4000;
         let mut out = Vec::new();
@@ -1281,20 +1292,18 @@ impl ChatView {
             // 停止录音要等后台线程收尾，别卡住界面
             cx.spawn(async move |this, cx| {
                 let wav = rec.stop();
-                let _ = this.update(cx, |this, cx| {
-                    match wav {
-                        Ok(bytes) => {
-                            let _ = tx.try_send(UiCommand::Transcribe { audio: bytes });
-                        }
-                        Err(e) => {
-                            this.transcribing = false;
-                            this.status = "Ready".into();
-                            this.messages.push(MsgItem {
-                                kind: MsgKind::System,
-                                text: format!("录音失败：{e}"),
-                            });
-                            cx.notify();
-                        }
+                let _ = this.update(cx, |this, cx| match wav {
+                    Ok(bytes) => {
+                        let _ = tx.try_send(UiCommand::Transcribe { audio: bytes });
+                    }
+                    Err(e) => {
+                        this.transcribing = false;
+                        this.status = "Ready".into();
+                        this.messages.push(MsgItem {
+                            kind: MsgKind::System,
+                            text: format!("录音失败：{e}"),
+                        });
+                        cx.notify();
                     }
                 });
             })
@@ -1502,7 +1511,12 @@ impl ChatView {
         }
 
         // 序号取当前图片数，只是为了给个能看的名字
-        let n = self.attachments.iter().filter(|a| a.image_b64.is_some()).count() + 1;
+        let n = self
+            .attachments
+            .iter()
+            .filter(|a| a.image_b64.is_some())
+            .count()
+            + 1;
         let name = format!("粘贴的图片 {n}.{ext}");
         self.attachments.push(Attachment {
             // 虚拟路径：仅用于去重，不会出现在 prompt 里
@@ -1633,7 +1647,8 @@ impl ChatView {
             .collect();
         self.attachments.clear();
 
-        self.input.update(cx, |state, cx| state.set_value("", window, cx));
+        self.input
+            .update(cx, |state, cx| state.set_value("", window, cx));
         // 派了活就要看到它跑：从工作台自动进入对话视图
         self.mode = ViewMode::Chat;
         self.messages.push(MsgItem {
@@ -1710,12 +1725,7 @@ impl ChatView {
                     .ok()
                     .and_then(|list| list.into_iter().find(|r| r.id == id))
                 {
-                    Some(r) => (
-                        r.session_id,
-                        r.description,
-                        format!("{:?}", r.status),
-                        r.id,
-                    ),
+                    Some(r) => (r.session_id, r.description, format!("{:?}", r.status), r.id),
                     None => return,
                 }
             }
@@ -1736,9 +1746,10 @@ impl ChatView {
     /// 把标签放进来：已有同键的就切过去，没有才新建一页。
     fn activate_or_push_tab(&mut self, tab: PanelTab, cx: &mut Context<Self>) {
         let key = tab.key();
-        let panel = self
-            .right_panel
-            .get_or_insert_with(|| RightPanel { tabs: Vec::new(), active: 0 });
+        let panel = self.right_panel.get_or_insert_with(|| RightPanel {
+            tabs: Vec::new(),
+            active: 0,
+        });
         match panel.tabs.iter().position(|t| t.key() == key) {
             Some(i) => panel.active = i,
             None => {
@@ -1800,10 +1811,7 @@ impl ChatView {
             self.status = "等待确认".into();
             self.approval = Some(req);
         } else if !self.pending_approvals.is_empty() {
-            self.status = format!(
-                "其它会话有 {} 个待确认",
-                self.pending_approvals.len()
-            );
+            self.status = format!("其它会话有 {} 个待确认", self.pending_approvals.len());
         }
         cx.notify();
     }
@@ -1822,9 +1830,7 @@ impl ChatView {
     /// 切什么模式都不豁免。
     fn push_mode_to_kernel(&mut self, mode: zex_core::RunMode, cx: &mut Context<Self>) {
         let session = zex_core::SessionId::from(self.active_session.clone());
-        let _ = self
-            .cmd_tx
-            .try_send(UiCommand::SetMode { session, mode });
+        let _ = self.cmd_tx.try_send(UiCommand::SetMode { session, mode });
 
         // 判据不在这里手写：问策略层"这个模式会不会放行这一档风险"，
         // 免得矩阵抄两份、抄漏一格就退化成"切了还问"
@@ -1838,30 +1844,44 @@ impl ChatView {
     }
 
     fn respond(&mut self, approve: bool, remember: bool, cx: &mut Context<Self>) {
-        let Some(req) = self.approval.take() else { return };
+        let Some(req) = self.approval.take() else {
+            return;
+        };
         let broker = self.broker.clone();
         let id: ApprovalId = req.id.clone();
         let grantable = req.grantable;
 
-        self.status = if approve { "执行中…".into() } else { "已拒绝".into() };
+        self.status = if approve {
+            "执行中…".into()
+        } else {
+            "已拒绝".into()
+        };
         // 处理完一个就摆出下一个，别让排队的一直等着
         self.show_next_approval(cx);
 
         cx.spawn(async move |_this, _cx| {
             if approve {
                 let scope = if remember && grantable {
-                    Some(RememberScope::Pattern { pattern: None, days: None })
+                    Some(RememberScope::Pattern {
+                        pattern: None,
+                        days: None,
+                    })
                 } else {
                     None
                 };
                 let _ = broker
-                    .resolve(&id, zex_agent::ApprovalDecision::Approve { remember: scope })
+                    .resolve(
+                        &id,
+                        zex_agent::ApprovalDecision::Approve { remember: scope },
+                    )
                     .await;
             } else {
                 let _ = broker
                     .resolve(
                         &id,
-                        zex_agent::ApprovalDecision::Reject { reason: "用户在界面上拒绝".into() },
+                        zex_agent::ApprovalDecision::Reject {
+                            reason: "用户在界面上拒绝".into(),
+                        },
                     )
                     .await;
             }
@@ -1911,9 +1931,17 @@ impl ChatView {
                 panel.status = "执行中".into();
             }
             CoreEvent::Token { text, .. } => {
-                panel.streaming.get_or_insert_with(String::new).push_str(text);
+                panel
+                    .streaming
+                    .get_or_insert_with(String::new)
+                    .push_str(text);
             }
-            CoreEvent::ToolCallBegin { name, arguments, risk, .. } => {
+            CoreEvent::ToolCallBegin {
+                name,
+                arguments,
+                risk,
+                ..
+            } => {
                 // 先把攒着的文本落成一条消息，保持顺序
                 if let Some(buf) = panel.streaming.take() {
                     if !buf.trim().is_empty() {
@@ -2077,13 +2105,25 @@ impl ChatView {
                 self.streaming.get_or_insert_with(String::new);
                 self.status = "思考中…".into();
             }
-            CoreEvent::Token { session, turn: _, text } => {
+            CoreEvent::Token {
+                session,
+                turn: _,
+                text,
+            } => {
                 if self.is_active(&session) {
-                    self.streaming.get_or_insert_with(String::new).push_str(&text);
+                    self.streaming
+                        .get_or_insert_with(String::new)
+                        .push_str(&text);
                     self.sync_scroller(cx);
                 }
             }
-            CoreEvent::ToolCallBegin { session, name, arguments, risk, .. } => {
+            CoreEvent::ToolCallBegin {
+                session,
+                name,
+                arguments,
+                risk,
+                ..
+            } => {
                 if !self.is_active(&session) {
                     // 是我的子智能体吗？是的话把动作回流到主对话，
                     // 用户不用点进去也知道后台在干什么。
@@ -2117,22 +2157,24 @@ impl ChatView {
                     // 其它会话的工具调用不上台面，但它确实在跑
                     self.status = format!("其它会话执行 {name}");
                 } else {
-                self.flush_streaming(cx);
-                self.running_tool = Some(name.clone());
-                self.status = format!("执行 {name}");
-                push_tool_step(
-                    &mut self.messages,
-                    ToolStep {
-                        name: name.clone(),
-                        args: compact_args(&arguments),
-                        risk: risk.label().to_string(),
-                        result: None,
-                    },
-                );
-                self.sync_scroller(cx);
+                    self.flush_streaming(cx);
+                    self.running_tool = Some(name.clone());
+                    self.status = format!("执行 {name}");
+                    push_tool_step(
+                        &mut self.messages,
+                        ToolStep {
+                            name: name.clone(),
+                            args: compact_args(&arguments),
+                            risk: risk.label().to_string(),
+                            result: None,
+                        },
+                    );
+                    self.sync_scroller(cx);
                 }
             }
-            CoreEvent::ToolCallEnd { session, ok, brief, .. } => {
+            CoreEvent::ToolCallEnd {
+                session, ok, brief, ..
+            } => {
                 if !self.is_active(&session) {
                     return;
                 }
@@ -2171,16 +2213,31 @@ impl ChatView {
                     };
                 }
             }
-            CoreEvent::ContextCompacted { session, before_tokens, after_tokens, strategy, .. } => {
+            CoreEvent::ContextCompacted {
+                session,
+                before_tokens,
+                after_tokens,
+                strategy,
+                ..
+            } => {
                 if !self.is_active(&session) {
                     return;
                 }
                 self.messages.push(MsgItem {
                     kind: MsgKind::System,
-                    text: format!("上下文已压缩（{strategy}）：{before_tokens} → {after_tokens} tokens"),
+                    text: format!(
+                        "上下文已压缩（{strategy}）：{before_tokens} → {after_tokens} tokens"
+                    ),
                 });
             }
-            CoreEvent::TurnEnded { session, reason, usage, steps, elapsed_ms, turn: _ } => {
+            CoreEvent::TurnEnded {
+                session,
+                reason,
+                usage,
+                steps,
+                elapsed_ms,
+                turn: _,
+            } => {
                 if !self.is_active(&session) {
                     // 后台会话跑完只是刷新待办，不动当前视图
                     self.tasks = load_tasks(&self.store);
@@ -2209,7 +2266,10 @@ impl ChatView {
                 self.sync_scroller(cx);
             }
             CoreEvent::Warning { message } => {
-                self.messages.push(MsgItem { kind: MsgKind::System, text: message });
+                self.messages.push(MsgItem {
+                    kind: MsgKind::System,
+                    text: message,
+                });
             }
             CoreEvent::SessionTitled { session, title } => {
                 // 侧栏和当前标题一起更新：这个事件既可能来自自动起名，
@@ -2262,7 +2322,10 @@ impl ChatView {
                 self.streaming = None;
                 self.running_tool = None;
                 self.status = "出错".into();
-                self.messages.push(MsgItem { kind: MsgKind::System, text: format!("错误：{message}") });
+                self.messages.push(MsgItem {
+                    kind: MsgKind::System,
+                    text: format!("错误：{message}"),
+                });
             }
             CoreEvent::Thinking { session, text, .. } => {
                 if !self.is_active(&session) {
@@ -2287,7 +2350,10 @@ impl ChatView {
     fn flush_streaming(&mut self, cx: &mut Context<Self>) {
         if let Some(text) = self.streaming.take() {
             if !text.trim().is_empty() {
-                self.messages.push(MsgItem { kind: MsgKind::Assistant, text });
+                self.messages.push(MsgItem {
+                    kind: MsgKind::Assistant,
+                    text,
+                });
             }
         }
         self.sync_scroller(cx);
@@ -2343,10 +2409,7 @@ fn sync_grants(host: &zex_extension::ExtensionHost, config: &zex_app::config::Fi
 ///
 /// 与网络不同，这里没有"清单长大了要重问"的分支：权限是一个布尔值，
 /// 不是一张会增删的名单。问过就记住了，拒绝也算记住。
-fn pending_clipboard(
-    config: &zex_app::config::FileConfig,
-    ext: &zex_extension::Extension,
-) -> bool {
+fn pending_clipboard(config: &zex_app::config::FileConfig, ext: &zex_extension::Extension) -> bool {
     let wants = ext.request.clipboard_read || ext.request.clipboard_write;
     wants && !config.clipboard_grants.contains_key(&ext.id)
 }
@@ -2433,7 +2496,11 @@ fn app_icon(icon: Option<&Arc<[u8]>>, size: f32, color: u32) -> Option<AnyElemen
 
 /// 往当前组里追加一步调用，没有组就新开一个。
 fn push_tool_step(items: &mut Vec<MsgItem>, step: ToolStep) {
-    if let Some(MsgItem { kind: MsgKind::ToolGroup { steps }, .. }) = items.last_mut() {
+    if let Some(MsgItem {
+        kind: MsgKind::ToolGroup { steps },
+        ..
+    }) = items.last_mut()
+    {
         steps.push(step);
         return;
     }
@@ -2501,10 +2568,13 @@ fn md_style_flat(scale: f32) -> TextViewStyle {
 /// 内容相同但地址不同的实例，且只建一次 —— 每帧新建会让代码块
 /// 每帧重新解析。
 fn hl_theme() -> std::sync::Arc<gpui_kit::component::highlighter::HighlightTheme> {
-    static HL: std::sync::OnceLock<std::sync::Arc<gpui_kit::component::highlighter::HighlightTheme>> =
-        std::sync::OnceLock::new();
+    static HL: std::sync::OnceLock<
+        std::sync::Arc<gpui_kit::component::highlighter::HighlightTheme>,
+    > = std::sync::OnceLock::new();
     HL.get_or_init(|| {
-        std::sync::Arc::new((*gpui_kit::component::highlighter::HighlightTheme::default_light()).clone())
+        std::sync::Arc::new(
+            (*gpui_kit::component::highlighter::HighlightTheme::default_light()).clone(),
+        )
     })
     .clone()
 }
@@ -2572,7 +2642,7 @@ fn copy_context_menu(
     &mut Window,
     &mut Context<gpui_kit::component::menu::PopupMenu>,
 ) -> gpui_kit::component::menu::PopupMenu
-       + 'static {
++ 'static {
     move |menu, _w, _cx| {
         let t = text.clone();
         menu.item(PopupMenuItem::new("复制").on_click(move |_, _w, cx| {
@@ -2595,11 +2665,7 @@ impl ChatView {
     ) -> AnyElement {
         match &m.kind {
             MsgKind::User { images } => {
-                let mut col = div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(role_label("USER"));
+                let mut col = div().flex().flex_col().gap_2().child(role_label("USER"));
 
                 // 图片排在文字上方：发图时那句话通常只是配文
                 if !images.is_empty() {
@@ -2609,9 +2675,7 @@ impl ChatView {
                             // 固定高度、限制最大宽度：原图尺寸各异，
                             // 按原始大小排会让信息流参差不齐
                             gpui::img(gpui::ImageSource::Image(img.clone()))
-                                .id(ElementId::Name(
-                                    format!("user-img-{idx}-{i}").into(),
-                                ))
+                                .id(ElementId::Name(format!("user-img-{idx}-{i}").into()))
                                 .h(px(120.0))
                                 .max_w(px(240.0))
                                 .rounded(px(8.0))
@@ -2660,13 +2724,13 @@ impl ChatView {
                             ElementId::Name(format!("md-ai-{idx}").into()),
                             m.text.clone(),
                         )
-                            .text_size(px(MSG_FONT * scale))
-                            .line_height(px(MSG_LINE * scale))
-                            // 标题默认按 14px 基准放大，h2 能到 24px——
-                            // 在消息流里比正文抢眼太多。压到这个比例后，
-                            // 层级还在，但不再喧宾夺主。
-                            .style(md_style(scale))
-                            .into_any_element(),
+                        .text_size(px(MSG_FONT * scale))
+                        .line_height(px(MSG_LINE * scale))
+                        // 标题默认按 14px 基准放大，h2 能到 24px——
+                        // 在消息流里比正文抢眼太多。压到这个比例后，
+                        // 层级还在，但不再喧宾夺主。
+                        .style(md_style(scale))
+                        .into_any_element(),
                     )
                     .context_menu(copy_context_menu(m.text.clone()))
                     .child(
@@ -2786,7 +2850,11 @@ impl ChatView {
                             .items_center()
                             .justify_center()
                             .child(if done < total {
-                                div().size(px(6.0)).rounded_full().bg(rgb(dot_fg)).into_any_element()
+                                div()
+                                    .size(px(6.0))
+                                    .rounded_full()
+                                    .bg(rgb(dot_fg))
+                                    .into_any_element()
                             } else {
                                 Icon::new(if failed > 0 {
                                     IconName::Close
@@ -2879,11 +2947,8 @@ impl ChatView {
                         // 参数里带 path 的（读写文件的工具）给一个可点的文件名：
                         // 点开就在右侧面板里预览，不用去终端翻
                         if let Some(full) = path_from_args(&step.args) {
-                            let short = full
-                                .rsplit('/')
-                                .next()
-                                .unwrap_or(full.as_str())
-                                .to_string();
+                            let short =
+                                full.rsplit('/').next().unwrap_or(full.as_str()).to_string();
                             head = head.child(
                                 div()
                                     .flex_none()
@@ -2975,8 +3040,7 @@ impl ChatView {
                             step_card = step_card.child(sb);
                         }
 
-                        body = body.child(
-                            step_card.context_menu(copy_context_menu(format!(
+                        body = body.child(step_card.context_menu(copy_context_menu(format!(
                                 "{}({}) → {}",
                                 step.name,
                                 step.args,
@@ -2984,8 +3048,7 @@ impl ChatView {
                                     .as_ref()
                                     .map(|r| r.output.as_str())
                                     .unwrap_or("（未完成）")
-                            ))),
-                        );
+                            ))));
                     }
                     card = card.child(body);
                 }
@@ -2997,7 +3060,10 @@ impl ChatView {
                             "{}({}) → {}",
                             s.name,
                             s.args,
-                            s.result.as_ref().map(|r| r.output.as_str()).unwrap_or("（未完成）")
+                            s.result
+                                .as_ref()
+                                .map(|r| r.output.as_str())
+                                .unwrap_or("（未完成）")
                         )
                     })
                     .collect::<Vec<_>>()
@@ -3205,13 +3271,7 @@ impl ChatView {
             .take(8)
             .collect();
 
-        let mut col = div()
-            .flex()
-            .flex_col()
-            .gap_6()
-            .px_10()
-            .py_8()
-            .w_full();
+        let mut col = div().flex().flex_col().gap_6().px_10().py_8().w_full();
 
         // ─── 标题 ───
         let headline = if running.is_empty() && failed.is_empty() && finished.is_empty() {
@@ -3511,7 +3571,8 @@ impl ChatView {
                 MouseButton::Left,
                 cx.listener(|this, e: &MouseDownEvent, _w, cx| {
                     this.subagent_resizing = true;
-                    this.subagent_drag_origin = (f32::from(e.position.x), this.subagent_panel_width);
+                    this.subagent_drag_origin =
+                        (f32::from(e.position.x), this.subagent_panel_width);
                     cx.notify();
                 }),
             );
@@ -3547,7 +3608,9 @@ impl ChatView {
             // id 带上会话：每个标签各自记住滚动位置。
             // 共用一个 id 的话，切标签时滚动量会互相覆盖，
             // 表现就是"切回来内容又从头开始了"
-            .id(ElementId::Name(format!("agent-scroll-{}", panel.session).into()))
+            .id(ElementId::Name(
+                format!("agent-scroll-{}", panel.session).into(),
+            ))
             .flex_1()
             .min_h(px(0.0))
             .overflow_y_scroll()
@@ -3663,9 +3726,12 @@ impl ChatView {
                     .text_color(rgb(TEXT_MUTED))
                     .child(hosts.join("、")),
             )
-            .child(div().text_xs().text_color(rgb(TEXT_DIM)).child(
-                "只放行上面这几条；随时可在「设置 → 应用」里撤销。",
-            ))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(TEXT_DIM))
+                    .child("只放行上面这几条；随时可在「设置 → 应用」里撤销。"),
+            )
             .child(
                 div()
                     .flex()
@@ -3754,12 +3820,9 @@ impl ChatView {
                             .child("需你确认后才会生效"),
                     ),
             )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(TEXT_DIM))
-                    .child("剪贴板里可能有密码、私钥、别处复制来的私事。准许后它随时可读，随时可在侧栏撤销。"),
-            )
+            .child(div().text_xs().text_color(rgb(TEXT_DIM)).child(
+                "剪贴板里可能有密码、私钥、别处复制来的私事。准许后它随时可读，随时可在侧栏撤销。",
+            ))
             .child(
                 div()
                     .flex()
@@ -3831,15 +3894,10 @@ impl ChatView {
                         .text_color(rgb(TEXT_MUTED))
                         .child(err.clone()),
                 )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(TEXT_DIM))
-                        .child(format!(
-                            "目录：{}",
-                            zex_extension::extensions_dir().join(&e.id).display()
-                        )),
-                )
+                .child(div().text_xs().text_color(rgb(TEXT_DIM)).child(format!(
+                    "目录：{}",
+                    zex_extension::extensions_dir().join(&e.id).display()
+                )))
                 .into_any_element();
         }
 
@@ -3884,7 +3942,13 @@ impl ChatView {
     ///
     /// `window` 用来在允许之后**原地重挂**：应用的 `init` 里那一通
     /// 网络调用当时是被拒的，不重挂它就得等用户自己关掉再打开。
-    fn grant_network(&mut self, id: &str, allow: bool, window: &mut Window, cx: &mut Context<Self>) {
+    fn grant_network(
+        &mut self,
+        id: &str,
+        allow: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let declared = self
             .extensions
             .iter()
@@ -3899,10 +3963,8 @@ impl ChatView {
         }
         // 面板上的确认卡片收掉
         if let Some(rp) = &mut self.right_panel {
-            if let Some(PanelTab::Extension(p)) = rp
-                .tabs
-                .iter_mut()
-                .find(|t| t.key() == format!("ext:{id}"))
+            if let Some(PanelTab::Extension(p)) =
+                rp.tabs.iter_mut().find(|t| t.key() == format!("ext:{id}"))
             {
                 p.net_request = None;
             }
@@ -3926,16 +3988,20 @@ impl ChatView {
     /// 与网络那条路一样：写进配置、立刻推给宿主、收掉确认卡片、重挂面板。
     /// 重挂是必须的 —— gpui-shell 的能力集是**建视图那一刻**读走的，
     /// 已挂载的视图里 `navigator.clipboard` 仍然按上一份判。
-    fn grant_clipboard(&mut self, id: &str, allow: bool, window: &mut Window, cx: &mut Context<Self>) {
+    fn grant_clipboard(
+        &mut self,
+        id: &str,
+        allow: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.config.clipboard_grants.insert(id.to_string(), allow);
         if let Some(host) = &self.ext_host {
             sync_grants(host, &self.config);
         }
         if let Some(rp) = &mut self.right_panel {
-            if let Some(PanelTab::Extension(p)) = rp
-                .tabs
-                .iter_mut()
-                .find(|t| t.key() == format!("ext:{id}"))
+            if let Some(PanelTab::Extension(p)) =
+                rp.tabs.iter_mut().find(|t| t.key() == format!("ext:{id}"))
             {
                 p.clip_request = false;
             }
@@ -3959,12 +4025,11 @@ impl ChatView {
             return;
         };
         let mounted = host.mount(&fresh, window, cx);
-        self.ext_mtimes.insert(fresh.id.clone(), Self::ext_stamp(&fresh));
+        self.ext_mtimes
+            .insert(fresh.id.clone(), Self::ext_stamp(&fresh));
         if let Some(rp) = &mut self.right_panel {
-            if let Some(PanelTab::Extension(p)) = rp
-                .tabs
-                .iter_mut()
-                .find(|t| t.key() == format!("ext:{id}"))
+            if let Some(PanelTab::Extension(p)) =
+                rp.tabs.iter_mut().find(|t| t.key() == format!("ext:{id}"))
             {
                 match mounted {
                     Ok(v) => {
@@ -4032,7 +4097,9 @@ impl ChatView {
                 return;
             };
             for tab in &rp.tabs {
-                let PanelTab::Extension(p) = tab else { continue };
+                let PanelTab::Extension(p) = tab else {
+                    continue;
+                };
                 let Some(ext) = self.extensions.iter().find(|e| e.id == p.id) else {
                     continue;
                 };
@@ -4062,8 +4129,10 @@ impl ChatView {
             // 清单可能刚改过：还没确认过的网络申请要在重挂后重新摆出来
             let pending = pending_net(&self.config, &fresh);
             if let Some(rp) = &mut self.right_panel {
-                if let Some(PanelTab::Extension(p)) =
-                    rp.tabs.iter_mut().find(|t| t.key() == format!("ext:{}", fresh.id))
+                if let Some(PanelTab::Extension(p)) = rp
+                    .tabs
+                    .iter_mut()
+                    .find(|t| t.key() == format!("ext:{}", fresh.id))
                 {
                     match mounted {
                         Ok(v) => {
@@ -4171,12 +4240,7 @@ impl ChatView {
     /// 打开（或切到）一个扩展面板。
     ///
     /// 第一次调会建宿主、加载脚本；已存在的标签只切过去。
-    fn open_extension(
-        &mut self,
-        id: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
+    fn open_extension(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let Some(ext) = self.extensions.iter().find(|e| e.id == id).cloned() else {
             self.status = format!("没有名为 `{id}` 的应用");
             cx.notify();
@@ -4246,7 +4310,8 @@ impl ChatView {
             clip_read: ext.request.clipboard_read,
             clip_write: ext.request.clipboard_write,
         });
-        self.ext_mtimes.insert(ext.id.clone(), Self::ext_stamp(&ext));
+        self.ext_mtimes
+            .insert(ext.id.clone(), Self::ext_stamp(&ext));
         self.activate_or_push_tab(tab, cx);
         true
     }
@@ -4294,9 +4359,7 @@ impl ChatView {
                 panel.status = "就绪".into();
                 let reply = match reason {
                     zex_core::event::EndReason::Completed => zex_extension::Reply::ok(text.clone()),
-                    other => {
-                        zex_extension::Reply::err(format!("这一轮没有正常结束：{other:?}"))
-                    }
+                    other => zex_extension::Reply::err(format!("这一轮没有正常结束：{other:?}")),
                 };
                 // 唤醒还在 await 的脚本；没人在等就什么也不做
                 host.bridge().complete(&session, reply);
@@ -4335,12 +4398,7 @@ impl ChatView {
             );
 
         if let Some(note) = &f.note {
-            body = body.child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(DANGER))
-                    .child(note.clone()),
-            );
+            body = body.child(div().text_xs().text_color(rgb(DANGER)).child(note.clone()));
         }
 
         if !f.content.trim().is_empty() {
@@ -4380,7 +4438,11 @@ impl ChatView {
         } else {
             let first = t.prompt.lines().next().unwrap_or("").trim();
             let s: String = first.chars().take(40).collect();
-            if s.is_empty() { "（空输入）".into() } else { s }
+            if s.is_empty() {
+                "（空输入）".into()
+            } else {
+                s
+            }
         };
 
         let detail = match t.status {
@@ -4490,26 +4552,24 @@ impl ChatView {
                     let (sid_clear, tx_clear) = (sid.clone(), tx.clone());
                     let (sid_del, tx_del) = (sid.clone(), tx.clone());
 
-                    menu.item(
-                        PopupMenuItem::new("重命名").on_click(move |_, window, cx| {
-                            let sid = sid_rename.clone();
-                            view_rename
-                                .update(cx, |this, cx| {
-                                    // 预填当前标题，改起来省事
-                                    let current = this
-                                        .sessions
-                                        .iter()
-                                        .find(|s| s.id == sid)
-                                        .map(|s| s.title.clone())
-                                        .unwrap_or_default();
-                                    this.rename_input
-                                        .update(cx, |st, cx| st.set_value(current, window, cx));
-                                    this.renaming = Some(sid.clone());
-                                    cx.notify();
-                                })
-                                .ok();
-                        }),
-                    )
+                    menu.item(PopupMenuItem::new("重命名").on_click(move |_, window, cx| {
+                        let sid = sid_rename.clone();
+                        view_rename
+                            .update(cx, |this, cx| {
+                                // 预填当前标题，改起来省事
+                                let current = this
+                                    .sessions
+                                    .iter()
+                                    .find(|s| s.id == sid)
+                                    .map(|s| s.title.clone())
+                                    .unwrap_or_default();
+                                this.rename_input
+                                    .update(cx, |st, cx| st.set_value(current, window, cx));
+                                this.renaming = Some(sid.clone());
+                                cx.notify();
+                            })
+                            .ok();
+                    }))
                     .separator()
                     .item(PopupMenuItem::new("清空会话").on_click(move |_, _w, _cx| {
                         let _ = tx_clear.try_send(UiCommand::ClearSession {
@@ -4596,42 +4656,40 @@ impl ChatView {
 
         // macOS 用系统红绿灯，不重复画按钮
         if !cfg!(target_os = "macos") {
-            let btn = |icon: IconName,
-                       danger: bool,
-                       action: fn(&mut Window),
-                       cx: &mut Context<Self>| {
-                let base = div()
-                    .w(px(34.0))
-                    .h_full()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .cursor_pointer()
-                    // 按下就吃掉：否则事件冒到标题栏，点按钮会顺带把窗口拖起来
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|_this, _e: &MouseDownEvent, _w, cx| {
-                            cx.stop_propagation();
-                        }),
+            let btn =
+                |icon: IconName, danger: bool, action: fn(&mut Window), cx: &mut Context<Self>| {
+                    let base = div()
+                        .w(px(34.0))
+                        .h_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        // 按下就吃掉：否则事件冒到标题栏，点按钮会顺带把窗口拖起来
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|_this, _e: &MouseDownEvent, _w, cx| {
+                                cx.stop_propagation();
+                            }),
+                        )
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(move |_this, _e: &MouseUpEvent, window, _cx| {
+                                action(window);
+                            }),
+                        );
+                    // 关闭键 hover 变红，警告意味明确
+                    let base = if danger {
+                        base.hover(|s| s.bg(rgb(0xE0383E)))
+                    } else {
+                        base.hover(|s| s.bg(rgb(BG_HOVER)))
+                    };
+                    base.child(
+                        Icon::new(icon)
+                            .text_size(px(13.0))
+                            .text_color(rgb(TEXT_MUTED)),
                     )
-                    .on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(move |_this, _e: &MouseUpEvent, window, _cx| {
-                            action(window);
-                        }),
-                    );
-                // 关闭键 hover 变红，警告意味明确
-                let base = if danger {
-                    base.hover(|s| s.bg(rgb(0xE0383E)))
-                } else {
-                    base.hover(|s| s.bg(rgb(BG_HOVER)))
                 };
-                base.child(
-                    Icon::new(icon)
-                        .text_size(px(13.0))
-                        .text_color(rgb(TEXT_MUTED)),
-                )
-            };
 
             bar = bar
                 .child(btn(IconName::Minus, false, |w| w.minimize_window(), cx))
@@ -4908,7 +4966,11 @@ impl ChatView {
                             .text_color(rgb(if set { OK } else { DANGER }))
                             .child(format!(
                                 "{} {}",
-                                if set { "密钥已就绪：" } else { "缺少环境变量：" },
+                                if set {
+                                    "密钥已就绪："
+                                } else {
+                                    "缺少环境变量："
+                                },
                                 env
                             ))
                     }
@@ -4921,7 +4983,10 @@ impl ChatView {
             // 模型列表：以当前配置为准（加一个就该立刻多一个），
             // 配置为空时回退到启动时解析出的清单（含内置默认）
             let models: Vec<String> = if entry.models.is_empty() {
-                self.models_by_provider.get(name).cloned().unwrap_or_default()
+                self.models_by_provider
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_default()
             } else {
                 entry.models.clone()
             };
@@ -5066,12 +5131,12 @@ impl ChatView {
                                         .ghost()
                                         .compact()
                                         .label("取消")
-                                        .on_click(cx.listener(
-                                            |this, _: &ClickEvent, _w, cx| {
+                                        .on_click(
+                                            cx.listener(|this, _: &ClickEvent, _w, cx| {
                                                 this.editing_params_for = None;
                                                 cx.notify();
-                                            },
-                                        )),
+                                            }),
+                                        ),
                                     )
                                     .child(
                                         Button::new(ElementId::Name(
@@ -5080,11 +5145,11 @@ impl ChatView {
                                         .primary()
                                         .compact()
                                         .label("保存")
-                                        .on_click(cx.listener(
-                                            move |this, _: &ClickEvent, window, cx| {
+                                        .on_click(
+                                            cx.listener(move |this, _: &ClickEvent, window, cx| {
                                                 this.save_params_form(window, cx);
-                                            },
-                                        )),
+                                            }),
+                                        ),
                                     ),
                             ),
                     );
@@ -5132,33 +5197,29 @@ impl ChatView {
                     .map(|c| c.find(name).is_some())
                     .unwrap_or(false);
                 list = list.child(
-                    div()
-                        .pt_2()
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(rgb(BRAND))
-                                .cursor_pointer()
-                                .hover(|s| s.underline())
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, _: &MouseDownEvent, window, cx| {
-                                        this.adding_model_for = Some(for_provider.clone());
-                                        this.pf_model.update(cx, |st, cx| {
-                                            st.set_value("", window, cx)
-                                        });
-                                        this.md_model_q.update(cx, |st, cx| {
-                                            st.set_value("", window, cx)
-                                        });
-                                        cx.notify();
-                                    }),
-                                )
-                                .child(if in_catalog {
-                                    "+ 从目录添加模型"
-                                } else {
-                                    "+ 添加模型"
+                    div().pt_2().child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(BRAND))
+                            .cursor_pointer()
+                            .hover(|s| s.underline())
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                                    this.adding_model_for = Some(for_provider.clone());
+                                    this.pf_model
+                                        .update(cx, |st, cx| st.set_value("", window, cx));
+                                    this.md_model_q
+                                        .update(cx, |st, cx| st.set_value("", window, cx));
+                                    cx.notify();
                                 }),
-                        ),
+                            )
+                            .child(if in_catalog {
+                                "+ 从目录添加模型"
+                            } else {
+                                "+ 添加模型"
+                            }),
+                    ),
                 );
             }
 
@@ -5301,12 +5362,7 @@ impl ChatView {
                         this.pick_provider_from_catalog(&pid, window, cx);
                     }),
                 )
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(rgb(TEXT))
-                        .child(p.name.clone()),
-                )
+                .child(div().text_sm().text_color(rgb(TEXT)).child(p.name.clone()))
                 .child(
                     div()
                         .font_family(MONO)
@@ -5333,15 +5389,10 @@ impl ChatView {
         }
         col = col.child(list);
         if hits.len() > SHOWN {
-            col = col.child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(TEXT_DIM))
-                    .child(format!(
-                        "还有 {} 个结果，继续输入以缩小范围",
-                        hits.len() - SHOWN
-                    )),
-            );
+            col = col.child(div().text_xs().text_color(rgb(TEXT_DIM)).child(format!(
+                "还有 {} 个结果，继续输入以缩小范围",
+                hits.len() - SHOWN
+            )));
         }
         col.into_any_element()
     }
@@ -5393,7 +5444,12 @@ impl ChatView {
                 .flex()
                 .flex_col()
                 .gap_1()
-                .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(label.to_string()))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(TEXT_MUTED))
+                        .child(label.to_string()),
+                )
                 .child(Input::new(&input))
         };
 
@@ -5416,9 +5472,15 @@ impl ChatView {
             .child(self.render_md_picker(cx))
             .child(div().h(px(1.0)).bg(rgb(BORDER_SOFT)))
             .child(field("名称", self.pf_name.clone()))
-            .child(field("协议（openai-compat / anthropic）", self.pf_kind.clone()))
+            .child(field(
+                "协议（openai-compat / anthropic）",
+                self.pf_kind.clone(),
+            ))
             .child(field("base_url", self.pf_base_url.clone()))
-            .child(field("api_key_env（可留空，本地模型）", self.pf_key_env.clone()))
+            .child(field(
+                "api_key_env（可留空，本地模型）",
+                self.pf_key_env.clone(),
+            ))
             .child(
                 div()
                     .flex()
@@ -5449,7 +5511,6 @@ impl ChatView {
             )
             .into_any_element()
     }
-
 
     /// 确保 models.dev 目录就绪。
     ///
@@ -5514,7 +5575,12 @@ impl ChatView {
     }
 
     /// 打开 provider 表单。`Some(name)` = 编辑现有，`None` = 新增。
-    fn open_provider_form(&mut self, name: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_provider_form(
+        &mut self,
+        name: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let (kind, base, key) = match &name {
             Some(n) => match self.config.providers.get(n) {
                 Some(e) => (
@@ -5601,12 +5667,7 @@ impl ChatView {
             0
         };
 
-        match zex_app::config::upsert_provider(
-            &mut self.config,
-            &name,
-            entry,
-            editing.as_deref(),
-        ) {
+        match zex_app::config::upsert_provider(&mut self.config, &name, entry, editing.as_deref()) {
             Ok(()) => {
                 self.provider_form = None;
                 self.md_picked = None;
@@ -5723,9 +5784,13 @@ impl ChatView {
                 // 全空 = 清掉这条记录，别在配置里留一个 `{}`
                 entry.params.remove(&model);
             } else {
-                entry
-                    .params
-                    .insert(model.clone(), zex_app::config::ModelParams { temperature, max_tokens });
+                entry.params.insert(
+                    model.clone(),
+                    zex_app::config::ModelParams {
+                        temperature,
+                        max_tokens,
+                    },
+                );
             }
         }
 
@@ -5805,32 +5870,24 @@ impl ChatView {
                 })
                 .collect();
 
-            panel = panel.child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(TEXT_MUTED))
-                    .child(format!(
-                        "models.dev 里 `{}` 有 {} 个可用模型（已加入 {} 个）",
-                        p.id,
-                        p.models.len(),
-                        existing.len()
-                    )),
-            );
+            panel = panel.child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(format!(
+                "models.dev 里 `{}` 有 {} 个可用模型（已加入 {} 个）",
+                p.id,
+                p.models.len(),
+                existing.len()
+            )));
             panel = panel.child(Input::new(&self.md_model_q));
 
             // 同屏最多 12 条：一个 openrouter 就 421 个，铺满屏幕反而难找
             const SHOWN: usize = 12;
             if candidates.is_empty() {
-                panel = panel.child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(TEXT_DIM))
-                        .child(if q_lower.is_empty() {
-                            "目录里的模型都加过了".to_string()
-                        } else {
-                            format!("没有匹配 `{q}` 的模型")
-                        }),
-                );
+                panel = panel.child(div().text_xs().text_color(rgb(TEXT_DIM)).child(
+                    if q_lower.is_empty() {
+                        "目录里的模型都加过了".to_string()
+                    } else {
+                        format!("没有匹配 `{q}` 的模型")
+                    },
+                ));
             } else {
                 let mut rows = div()
                     .flex()
@@ -5910,15 +5967,10 @@ impl ChatView {
                 }
                 panel = panel.child(rows);
                 if candidates.len() > SHOWN {
-                    panel = panel.child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(TEXT_DIM))
-                            .child(format!(
-                                "还有 {} 个，输入关键词缩小范围",
-                                candidates.len() - SHOWN
-                            )),
-                    );
+                    panel = panel.child(div().text_xs().text_color(rgb(TEXT_DIM)).child(format!(
+                        "还有 {} 个，输入关键词缩小范围",
+                        candidates.len() - SHOWN
+                    )));
                 }
             }
             panel = panel.child(div().h(px(1.0)).bg(rgb(BORDER_SOFT)));
@@ -6056,8 +6108,7 @@ impl ChatView {
                             .label("重新扫描")
                             .on_click(cx.listener(|this, _: &ClickEvent, _w, cx| {
                                 this.extensions = zex_extension::scan_default();
-                                this.status =
-                                    format!("已扫描到 {} 个应用", this.extensions.len());
+                                this.status = format!("已扫描到 {} 个应用", this.extensions.len());
                                 cx.notify();
                             })),
                     ),
@@ -6068,17 +6119,12 @@ impl ChatView {
                     .text_color(rgb(TEXT_DIM))
                     .child(format!("目录：{}", dir.display())),
             )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(TEXT_MUTED))
-                    .child(
-                        "每个应用是一个子目录，里面放 gpui-shell.json（id / name / entry）、\
+            .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(
+                "每个应用是一个子目录，里面放 gpui-shell.json（id / name / entry）、\
                          脚本入口，以及可选的 icon.svg（侧边栏显示的那个图标）。\
                          脚本里用 `import { ask } from \"zex.<id>\"` 调用 agent；\
                          示例见仓库 examples/extensions/demo，文档见 docs/EXTENSIONS.md。",
-                    ),
-            );
+            ));
 
         if self.extensions.is_empty() {
             return col
@@ -6116,9 +6162,10 @@ impl ChatView {
         for ext in &self.extensions {
             let id = ext.id.clone();
             let is_pinned = self.config.pinned_extensions.iter().any(|x| x == &ext.id);
-            let open = self.right_panel.as_ref().is_some_and(|rp| {
-                rp.tabs.iter().any(|t| t.key() == format!("ext:{}", ext.id))
-            });
+            let open = self
+                .right_panel
+                .as_ref()
+                .is_some_and(|rp| rp.tabs.iter().any(|t| t.key() == format!("ext:{}", ext.id)));
             col = col.child(
                 div()
                     .flex()
@@ -6647,25 +6694,26 @@ impl ChatView {
                     .unwrap_or_default(),
             ),
         ];
-        let mut col = div()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .max_w(px(780.0))
-            .child(
-                div()
-                    .text_lg()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(rgb(TEXT))
-                    .child("关于"),
-            );
+        let mut col = div().flex().flex_col().gap_3().max_w(px(780.0)).child(
+            div()
+                .text_lg()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(rgb(TEXT))
+                .child("关于"),
+        );
         for (k, v) in rows {
             col = col.child(
                 div()
                     .flex()
                     .items_center()
                     .gap_3()
-                    .child(div().w(px(90.0)).text_xs().text_color(rgb(TEXT_DIM)).child(k))
+                    .child(
+                        div()
+                            .w(px(90.0))
+                            .text_xs()
+                            .text_color(rgb(TEXT_DIM))
+                            .child(k),
+                    )
                     .child(div().text_xs().text_color(rgb(TEXT)).child(v)),
             );
         }
@@ -6712,15 +6760,12 @@ impl ChatView {
                 .child("应用")
                 .child(div().flex_1())
                 // 已固定几个，就在右边标几个：一眼看出还有没有空位
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(TEXT_DIM))
-                        .child(match self.config.pinned_extensions.len() {
-                            0 => String::new(),
-                            n => format!("{n} 个"),
-                        }),
-                )
+                .child(div().text_xs().text_color(rgb(TEXT_DIM)).child(
+                    match self.config.pinned_extensions.len() {
+                        0 => String::new(),
+                        n => format!("{n} 个"),
+                    },
+                ))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _: &MouseDownEvent, _w, cx| {
@@ -6736,9 +6781,10 @@ impl ChatView {
                 continue;
             }
             let id = ext.id.clone();
-            let open = self.right_panel.as_ref().is_some_and(|rp| {
-                rp.tabs.iter().any(|t| t.key() == format!("ext:{id}"))
-            });
+            let open = self
+                .right_panel
+                .as_ref()
+                .is_some_and(|rp| rp.tabs.iter().any(|t| t.key() == format!("ext:{id}")));
             let mut row = div()
                 .w_full()
                 .h(px(32.0))
@@ -6755,24 +6801,31 @@ impl ChatView {
                 row = row.bg(rgb(BG_HOVER));
             }
             col = col.child(
-                row
-                    .hover(|s| s.bg(rgb(BG_HOVER)))
-                    .child(match app_icon(
-                        ext.icon.as_ref(),
-                        14.0,
-                        if open { BRAND } else { TEXT_MUTED },
-                    ) {
-                        // 有 icon.svg 就画它；没有就退回原作那个小圆点，
-                        // 让老应用（和手写的半成品）看起来不像是坏了
-                        Some(icon) => icon,
-                        None => div()
-                            .size(px(6.0))
-                            .rounded_full()
-                            .flex_none()
-                            .bg(rgb(if open { BRAND } else { TEXT_DIM }))
-                            .into_any_element(),
-                    })
-                    .child(div().flex_1().min_w(px(0.0)).truncate().child(ext.name.clone()))
+                row.hover(|s| s.bg(rgb(BG_HOVER)))
+                    .child(
+                        match app_icon(
+                            ext.icon.as_ref(),
+                            14.0,
+                            if open { BRAND } else { TEXT_MUTED },
+                        ) {
+                            // 有 icon.svg 就画它；没有就退回原作那个小圆点，
+                            // 让老应用（和手写的半成品）看起来不像是坏了
+                            Some(icon) => icon,
+                            None => div()
+                                .size(px(6.0))
+                                .rounded_full()
+                                .flex_none()
+                                .bg(rgb(if open { BRAND } else { TEXT_DIM }))
+                                .into_any_element(),
+                        },
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .truncate()
+                            .child(ext.name.clone()),
+                    )
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _: &MouseDownEvent, window, cx| {
@@ -6820,14 +6873,9 @@ impl ChatView {
                             .min_w(px(0.0))
                             .child(Input::new(&self.rename_input)),
                     )
-                    .child(
-                        Button::new("rename-ok")
-                            .primary()
-                            .label("✓")
-                            .on_click(cx.listener(|this, _: &ClickEvent, _w, cx| {
-                                this.commit_rename(cx)
-                            })),
-                    );
+                    .child(Button::new("rename-ok").primary().label("✓").on_click(
+                        cx.listener(|this, _: &ClickEvent, _w, cx| this.commit_rename(cx)),
+                    ));
             } else {
                 let color = if active { TEXT } else { TEXT_MUTED };
                 let mut title = div()
@@ -6860,20 +6908,18 @@ impl ChatView {
                 // 平时不可见，hover 时才浮出来 —— 不占布局宽度，
                 // 标题能用满整行（侧栏只有 240px）。
                 let g_menu = group.clone();
-                row = row
-                    .child(title.pr(px(20.0)))
-                    .child(
-                        div()
-                            .absolute()
-                            .top_0()
-                            .right_0()
-                            .bottom_0()
-                            .flex()
-                            .items_center()
-                            .invisible()
-                            .group_hover(g_menu, |st| st.visible())
-                            .child(self.render_item_menu(&s.id, cx)),
-                    );
+                row = row.child(title.pr(px(20.0))).child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .right_0()
+                        .bottom_0()
+                        .flex()
+                        .items_center()
+                        .invisible()
+                        .group_hover(g_menu, |st| st.visible())
+                        .child(self.render_item_menu(&s.id, cx)),
+                );
             }
 
             list = list.child(row);
@@ -6908,17 +6954,20 @@ impl ChatView {
                         .child(div().text_base().child("＋"))
                         .child("新建会话")
                         .cursor_pointer()
-                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
-                            let tx = this.cmd_tx.clone();
-                            this.status = "新建中…".into();
-                            this.settings = None;
-                            this.mode = ViewMode::Chat;
-                            cx.spawn(async move |_this, _cx| {
-                                let _ = tx.send(UiCommand::NewSession).await;
-                            })
-                            .detach();
-                            cx.notify();
-                        })),
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _ev, _window, cx| {
+                                let tx = this.cmd_tx.clone();
+                                this.status = "新建中…".into();
+                                this.settings = None;
+                                this.mode = ViewMode::Chat;
+                                cx.spawn(async move |_this, _cx| {
+                                    let _ = tx.send(UiCommand::NewSession).await;
+                                })
+                                .detach();
+                                cx.notify();
+                            }),
+                        ),
                 ),
             )
             // 工作台入口：顶栏去掉之后，首页没有别的路可走了
@@ -6936,13 +6985,20 @@ impl ChatView {
                         .text_color(rgb(TEXT_MUTED))
                         .cursor_pointer()
                         .hover(|s| s.bg(rgb(BG_HOVER)))
-                        .child(Icon::default().path("icons/layout-dashboard.svg").text_size(px(14.0)))
+                        .child(
+                            Icon::default()
+                                .path("icons/layout-dashboard.svg")
+                                .text_size(px(14.0)),
+                        )
                         .child("工作台")
-                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
-                            this.mode = ViewMode::Dashboard;
-                            this.settings = None;
-                            cx.notify();
-                        })),
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _ev, _window, cx| {
+                                this.mode = ViewMode::Dashboard;
+                                this.settings = None;
+                                cx.notify();
+                            }),
+                        ),
                 ),
             )
             .child(div().flex_1().min_h(px(0.0)).child(list))
@@ -6962,7 +7018,11 @@ impl ChatView {
                         div()
                             .cursor_pointer()
                             .hover(|s| s.text_color(rgb(TEXT)))
-                            .text_color(rgb(if self.settings.is_some() { TEXT } else { TEXT_MUTED }))
+                            .text_color(rgb(if self.settings.is_some() {
+                                TEXT
+                            } else {
+                                TEXT_MUTED
+                            }))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, _: &MouseDownEvent, _w, cx| {
@@ -7013,22 +7073,15 @@ impl ChatView {
                     .border_1()
                     .border_color(rgb(BORDER))
                     .bg(rgb(BG_TOOL))
-                    .child(
-                        div()
-                            .text_xs()
-                            .child(if is_img { "🖼" } else { "📄" }),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(TEXT_MUTED))
-                            .child(if a.name.chars().count() > 24 {
-                                let n: String = a.name.chars().take(24).collect();
-                                format!("{n}…")
-                            } else {
-                                a.name.clone()
-                            }),
-                    )
+                    .child(div().text_xs().child(if is_img { "🖼" } else { "📄" }))
+                    .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child(
+                        if a.name.chars().count() > 24 {
+                            let n: String = a.name.chars().take(24).collect();
+                            format!("{n}…")
+                        } else {
+                            a.name.clone()
+                        },
+                    ))
                     .child(
                         Button::new(SharedString::from(format!("drop-attach-{i}")))
                             .ghost()
@@ -7089,9 +7142,7 @@ impl ChatView {
             false => Button::new("send")
                 .primary()
                 .icon(Icon::new(IconName::ArrowUp))
-                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                    this.submit(window, cx)
-                }))
+                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.submit(window, cx)))
                 .into_any_element(),
         };
         // 模型切换放在输入框内部左下角：它和"这条消息"一起生效，
@@ -7113,11 +7164,7 @@ impl ChatView {
                 .selected_model
                 .clone()
                 .unwrap_or_else(|| format!("{}/{}", self.active_provider, self.model));
-            let cur_label = cur_full
-                .split('/')
-                .nth(1)
-                .unwrap_or(&cur_full)
-                .to_string();
+            let cur_label = cur_full.split('/').nth(1).unwrap_or(&cur_full).to_string();
             let groups: Vec<(String, Vec<String>)> = self
                 .models_by_provider
                 .iter()
@@ -7148,9 +7195,8 @@ impl ChatView {
                                     let selected = full == cur_full;
                                     let view = view.clone();
                                     submenu = submenu.item(
-                                        PopupMenuItem::new(m.clone())
-                                            .checked(selected)
-                                            .on_click(move |_, _w, cx| {
+                                        PopupMenuItem::new(m.clone()).checked(selected).on_click(
+                                            move |_, _w, cx| {
                                                 let full = full.clone();
                                                 view.update(cx, |this, cx| {
                                                     this.selected_model = Some(full.clone());
@@ -7170,7 +7216,8 @@ impl ChatView {
                                                     cx.notify();
                                                 })
                                                 .ok();
-                                            }),
+                                            },
+                                        ),
                                     );
                                 }
                                 submenu
@@ -7178,15 +7225,14 @@ impl ChatView {
                         );
                     }
                     // 配置里没声明的模型也允许手填：provider 组合是用户自己写的
-                    menu.separator().item(
-                        PopupMenuItem::new("手动输入模型名…").on_click({
+                    menu.separator()
+                        .item(PopupMenuItem::new("手动输入模型名…").on_click({
                             let view = view.clone();
                             move |_, window, cx| {
                                 view.update(cx, |this, cx| this.begin_model_edit(window, cx))
                                     .ok();
                             }
-                        }),
-                    )
+                        }))
                 })
                 .into_any_element()
         };
@@ -7210,25 +7256,20 @@ impl ChatView {
                         let selected = t == cur;
                         menu = menu.item(
                             PopupMenuItem::element(move |_w, _c| {
-                                let mut row = div()
-                                    .flex()
-                                    .items_start()
-                                    .gap_3()
-                                    .w_full()
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .flex()
-                                            .flex_col()
-                                            .gap(px(2.0))
-                                            .child(div().text_sm().child(t.label()))
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .text_color(rgb(TEXT_DIM))
-                                                    .child(t.description()),
-                                            ),
-                                    );
+                                let mut row = div().flex().items_start().gap_3().w_full().child(
+                                    div()
+                                        .flex_1()
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(2.0))
+                                        .child(div().text_sm().child(t.label()))
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(rgb(TEXT_DIM))
+                                                .child(t.description()),
+                                        ),
+                                );
                                 if selected {
                                     row = row.child(
                                         Icon::new(IconName::Check)
@@ -7274,7 +7315,8 @@ impl ChatView {
                                     .gap_3()
                                     .w_full()
                                     .child(
-                                        Icon::default().path(mode_icon_path(m))
+                                        Icon::default()
+                                            .path(mode_icon_path(m))
                                             .text_size(px(18.0))
                                             .text_color(rgb(TEXT_MUTED)),
                                     )
@@ -7355,8 +7397,7 @@ impl ChatView {
                             for (id, status, desc) in members.iter() {
                                 let view = view.clone();
                                 let open_id = id.clone();
-                                let (id, status, desc) =
-                                    (id.clone(), status.clone(), desc.clone());
+                                let (id, status, desc) = (id.clone(), status.clone(), desc.clone());
                                 menu = menu.item(
                                     PopupMenuItem::element(move |_w, _c| {
                                         let (dot, dot_bg) = match status.as_str() {
@@ -7370,12 +7411,7 @@ impl ChatView {
                                             .items_center()
                                             .gap_2()
                                             .w_full()
-                                            .child(
-                                                div()
-                                                    .size(px(6.0))
-                                                    .rounded_full()
-                                                    .bg(rgb(dot)),
-                                            )
+                                            .child(div().size(px(6.0)).rounded_full().bg(rgb(dot)))
                                             .child(
                                                 div()
                                                     .text_sm()
@@ -7400,13 +7436,15 @@ impl ChatView {
                                                     .child(desc.clone()),
                                             )
                                     })
-                                    .on_click(move |_, _w, cx| {
-                                        let id = open_id.clone();
-                                        view.update(cx, |this, cx| {
-                                            this.open_subagent_panel(&id, cx)
-                                        })
-                                        .ok();
-                                    }),
+                                    .on_click(
+                                        move |_, _w, cx| {
+                                            let id = open_id.clone();
+                                            view.update(cx, |this, cx| {
+                                                this.open_subagent_panel(&id, cx)
+                                            })
+                                            .ok();
+                                        },
+                                    ),
                                 );
                             }
                             menu
@@ -7453,63 +7491,64 @@ impl ChatView {
             }))
             .into_any_element();
 
-        composer.child(
-            div()
-                .relative()
-                .rounded(px(16.0))
-                .border_1()
-                .border_color(rgb(border))
-                .bg(rgb(BG_INPUT))
-                // 底部给按钮留出空间，文字不会钻到按钮底下
-                .pb(px(44.0))
-                .child(
-                    div().px_4().pt_3().child(
-                        Textarea::new(&self.input)
-                            .appearance(false)
-                            .bordered(false)
-                            // 图片/文件粘贴统一走这里：键盘 Ctrl+V 与
-                            // 右键菜单的 Paste 是两条路径，只有这个钩子
-                            // 能同时覆盖（输入框自己只认文本）
-                            .on_paste({
-                                let weak = cx.entity().downgrade();
-                                move |item, _window, cx| {
-                                    weak.update(cx, |this, cx| this.take_paste(item, cx))
-                                        .unwrap_or(false)
-                                }
-                            })
-                            .h(px(self.composer_height(cx))),
+        composer
+            .child(
+                div()
+                    .relative()
+                    .rounded(px(16.0))
+                    .border_1()
+                    .border_color(rgb(border))
+                    .bg(rgb(BG_INPUT))
+                    // 底部给按钮留出空间，文字不会钻到按钮底下
+                    .pb(px(44.0))
+                    .child(
+                        div().px_4().pt_3().child(
+                            Textarea::new(&self.input)
+                                .appearance(false)
+                                .bordered(false)
+                                // 图片/文件粘贴统一走这里：键盘 Ctrl+V 与
+                                // 右键菜单的 Paste 是两条路径，只有这个钩子
+                                // 能同时覆盖（输入框自己只认文本）
+                                .on_paste({
+                                    let weak = cx.entity().downgrade();
+                                    move |item, _window, cx| {
+                                        weak.update(cx, |this, cx| this.take_paste(item, cx))
+                                            .unwrap_or(false)
+                                    }
+                                })
+                                .h(px(self.composer_height(cx))),
+                        ),
+                    )
+                    // 按钮浮在右下角：它们属于这条消息的一部分，
+                    // 摆在框外会让人以为是独立控件
+                    .child(
+                        div()
+                            .absolute()
+                            .right(px(10.0))
+                            .bottom(px(8.0))
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .children(team_entry)
+                            .child(model_picker)
+                            .child(voice_btn)
+                            .child(send_btn),
+                    )
+                    // 左下角：模型切换。和右下角的发送键同处框内，
+                    // 用户一眼能看出"模型 + 内容"是同一条消息的属性
+                    .child(
+                        div()
+                            .absolute()
+                            .left(px(10.0))
+                            .bottom(px(8.0))
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(attach_btn)
+                            .child(mode_picker)
+                            .child(thinking_picker),
                     ),
-                )
-                // 按钮浮在右下角：它们属于这条消息的一部分，
-                // 摆在框外会让人以为是独立控件
-                .child(
-                    div()
-                        .absolute()
-                        .right(px(10.0))
-                        .bottom(px(8.0))
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .children(team_entry)
-                        .child(model_picker)
-                        .child(voice_btn)
-                        .child(send_btn),
-                )
-                // 左下角：模型切换。和右下角的发送键同处框内，
-                // 用户一眼能看出"模型 + 内容"是同一条消息的属性
-                .child(
-                    div()
-                        .absolute()
-                        .left(px(10.0))
-                        .bottom(px(8.0))
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(attach_btn)
-                        .child(mode_picker)
-                        .child(thinking_picker),
-                ),
-        )
+            )
             .child(
                 div()
                     .flex()
@@ -7540,7 +7579,11 @@ impl ChatView {
                         ));
                         div()
                             .text_xs()
-                            .text_color(if typed > 2000 { rgb(DANGER) } else { rgb(TEXT_DIM) })
+                            .text_color(if typed > 2000 {
+                                rgb(DANGER)
+                            } else {
+                                rgb(TEXT_DIM)
+                            })
                             .child(label)
                     }),
             )
@@ -7553,22 +7596,18 @@ impl ChatView {
         };
 
         let mut actions = div().flex().items_center().gap_2();
-        actions = actions.child(
-            Button::new("approve").primary().label("批准").on_click(cx.listener(
-                |this, _: &ClickEvent, _w, cx| this.respond(true, false, cx),
-            )),
-        );
-        actions = actions.child(
-            Button::new("reject").label("拒绝").on_click(cx.listener(
-                |this, _: &ClickEvent, _w, cx| this.respond(false, false, cx),
-            )),
-        );
+        actions =
+            actions.child(Button::new("approve").primary().label("批准").on_click(
+                cx.listener(|this, _: &ClickEvent, _w, cx| this.respond(true, false, cx)),
+            ));
+        actions =
+            actions.child(Button::new("reject").label("拒绝").on_click(
+                cx.listener(|this, _: &ClickEvent, _w, cx| this.respond(false, false, cx)),
+            ));
         if req.grantable {
-            actions = actions.child(
-                Button::new("always").label("批准并记住此类").on_click(cx.listener(
-                    |this, _: &ClickEvent, _w, cx| this.respond(true, true, cx),
-                )),
-            );
+            actions = actions.child(Button::new("always").label("批准并记住此类").on_click(
+                cx.listener(|this, _: &ClickEvent, _w, cx| this.respond(true, true, cx)),
+            ));
         }
         // 后面还压着几个？写出来，免得用户以为处理完就没事了
         let queued = self.pending_approvals.len();
@@ -7602,12 +7641,7 @@ impl ChatView {
                             .flex()
                             .items_center()
                             .gap_2()
-                            .child(
-                                div()
-                                    .text_lg()
-                                    .text_color(rgb(BRAND))
-                                    .child("⚠"),
-                            )
+                            .child(div().text_lg().text_color(rgb(BRAND)).child("⚠"))
                             .child(
                                 div()
                                     .text_sm()
@@ -7737,12 +7771,7 @@ impl Render for ChatView {
             .text_color(rgb(TEXT))
             .child(self.render_titlebar(window, cx))
             .child({
-                let mut main = div()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .h_full()
-                    .flex()
-                    .flex_col();
+                let mut main = div().flex_1().min_w(px(0.0)).h_full().flex().flex_col();
                 if let Some(tab) = self.settings {
                     // 设置页盖住主区：它是个"离开对话"的动作，
                     // 和消息流并排没意义
@@ -7781,7 +7810,6 @@ impl Render for ChatView {
         }
         root
     }
-
 }
 
 /// 斜杠命令表。菜单渲染和键盘导航都用它。
@@ -7877,8 +7905,16 @@ fn base64_encode(bytes: &[u8]) -> String {
         let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
         out.push(T[(n >> 18) as usize & 63] as char);
         out.push(T[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
-        out.push(if chunk.len() > 2 { T[n as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            T[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            T[n as usize & 63] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -8012,7 +8048,9 @@ fn lang_from_path(path: &str) -> String {
 /// 取不到就返回 None —— 调用方据此决定要不要显示"打开文件"的入口。
 fn path_from_args(args: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(args).ok()?;
-    v.get("path").and_then(|x| x.as_str()).map(|s| s.to_string())
+    v.get("path")
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_string())
 }
 
 /// 按平台选择 UI 字体。
@@ -8065,7 +8103,11 @@ fn history_to_items(msgs: &[zex_core::Message]) -> Vec<MsgItem> {
                     text: m.text(),
                 });
             }
-            Message::Assistant { content, tool_calls, .. } => {
+            Message::Assistant {
+                content,
+                tool_calls,
+                ..
+            } => {
                 // 思考过程也要还原。它已经存在历史里（Part::Thinking），
                 // 只是 m.text() 只拼 Text 片段 —— 不回放的话，
                 // 重开会话就只剩结论，看不出当时是怎么想的
@@ -8085,7 +8127,10 @@ fn history_to_items(msgs: &[zex_core::Message]) -> Vec<MsgItem> {
                 }
                 let t = m.text();
                 if !t.trim().is_empty() {
-                    out.push(MsgItem { kind: MsgKind::Assistant, text: t });
+                    out.push(MsgItem {
+                        kind: MsgKind::Assistant,
+                        text: t,
+                    });
                 }
                 // 历史里的工具调用也要还原成卡片，否则回看会话时
                 // 只剩一堆结果、看不出中间发生了什么
@@ -8102,7 +8147,9 @@ fn history_to_items(msgs: &[zex_core::Message]) -> Vec<MsgItem> {
                     );
                 }
             }
-            Message::Tool { content, is_error, .. } => {
+            Message::Tool {
+                content, is_error, ..
+            } => {
                 // 结果的归属靠"前面那条还没配对的调用"，不靠工具名 ——
                 // 同一轮里连着调两个 shell 时名字是重复的
                 if !merge_tool_result(&mut out, !*is_error, content.clone()) {
@@ -8133,7 +8180,11 @@ fn summaries_to_items(list: &[zex_core::event::SessionSummary]) -> Vec<SessionIt
         .map(|s| {
             let title = if s.title.trim().is_empty() {
                 let raw = s.id.as_str();
-                let tail = if raw.len() > 6 { &raw[raw.len() - 6..] } else { raw };
+                let tail = if raw.len() > 6 {
+                    &raw[raw.len() - 6..]
+                } else {
+                    raw
+                };
                 format!("会话 {tail}")
             } else {
                 s.title.clone()
@@ -8172,7 +8223,11 @@ fn load_tasks(store: &zex_store::Store) -> Vec<zex_store::tasks::TaskRecord> {
     let mut all = Vec::new();
     for group in [
         vec![TaskStatus::Running, TaskStatus::Queued],
-        vec![TaskStatus::Completed, TaskStatus::Failed, TaskStatus::Cancelled],
+        vec![
+            TaskStatus::Completed,
+            TaskStatus::Failed,
+            TaskStatus::Cancelled,
+        ],
     ] {
         if let Ok(mut list) = store.list_tasks_by_status(&group, 20) {
             all.append(&mut list);
@@ -8242,7 +8297,11 @@ fn load_sessions(store: &zex_store::Store) -> Vec<SessionItem> {
                 // session id 形如 ses_<uuidv7>，前缀是时间戳所以彼此相同；
                 // 取尾部 6 位才能区分
                 let raw = s.id.as_str();
-                let tail = if raw.len() > 6 { &raw[raw.len() - 6..] } else { raw };
+                let tail = if raw.len() > 6 {
+                    &raw[raw.len() - 6..]
+                } else {
+                    raw
+                };
                 format!("会话 {tail}")
             } else {
                 s.title
@@ -8364,35 +8423,30 @@ fn main() {
     let cmd_tx = handles.cmd_tx.clone();
     let mut event_rx = handles.event_rx;
 
-    gpui_kit::application().with_assets(ZexAssets).run(move |cx| {
-        gpui_kit::init(cx);
-        // 设计稿是浅色主题
-        gpui_kit::component::Theme::change(
-            gpui_kit::component::ThemeMode::Light,
-            None,
-            cx,
-        );
-        apply_platform_font(cx);
+    gpui_kit::application()
+        .with_assets(ZexAssets)
+        .run(move |cx| {
+            gpui_kit::init(cx);
+            // 设计稿是浅色主题
+            gpui_kit::component::Theme::change(gpui_kit::component::ThemeMode::Light, None, cx);
+            apply_platform_font(cx);
 
-        let options = WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(Bounds::new(
-                point(px(80.0), px(60.0)),
-                size(px(1280.0), px(820.0)),
-            ))),
-            titlebar: Some(TitlebarOptions {
-                title: Some("Zex".into()),
-                // 系统标题栏让位给自绘的那一条：
-                // macOS/Windows 靠 appears_transparent，Linux 靠 window_decorations
-                appears_transparent: true,
-                traffic_light_position: Some(point(px(14.0), px(12.0))),
-            }),
-            window_decorations: Some(WindowDecorations::Client),
-            ..Default::default()
-        };
-        let (handle, view) = match gpui_kit::open_window(
-            options,
-            cx,
-            |window, cx| {
+            let options = WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                    point(px(80.0), px(60.0)),
+                    size(px(1280.0), px(820.0)),
+                ))),
+                titlebar: Some(TitlebarOptions {
+                    title: Some("Zex".into()),
+                    // 系统标题栏让位给自绘的那一条：
+                    // macOS/Windows 靠 appears_transparent，Linux 靠 window_decorations
+                    appears_transparent: true,
+                    traffic_light_position: Some(point(px(14.0), px(12.0))),
+                }),
+                window_decorations: Some(WindowDecorations::Client),
+                ..Default::default()
+            };
+            let (handle, view) = match gpui_kit::open_window(options, cx, |window, cx| {
                 // niri/sway 这类平铺器会忽略 WindowOptions 里的初始尺寸，
                 // 这里再显式要一次；被忽略也无害（浮动窗口自行决定）。
                 window.resize(size(px(1280.0), px(820.0)));
@@ -8595,12 +8649,15 @@ fn main() {
                         let session = view.read_with(cx, |v, _| v.active_session.clone());
                         {
                             // 同步投递即可：内核那边是独立线程
-                            let mode = std::env::var("ZEX_AUTO_MODE").ok().map(|m| match m.as_str() {
-                                "auto_edit" => zex_core::RunMode::AutoEdit,
-                                "plan" => zex_core::RunMode::Plan,
-                                "full_access" => zex_core::RunMode::FullAccess,
-                                _ => zex_core::RunMode::Confirm,
-                            });
+                            let mode =
+                                std::env::var("ZEX_AUTO_MODE")
+                                    .ok()
+                                    .map(|m| match m.as_str() {
+                                        "auto_edit" => zex_core::RunMode::AutoEdit,
+                                        "plan" => zex_core::RunMode::Plan,
+                                        "full_access" => zex_core::RunMode::FullAccess,
+                                        _ => zex_core::RunMode::Confirm,
+                                    });
                             let _ = tx.try_send(UiCommand::UserPrompt {
                                 session: zex_core::SessionId::from(session),
                                 text: prompt,
@@ -8614,27 +8671,26 @@ fn main() {
                 }
 
                 view
-            },
-        ) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("无法创建窗口: {e}");
-                return;
-            }
-        };
-        let _ = handle;
-
-        let weak = view.downgrade();
-        cx.spawn(async move |cx| {
-            while let Some(ev) = event_rx.recv().await {
-                let alive = weak.update(cx, |this, cx| this.handle_event(ev, cx)).is_ok();
-                if !alive {
-                    break;
+            }) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("无法创建窗口: {e}");
+                    return;
                 }
-            }
-        })
-        .detach();
-    });
+            };
+            let _ = handle;
+
+            let weak = view.downgrade();
+            cx.spawn(async move |cx| {
+                while let Some(ev) = event_rx.recv().await {
+                    let alive = weak
+                        .update(cx, |this, cx| this.handle_event(ev, cx))
+                        .is_ok();
+                    if !alive {
+                        break;
+                    }
+                }
+            })
+            .detach();
+        });
 }
-
-

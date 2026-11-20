@@ -167,8 +167,9 @@ impl Tool for ExtensionLogs {
         let entries = crate::ext_logs::recent(lines, args.min_level.as_deref());
         if entries.is_empty() {
             return Ok(ToolOutput {
-                content: "没有日志。可能是：确实没输出、已经被 ext_check 清空、或日志级别被过滤掉了"
-                    .into(),
+                content:
+                    "没有日志。可能是：确实没输出、已经被 ext_check 清空、或日志级别被过滤掉了"
+                        .into(),
                 is_error: false,
                 meta: None,
             });
@@ -359,7 +360,10 @@ impl Tool for ExtensionUninstall {
             message: format!("删除失败 {}: {e}", dir.display()),
         })?;
         Ok(ToolOutput {
-            content: format!("已删除应用 `{id}`（{}）。已固定的侧边栏入口会在下次启动时消失。", dir.display()),
+            content: format!(
+                "已删除应用 `{id}`（{}）。已固定的侧边栏入口会在下次启动时消失。",
+                dir.display()
+            ),
             is_error: false,
             meta: None,
         })

@@ -424,7 +424,8 @@ impl ModeCell {
 
     /// 改当前模式。下一��工具判定立刻生效。
     pub fn set(&self, mode: RunMode) {
-        self.0.store(mode.as_u8(), std::sync::atomic::Ordering::Relaxed);
+        self.0
+            .store(mode.as_u8(), std::sync::atomic::Ordering::Relaxed);
     }
 }
 

@@ -164,8 +164,7 @@ fn build_command(command: &str) -> tokio::process::Command {
         // 中文环境下输出是 GBK，而这些字节被当成 UTF-8 解析就是一堆
         // 乱码（`dir` 的输出会变成 `������`）。chcp 的提示信息用 >nul 吃掉。
         let mut c = tokio::process::Command::new("cmd");
-        c.arg("/C")
-            .arg(format!("chcp 65001 >nul && {command}"));
+        c.arg("/C").arg(format!("chcp 65001 >nul && {command}"));
         c
     }
     #[cfg(not(windows))]

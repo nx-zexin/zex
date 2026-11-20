@@ -190,7 +190,10 @@ pub fn load() -> Result<ResolvedConfig> {
         let mut all = BTreeMap::new();
         all.insert(kind_str.clone(), provider.clone());
         let mut models = BTreeMap::new();
-        models.insert(kind_str.clone(), model_list(&ProviderEntry::default(), &kind_str, Some(&model)));
+        models.insert(
+            kind_str.clone(),
+            model_list(&ProviderEntry::default(), &kind_str, Some(&model)),
+        );
         return Ok(ResolvedConfig {
             provider,
             model,
@@ -293,11 +296,7 @@ fn builtin_models(provider: &str) -> &'static [&'static str] {
         // deepseek-flash 与 deepseek-v4-pro。旧的 deepseek-chat /
         // deepseek-reasoner 已不在文档里，仍可调用但会映射到新模型。
         "deepseek" => &["deepseek-flash", "deepseek-v4-pro"],
-        "anthropic" | "claude" => &[
-            "claude-opus-4-6",
-            "claude-sonnet-4-6",
-            "claude-haiku-4-5",
-        ],
+        "anthropic" | "claude" => &["claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5"],
         "openai" | "gpt" => &["gpt-5", "gpt-5-mini", "o4"],
         "moonshot" | "moonshotai" | "kimi" => &["kimi-k2", "kimi-k2-turbo"],
         "google" | "gemini" => &["gemini-2.5-pro", "gemini-2.5-flash"],
@@ -448,8 +447,7 @@ pub fn remove_model(cfg: &mut FileConfig, provider: &str, model: &str) {
 /// 下次启动就读不到配置了。
 pub fn save_file_config(cfg: &FileConfig) -> Result<()> {
     let dir = config_dir();
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| Error::Config(format!("创建配置目录失败: {e}")))?;
+    std::fs::create_dir_all(&dir).map_err(|e| Error::Config(format!("创建配置目录失败: {e}")))?;
     let path = dir.join("config.json");
     let tmp = dir.join("config.json.tmp");
     let text = serde_json::to_string_pretty(cfg)
@@ -630,8 +628,16 @@ mod tests {
         upsert_provider(&mut c, "b", e, Some("a")).unwrap();
 
         assert!(!c.providers.contains_key("a"), "旧名应当消失");
-        assert_eq!(c.providers["b"].models, vec!["m1", "m2"], "模型列表要跟过来");
-        assert_eq!(c.default_model.as_deref(), Some("b/m1"), "默认模型要跟着改名");
+        assert_eq!(
+            c.providers["b"].models,
+            vec!["m1", "m2"],
+            "模型列表要跟过来"
+        );
+        assert_eq!(
+            c.default_model.as_deref(),
+            Some("b/m1"),
+            "默认模型要跟着改名"
+        );
         assert_eq!(c.providers["b"].base_url, "https://new/v1");
     }
 
@@ -666,7 +672,11 @@ mod tests {
         let mut c = cfg_with();
         remove_model(&mut c, "a", "m1");
         assert_eq!(c.providers["a"].models, vec!["m2"]);
-        assert_eq!(c.default_model.as_deref(), Some("a/m2"), "默认要换成剩下的第一个");
+        assert_eq!(
+            c.default_model.as_deref(),
+            Some("a/m2"),
+            "默认要换成剩下的第一个"
+        );
     }
 
     #[test]
@@ -752,35 +762,32 @@ mod tests {
         assert!(cfg.pinned_extensions.is_empty());
     }
 
-#[cfg(test)]
-mod tests_network_grants {
-    use super::*;
+    #[cfg(test)]
+    mod tests_network_grants {
+        use super::*;
 
-    #[test]
-    fn grants_roundtrip() {
-        let mut c = FileConfig::default();
-        c.network_grants
-            .insert("weather".into(), vec!["api.example.com".into()]);
-        // 空列表有明确含义（拒绝过），必须能原样存回去
-        c.network_grants.insert("news".into(), Vec::new());
-        let json = serde_json::to_string(&c).unwrap();
-        let back: FileConfig = serde_json::from_str(&json).unwrap();
-        assert_eq!(
-            back.network_grants.get("weather").map(|v| v.len()),
-            Some(1)
-        );
-        assert_eq!(
-            back.network_grants.get("news").map(|v| v.is_empty()),
-            Some(true),
-            "拒绝过（空列表）不能被读成\"没问过\""
-        );
-        assert!(!back.network_grants.contains_key("other"));
-    }
+        #[test]
+        fn grants_roundtrip() {
+            let mut c = FileConfig::default();
+            c.network_grants
+                .insert("weather".into(), vec!["api.example.com".into()]);
+            // 空列表有明确含义（拒绝过），必须能原样存回去
+            c.network_grants.insert("news".into(), Vec::new());
+            let json = serde_json::to_string(&c).unwrap();
+            let back: FileConfig = serde_json::from_str(&json).unwrap();
+            assert_eq!(back.network_grants.get("weather").map(|v| v.len()), Some(1));
+            assert_eq!(
+                back.network_grants.get("news").map(|v| v.is_empty()),
+                Some(true),
+                "拒绝过（空列表）不能被读成\"没问过\""
+            );
+            assert!(!back.network_grants.contains_key("other"));
+        }
 
-    #[test]
-    fn missing_field_means_never_asked() {
-        let c: FileConfig = serde_json::from_str("{}").unwrap();
-        assert!(c.network_grants.is_empty());
+        #[test]
+        fn missing_field_means_never_asked() {
+            let c: FileConfig = serde_json::from_str("{}").unwrap();
+            assert!(c.network_grants.is_empty());
+        }
     }
-}
 }

@@ -185,12 +185,17 @@ async fn async_main() -> ExitCode {
                         eprintln!("（审批请求已失效）");
                     }
                 }
-                CoreEvent::TurnEnded { reason, usage, steps, elapsed_ms, .. } => {
+                CoreEvent::TurnEnded {
+                    reason,
+                    usage,
+                    steps,
+                    elapsed_ms,
+                    ..
+                } => {
                     // 收尾要说清楚：干完了没有、花了多少。跑几小时的任务
                     // 尤其需要这一行 —— 没有落款就分不清"完成"和"卡住"。
-                    let took = zex_agent::human_elapsed(std::time::Duration::from_millis(
-                        elapsed_ms,
-                    ));
+                    let took =
+                        zex_agent::human_elapsed(std::time::Duration::from_millis(elapsed_ms));
                     eprintln!(
                         "\n[{:?}] {steps} 步 · 用时 {took} · tokens: in {} / out {}",
                         reason, usage.input_tokens, usage.output_tokens
@@ -216,8 +221,15 @@ async fn async_main() -> ExitCode {
     if !leftovers.is_empty() {
         eprintln!("\n[收尾] 等子智能体结束：");
         for a in &leftovers {
-            eprintln!("  {} · {}{}", a.id, a.status.label(),
-                a.result.as_ref().map(|r| format!(" — {}", r.chars().take(80).collect::<String>())).unwrap_or_default());
+            eprintln!(
+                "  {} · {}{}",
+                a.id,
+                a.status.label(),
+                a.result
+                    .as_ref()
+                    .map(|r| format!(" — {}", r.chars().take(80).collect::<String>()))
+                    .unwrap_or_default()
+            );
         }
     }
     drop(tx);

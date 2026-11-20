@@ -113,7 +113,12 @@ impl Tool for FsRead {
             if emitted >= limit {
                 continue; // 继续数行数以给出总数
             }
-            out.push_str(&format!("{:>num_width$}\t{}\n", i + 1, line, num_width = num_width));
+            out.push_str(&format!(
+                "{:>num_width$}\t{}\n",
+                i + 1,
+                line,
+                num_width = num_width
+            ));
             emitted += 1;
         }
 

@@ -10,9 +10,9 @@
 
 pub mod config;
 pub mod ext_logs;
+pub mod ext_tools;
 /// 把脚本 API 的 `.d.ts` 生成到技能目录，模型写扩展前查的就是它。
 pub mod ext_typings;
-pub mod ext_tools;
 pub mod models_dev;
 /// 自绘标题栏的窗口动作（拖动 / 最大化还原）。Windows 上绕过 gpui 的两个缺陷。
 pub mod window_ops;
@@ -225,7 +225,10 @@ pub fn load_skills() -> std::sync::Arc<zex_skill::SkillRegistry> {
 }
 
 /// 打开最近一个会话（若无则新建），并加载技能。
-pub fn build_agent_resuming(cfg: &ResolvedConfig, cwd: PathBuf) -> zex_core::Result<zex_agent::Agent> {
+pub fn build_agent_resuming(
+    cfg: &ResolvedConfig,
+    cwd: PathBuf,
+) -> zex_core::Result<zex_agent::Agent> {
     build_agent_resuming_with(cfg, cwd, Vec::new())
 }
 
@@ -269,10 +272,12 @@ pub fn build_agent_resuming_with(
 
     // 跳过空会话：每次启动都会留下一个没说话的会话壳，
     // 直接恢复它会让用户以为历史丢了。
-    let latest = store
-        .list_visible_sessions(8)?
-        .into_iter()
-        .find(|s| !store.load_messages(&s.id).map(|m| m.is_empty()).unwrap_or(true));
+    let latest = store.list_visible_sessions(8)?.into_iter().find(|s| {
+        !store
+            .load_messages(&s.id)
+            .map(|m| m.is_empty())
+            .unwrap_or(true)
+    });
 
     let mut tools = zex_tools::default_tools();
     if !skills.all().is_empty() {
@@ -285,7 +290,12 @@ pub fn build_agent_resuming_with(
     match latest {
         Some(session) => {
             // 恢复失败时退回新建，不让一次数据问题把应用卡死
-            match zex_agent::Agent::resume(agent_cfg.clone(), tools.clone(), store.clone(), session.id) {
+            match zex_agent::Agent::resume(
+                agent_cfg.clone(),
+                tools.clone(),
+                store.clone(),
+                session.id,
+            ) {
                 Ok(a) => Ok(a),
                 Err(e) => {
                     tracing::warn!(error = %e, "恢复会话失败，改为新建");
@@ -313,11 +323,7 @@ fn apply_model_params(cfg: &mut zex_agent::AgentConfig, provider: &str, model: &
 ///
 /// 单独一个纯函数是为了能测：`apply_model_params` 要读磁盘，测起来得
 /// 折腾环境变量，而"没配参数时该回到默认"这条恰恰是最容易写错的地方。
-fn params_for_model(
-    file: Option<&FileConfig>,
-    provider: &str,
-    model: &str,
-) -> ModelParams {
+fn params_for_model(file: Option<&FileConfig>, provider: &str, model: &str) -> ModelParams {
     file.and_then(|f| {
         f.providers
             .get(provider)
@@ -345,16 +351,31 @@ pub fn attach_team_tools(
     store: Store,
     ev_tx: mpsc::Sender<CoreEvent>,
     broker: Arc<zex_agent::ApprovalBroker>,
-) -> (Arc<zex_agent::subagent::AgentRegistry>, Vec<Arc<dyn zex_core::tool::ErasedTool>>) {
-    use zex_agent::subagent::{AgentRegistry, SendMessage, SpawnAgent, TeamStatus, TerminateAgent, WaitForAgents};
+) -> (
+    Arc<zex_agent::subagent::AgentRegistry>,
+    Vec<Arc<dyn zex_core::tool::ErasedTool>>,
+) {
+    use zex_agent::subagent::{
+        AgentRegistry, SendMessage, SpawnAgent, TeamStatus, TerminateAgent, WaitForAgents,
+    };
 
     let registry = Arc::new(AgentRegistry::new());
     let mut tools = zex_tools::default_tools();
-    tools.push(Arc::new(SpawnAgent { registry: registry.clone() }));
-    tools.push(Arc::new(TeamStatus { registry: registry.clone() }));
-    tools.push(Arc::new(WaitForAgents { registry: registry.clone() }));
-    tools.push(Arc::new(SendMessage { registry: registry.clone() }));
-    tools.push(Arc::new(TerminateAgent { registry: registry.clone() }));
+    tools.push(Arc::new(SpawnAgent {
+        registry: registry.clone(),
+    }));
+    tools.push(Arc::new(TeamStatus {
+        registry: registry.clone(),
+    }));
+    tools.push(Arc::new(WaitForAgents {
+        registry: registry.clone(),
+    }));
+    tools.push(Arc::new(SendMessage {
+        registry: registry.clone(),
+    }));
+    tools.push(Arc::new(TerminateAgent {
+        registry: registry.clone(),
+    }));
     registry.install(agent_cfg, tools.clone(), store, ev_tx, broker);
     (registry, tools)
 }
@@ -373,7 +394,8 @@ pub fn build_agent_with_team(
     let skills = load_skills();
     let agent_cfg = agent_config_for(cfg, cwd, &skills);
     let broker = Arc::new(zex_agent::ApprovalBroker::new());
-    let (registry, tools) = attach_team_tools(agent_cfg.clone(), store.clone(), ev_tx, broker.clone());
+    let (registry, tools) =
+        attach_team_tools(agent_cfg.clone(), store.clone(), ev_tx, broker.clone());
     let agent = zex_agent::Agent::new(agent_cfg, tools, store)?.with_shared_approvals(broker);
     Ok((agent, registry))
 }
@@ -390,7 +412,8 @@ pub fn build_ephemeral_agent_with_team(
     let skills = load_skills();
     let agent_cfg = agent_config_for(cfg, cwd, &skills);
     let broker = Arc::new(zex_agent::ApprovalBroker::new());
-    let (registry, tools) = attach_team_tools(agent_cfg.clone(), store.clone(), ev_tx, broker.clone());
+    let (registry, tools) =
+        attach_team_tools(agent_cfg.clone(), store.clone(), ev_tx, broker.clone());
     let agent = zex_agent::Agent::new(agent_cfg, tools, store)?.with_shared_approvals(broker);
     Ok((agent, registry))
 }
@@ -553,7 +576,10 @@ pub fn spawn_core(
     let spawn_result = std::thread::Builder::new()
         .name("zex-core".into())
         .spawn(move || {
-            let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+            let rt = match tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+            {
                 Ok(rt) => rt,
                 Err(e) => {
                     tracing::error!(error = %e, "无法创建内核运行时");
@@ -563,7 +589,14 @@ pub fn spawn_core(
             rt.block_on(async move {
                 while let Some(cmd) = cmd_rx.recv().await {
                     match cmd {
-                        UiCommand::UserPrompt { session, text, attachments, model, mode, thinking } => {
+                        UiCommand::UserPrompt {
+                            session,
+                            text,
+                            attachments,
+                            model,
+                            mode,
+                            thinking,
+                        } => {
                             // 派到后台执行，主循环立刻回去收下一条命令 ——
                             // 否则一个慢任务会把「切会话」「审批」全堵在队列里。
                             // 同一会话内部仍串行（run_task 里的会话锁），
@@ -615,8 +648,16 @@ pub fn spawn_core(
                                 // 要求重启才生效没有道理，而且他看不出来没生效。
                                 apply_model_params(&mut task_cfg, &eff_provider, &eff_model);
                                 run_task(
-                                    task_cfg, tools, store, session, text, attachments, ev,
-                                    locks, broker, cell,
+                                    task_cfg,
+                                    tools,
+                                    store,
+                                    session,
+                                    text,
+                                    attachments,
+                                    ev,
+                                    locks,
+                                    broker,
+                                    cell,
                                 )
                                 .await;
                             });
@@ -634,19 +675,15 @@ pub fn spawn_core(
                             let provider = agent.provider().clone();
                             let ev = ev_tx.clone();
                             tokio::spawn(async move {
-                                let out =
-                                    zex_llm::transcribe(&http, &provider, audio).await;
+                                let out = zex_llm::transcribe(&http, &provider, audio).await;
                                 let (text, error) = match out {
-                                    Ok(t) if t.is_empty() => (
-                                        None,
-                                        Some("没有识别出内容，可能说得太轻".to_string()),
-                                    ),
+                                    Ok(t) if t.is_empty() => {
+                                        (None, Some("没有识别出内容，可能说得太轻".to_string()))
+                                    }
                                     Ok(t) => (Some(t), None),
                                     Err(e) => (None, Some(e.to_string())),
                                 };
-                                let _ = ev
-                                    .send(CoreEvent::Transcribed { text, error })
-                                    .await;
+                                let _ = ev.send(CoreEvent::Transcribed { text, error }).await;
                             });
                         }
                         UiCommand::Approve { id, remember } => {
@@ -746,26 +783,24 @@ pub fn spawn_core(
                                 }
                             }
                         }
-                        UiCommand::NewSession => {
-                            match agent.new_session() {
-                                Ok(()) => {
-                                    let _ = ev_tx
-                                        .send(CoreEvent::SessionSwitched {
-                                            session: agent.session_id().to_string(),
-                                            history: Vec::new(),
-                                            sessions: session_summaries(&agent),
-                                        })
-                                        .await;
-                                }
-                                Err(e) => {
-                                    let _ = ev_tx
-                                        .send(CoreEvent::Warning {
-                                            message: format!("新建会话失败：{e}"),
-                                        })
-                                        .await;
-                                }
+                        UiCommand::NewSession => match agent.new_session() {
+                            Ok(()) => {
+                                let _ = ev_tx
+                                    .send(CoreEvent::SessionSwitched {
+                                        session: agent.session_id().to_string(),
+                                        history: Vec::new(),
+                                        sessions: session_summaries(&agent),
+                                    })
+                                    .await;
                             }
-                        }
+                            Err(e) => {
+                                let _ = ev_tx
+                                    .send(CoreEvent::Warning {
+                                        message: format!("新建会话失败：{e}"),
+                                    })
+                                    .await;
+                            }
+                        },
                         UiCommand::SwitchSession { session } => {
                             match agent.switch_session(session.clone()) {
                                 Ok(()) => {
@@ -802,7 +837,10 @@ pub fn spawn_core(
         tracing::error!(error = %e, "无法启动内核线程");
     }
 
-    CoreHandles { cmd_tx, event_rx: ev_rx }
+    CoreHandles {
+        cmd_tx,
+        event_rx: ev_rx,
+    }
 }
 
 /// 每个会话一把锁：同一会话的任务排队，不同会话并行。
@@ -868,7 +906,9 @@ async fn run_task(
     let _ = store.start_task(&task_id);
 
     let mut agent = match Agent::resume(cfg, tools, store.clone(), session.clone()) {
-        Ok(agent) => agent.with_shared_approvals(broker).with_mode_cell(mode_cell),
+        Ok(agent) => agent
+            .with_shared_approvals(broker)
+            .with_mode_cell(mode_cell),
         Err(e) => {
             let _ = store.finish_task(
                 &task_id,
@@ -950,7 +990,9 @@ mod model_params_tests {
             ProviderEntry {
                 kind: "openai-compat".into(),
                 base_url: "https://api.deepseek.com/v1".into(),
-                params: [("deepseek-flash".to_string(), params)].into_iter().collect(),
+                params: [("deepseek-flash".to_string(), params)]
+                    .into_iter()
+                    .collect(),
                 ..Default::default()
             },
         );
@@ -984,9 +1026,21 @@ mod model_params_tests {
             max_tokens: Some(4096),
             ..Default::default()
         });
-        assert!(params_for_model(Some(&f), "nope", "deepseek-flash").max_tokens.is_none());
-        assert!(params_for_model(Some(&f), "deepseek", "nope").max_tokens.is_none());
-        assert!(params_for_model(None, "deepseek", "deepseek-flash").max_tokens.is_none());
+        assert!(
+            params_for_model(Some(&f), "nope", "deepseek-flash")
+                .max_tokens
+                .is_none()
+        );
+        assert!(
+            params_for_model(Some(&f), "deepseek", "nope")
+                .max_tokens
+                .is_none()
+        );
+        assert!(
+            params_for_model(None, "deepseek", "deepseek-flash")
+                .max_tokens
+                .is_none()
+        );
     }
 }
 
@@ -1002,7 +1056,10 @@ mod system_banner_tests {
     #[test]
     fn long_error_gets_the_wide_layout() {
         // 真实报错带一段原文，远超一行
-        let text = format!("✗ 出错了：工具 `fs_write` 的参数不是合法 JSON: {}", "字".repeat(200));
+        let text = format!(
+            "✗ 出错了：工具 `fs_write` 的参数不是合法 JSON: {}",
+            "字".repeat(200)
+        );
         assert!(system_banner_is_long(&text));
     }
 
@@ -1070,9 +1127,15 @@ mod control_panel_tests {
         let ctx = MockCtx {
             sid: SessionId::generate(),
         };
-        tool.call(&ctx, ControlPanelArgs { open: false, agent: None })
-            .await
-            .expect("发送应当成功");
+        tool.call(
+            &ctx,
+            ControlPanelArgs {
+                open: false,
+                agent: None,
+            },
+        )
+        .await
+        .expect("发送应当成功");
         match rx.recv().await.expect("应收到事件") {
             CoreEvent::PanelControl { open, agent } => {
                 assert!(!open);
@@ -1106,7 +1169,10 @@ mod skills_tests {
         assert!(path.exists(), "内置技能应被铺到磁盘");
         let once = std::fs::read_to_string(&path).unwrap();
         assert!(once.contains("write-extension") || once.contains("给 zex 写"));
-        assert!(dir.join(BUNDLE_STATE).exists(), "应记下铺的版本，用于下次判断");
+        assert!(
+            dir.join(BUNDLE_STATE).exists(),
+            "应记下铺的版本，用于下次判断"
+        );
     }
 
     #[test]
@@ -1124,7 +1190,10 @@ mod skills_tests {
         .unwrap();
         install_bundled_skills(&dir);
         let after = std::fs::read_to_string(&path).unwrap();
-        assert!(!after.contains("旧内容"), "没改过的旧版必须被升级，否则会误导模型");
+        assert!(
+            !after.contains("旧内容"),
+            "没改过的旧版必须被升级，否则会误导模型"
+        );
         assert!(after.contains("icon.svg"), "新版内容应到位");
     }
 
@@ -1156,7 +1225,10 @@ mod skills_tests {
         assert!(after.contains("icon.svg"), "没有记录时也要升级到新版");
         let backup = dir.join(".bundled-backup-write-extension.md");
         let kept = std::fs::read_to_string(&backup).unwrap();
-        assert!(kept.contains("上一代内容"), "旧内容必须留个备份，不能凭空消失");
+        assert!(
+            kept.contains("上一代内容"),
+            "旧内容必须留个备份，不能凭空消失"
+        );
     }
 
     #[test]

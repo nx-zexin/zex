@@ -211,7 +211,10 @@ fn parse_rule(entry: &str) -> Result<HostRule, String> {
         .rsplit_once('@')
         .map(|(_, h)| h)
         .unwrap_or(entry);
-    let raw_host = raw_host.rsplit_once(':').map(|(h, _)| h).unwrap_or(raw_host);
+    let raw_host = raw_host
+        .rsplit_once(':')
+        .map(|(h, _)| h)
+        .unwrap_or(raw_host);
     if raw_host.trim_end().ends_with('.') {
         return Err(format!(
             "`{entry}` 结尾多了一个点；通配要写成 `*.example.com`"
@@ -511,7 +514,11 @@ async fn http_on(inner: &Arc<Inner>, req: HttpRequest) -> Result<HttpResponse, S
         // **不跟随重定向**：跟着跳就能绕过白名单（302 到别的域名）。
         // 需要跳的应用自己再发一次，那时会重新过一遍白名单
         .redirect(reqwest::redirect::Policy::none())
-        .timeout(req.timeout_ms.map(Duration::from_millis).unwrap_or(HTTP_TIMEOUT))
+        .timeout(
+            req.timeout_ms
+                .map(Duration::from_millis)
+                .unwrap_or(HTTP_TIMEOUT),
+        )
         .build()
         .map_err(|e| format!("无法创建 HTTP 客户端: {e}"))?;
 
@@ -769,8 +776,6 @@ async fn recv_on(
     recv_from_mpsc(inbox, timeout_ms).await
 }
 
-
-
 /// 从接收端等一条，带超时。
 ///
 /// 锁在进入 `recv()` 之后就不再被 `conns` 持有 —— 调用方传的是
@@ -779,7 +784,9 @@ async fn recv_from_mpsc(
     inbox: &Mutex<tokio::sync::mpsc::Receiver<Recv>>,
     timeout_ms: Option<u64>,
 ) -> Result<Recv, String> {
-    let wait = timeout_ms.map(Duration::from_millis).unwrap_or(RECV_TIMEOUT);
+    let wait = timeout_ms
+        .map(Duration::from_millis)
+        .unwrap_or(RECV_TIMEOUT);
     let mut rx = inbox.lock().await;
     match tokio::time::timeout(wait, rx.recv()).await {
         Ok(Some(msg)) => Ok(msg),
@@ -802,11 +809,11 @@ pub fn split_url(url: &str) -> Result<(String, String, u16), String> {
         .ok_or_else(|| format!("`{url}` 不像 URL（缺少 scheme://）"))?;
     let scheme = scheme.to_ascii_lowercase();
     // 去掉 userinfo、路径、查询串
-    let authority = rest
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or(rest);
-    let authority = authority.rsplit_once('@').map(|(_, h)| h).unwrap_or(authority);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    let authority = authority
+        .rsplit_once('@')
+        .map(|(_, h)| h)
+        .unwrap_or(authority);
     let (host, port) = match authority.rsplit_once(':') {
         Some((h, p)) => {
             let port = p
@@ -885,11 +892,17 @@ mod tests {
 
     #[test]
     fn malformed_entries_are_rejected_not_ignored() {
-        assert!(NetPolicy::parse(&["api*.example.com".into()]).is_err(), "中间通配不支持");
+        assert!(
+            NetPolicy::parse(&["api*.example.com".into()]).is_err(),
+            "中间通配不支持"
+        );
         assert!(NetPolicy::parse(&["example.com:notaport".into()]).is_err());
         // `*.` 归一化后等于 `*`（任意主机）—— 笔误不能悄悄扩权
         assert!(NetPolicy::parse(&["*.".into()]).is_err(), "`*.` 必须被拒");
-        assert!(NetPolicy::parse(&["example.com.".into()]).is_err(), "尾点必须被拒");
+        assert!(
+            NetPolicy::parse(&["example.com.".into()]).is_err(),
+            "尾点必须被拒"
+        );
     }
 
     #[test]
@@ -934,7 +947,10 @@ mod tests {
         let declared = vec!["api.example.com".to_string(), "cdn.example.com".to_string()];
         // 用户只同意了其中一个
         let granted = vec!["api.example.com".to_string()];
-        assert_eq!(intersect(&declared, &granted), vec!["api.example.com".to_string()]);
+        assert_eq!(
+            intersect(&declared, &granted),
+            vec!["api.example.com".to_string()]
+        );
         // 用户什么都没同意 → 一条都不生效（清单不能自己扩权）
         assert!(intersect(&declared, &[]).is_empty());
         // 授权里多出来的条目不影响：生效的永远是"声明且授权"
@@ -945,7 +961,11 @@ mod tests {
     fn intersect_ignores_case_and_whitespace() {
         let declared = vec![" https://API.example.com/v1 ".to_string()];
         let granted = vec!["https://api.example.com/v1".to_string()];
-        assert_eq!(intersect(&declared, &granted).len(), 1, "写法差异不该让授权失效");
+        assert_eq!(
+            intersect(&declared, &granted).len(),
+            1,
+            "写法差异不该让授权失效"
+        );
     }
 
     #[test]
@@ -1086,7 +1106,10 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let hub = NetHub::new(policy(&["127.0.0.1"])).unwrap();
         rt.block_on(async {
-            let id = hub.ws_connect(&format!("ws://127.0.0.1:{port}/")).await.unwrap();
+            let id = hub
+                .ws_connect(&format!("ws://127.0.0.1:{port}/"))
+                .await
+                .unwrap();
             hub.ws_send(&id, "hi-ws").await.unwrap();
             let got = hub.ws_recv(&id, Some(10000)).await.unwrap();
             assert_eq!(got.kind, "text");
@@ -1132,7 +1155,9 @@ mod tests {
             let _ = listener.accept();
             std::thread::sleep(std::time::Duration::from_millis(200));
         });
-        let stream = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
         let (_r, w) = stream.into_split();
         w
     }

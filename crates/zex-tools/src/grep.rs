@@ -159,7 +159,10 @@ fn build_matcher(args: &GrepArgs) -> Result<RegexMatcher> {
 /// 真正的搜索。同步执行，由调用方放进 spawn_blocking。
 fn search(root: &Path, matcher: &RegexMatcher, args: &GrepArgs, max_hits: usize) -> Result<Hits> {
     let started = Instant::now();
-    let mut out = Hits { rows: Vec::new(), truncated: Vec::new() };
+    let mut out = Hits {
+        rows: Vec::new(),
+        truncated: Vec::new(),
+    };
 
     // 走路：单文件直接把根当成唯一入口，目录则按 .gitignore 遍历
     let mut walk = WalkBuilder::new(root);
@@ -273,8 +276,7 @@ fn render(rows: Vec<Row>, truncated: Vec<&'static str>) -> ToolOutput {
     if rows.is_empty() {
         return ToolOutput::ok("没有命中。");
     }
-    let files: std::collections::BTreeSet<&str> =
-        rows.iter().map(|r| r.display.as_str()).collect();
+    let files: std::collections::BTreeSet<&str> = rows.iter().map(|r| r.display.as_str()).collect();
     let total = rows.len();
     let mut text = rows
         .iter()
@@ -317,7 +319,11 @@ mod tests {
         }
         fn resolve_path(&self, raw: &str) -> Result<PathBuf> {
             let p = Path::new(raw);
-            Ok(if p.is_absolute() { p.to_path_buf() } else { self.root.join(p) })
+            Ok(if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                self.root.join(p)
+            })
         }
         fn is_secret_path(&self, path: &Path) -> bool {
             path.file_name().is_some_and(|n| n == ".env")
@@ -325,7 +331,9 @@ mod tests {
     }
 
     fn ctx_for(dir: &Path) -> Ctx {
-        Ctx { root: dir.to_path_buf() }
+        Ctx {
+            root: dir.to_path_buf(),
+        }
     }
 
     fn args(pattern: &str, path: &Path) -> GrepArgs {
@@ -383,7 +391,10 @@ mod tests {
 
         a.hidden = Some(true);
         let out = run(a).await;
-        assert!(out.contains("gen.rs"), "hidden=true 时要连忽略的一起搜：{out}");
+        assert!(
+            out.contains("gen.rs"),
+            "hidden=true 时要连忽略的一起搜：{out}"
+        );
     }
 
     #[tokio::test]
@@ -439,6 +450,10 @@ mod tests {
         a.max_hits = Some(5);
         let out = run(a).await;
         assert!(out.contains("命中数上限"), "{out}");
-        assert_eq!(out.lines().filter(|l| l.contains("needle")).count(), 5, "{out}");
+        assert_eq!(
+            out.lines().filter(|l| l.contains("needle")).count(),
+            5,
+            "{out}"
+        );
     }
 }

@@ -22,8 +22,8 @@ use std::sync::{Mutex, OnceLock};
 
 use tracing::field::{Field, Visit};
 use tracing::{Event, Level, Subscriber};
-use tracing_subscriber::layer::Context;
 use tracing_subscriber::Layer;
+use tracing_subscriber::layer::Context;
 
 /// 缓冲上限。
 ///
@@ -187,9 +187,7 @@ impl<S: Subscriber> Layer<S> for CaptureLayer {
         if *meta.level() > Level::INFO {
             return;
         }
-        let mut visitor = MessageVisitor {
-            out: String::new(),
-        };
+        let mut visitor = MessageVisitor { out: String::new() };
         event.record(&mut visitor);
         let message = if visitor.out.is_empty() {
             // 只有 target 没有字段的事件（少数宏会这样）也要留个痕迹
@@ -290,7 +288,10 @@ mod tests {
         let got = recent(10, None);
         assert_eq!(got.len(), 3, "应收三条，实际：{got:?}");
         assert!(got.iter().any(|e| e.message.contains("点击回调炸了")));
-        assert!(got.iter().any(|e| e.level == "info" && e.message.contains("console.log")));
+        assert!(
+            got.iter()
+                .any(|e| e.level == "info" && e.message.contains("console.log"))
+        );
         assert!(!got.iter().any(|e| e.message.contains("调试噪声")));
         assert!(!got.iter().any(|e| e.message.contains("内核自己的错")));
     }

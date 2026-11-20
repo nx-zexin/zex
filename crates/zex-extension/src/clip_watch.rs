@@ -208,8 +208,8 @@ fn server_channel() -> Option<&'static std::sync::mpsc::Sender<Job>> {
 /// 会转投新的所有者。
 #[cfg(target_os = "linux")]
 fn serve_loop(rx: std::sync::mpsc::Receiver<Job>) {
-    use std::sync::atomic::AtomicU64;
     use std::sync::Arc;
+    use std::sync::atomic::AtomicU64;
 
     let current = Arc::new(AtomicU64::new(0));
 
@@ -328,16 +328,20 @@ fn watch_loop() -> std::result::Result<(), String> {
         // 有 image/* 就**只**走这条：不能因为某次读图失败就落到文本分支，
         // 那会把 spectacle 提供的文件名当成一条文本记下来，下一轮图片又成功，
         // 于是同一次复制在列表里一图一文交替出现。
-        let image_mime = IMAGE_PREFERENCE.iter().find(|m| has(m)).map(|m| *m).or_else(|| {
-            // 优先级表里都没有时，退到"排序后取第一个"—— 至少是确定的
-            let mut all: Vec<&str> = types
-                .iter()
-                .map(|t| t.as_str())
-                .filter(|t| t.starts_with("image/"))
-                .collect();
-            all.sort_unstable();
-            all.first().copied()
-        });
+        let image_mime = IMAGE_PREFERENCE
+            .iter()
+            .find(|m| has(m))
+            .map(|m| *m)
+            .or_else(|| {
+                // 优先级表里都没有时，退到"排序后取第一个"—— 至少是确定的
+                let mut all: Vec<&str> = types
+                    .iter()
+                    .map(|t| t.as_str())
+                    .filter(|t| t.starts_with("image/"))
+                    .collect();
+                all.sort_unstable();
+                all.first().copied()
+            });
 
         if let Some(mime) = image_mime {
             if let Some(bytes) = read_mime(mime) {
@@ -406,9 +410,27 @@ mod tests {
     fn queue_drains_and_does_not_duplicate_back_to_back() {
         let _g = exclusive();
         let at = now_ms();
-        push(Event { kind: "text", body: "a".into(), width: 0, height: 0, at_ms: at });
-        push(Event { kind: "text", body: "a".into(), width: 0, height: 0, at_ms: at + 1 });
-        push(Event { kind: "text", body: "b".into(), width: 0, height: 0, at_ms: at + 2 });
+        push(Event {
+            kind: "text",
+            body: "a".into(),
+            width: 0,
+            height: 0,
+            at_ms: at,
+        });
+        push(Event {
+            kind: "text",
+            body: "a".into(),
+            width: 0,
+            height: 0,
+            at_ms: at + 1,
+        });
+        push(Event {
+            kind: "text",
+            body: "b".into(),
+            width: 0,
+            height: 0,
+            at_ms: at + 2,
+        });
 
         let items = drain();
         let bodies: Vec<_> = items.iter().map(|e| e.body.as_str()).collect();
@@ -420,11 +442,20 @@ mod tests {
     fn queue_is_bounded() {
         let _g = exclusive();
         for i in 0..(MAX_QUEUE + 50) {
-            push(Event { kind: "text", body: format!("x{i}"), width: 0, height: 0, at_ms: i as u64 });
+            push(Event {
+                kind: "text",
+                body: format!("x{i}"),
+                width: 0,
+                height: 0,
+                at_ms: i as u64,
+            });
         }
         let items = drain();
         assert_eq!(items.len(), MAX_QUEUE);
         // 留下的是最新的一批
-        assert_eq!(items.last().map(|e| e.body.as_str()), Some(format!("x{}", MAX_QUEUE + 49).as_str()));
+        assert_eq!(
+            items.last().map(|e| e.body.as_str()),
+            Some(format!("x{}", MAX_QUEUE + 49).as_str())
+        );
     }
 }

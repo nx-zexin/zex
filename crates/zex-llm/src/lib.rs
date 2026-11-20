@@ -546,7 +546,10 @@ mod tests {
             stop_reason: Some("stop".into()),
         });
         let err = acc.finish().unwrap_err();
-        assert!(!matches!(err, Error::Truncated { .. }), "不该报截断: {err:?}");
+        assert!(
+            !matches!(err, Error::Truncated { .. }),
+            "不该报截断: {err:?}"
+        );
         assert!(err.to_string().contains("不是合法 JSON"), "{err}");
     }
 
@@ -690,8 +693,10 @@ mod thinking_tests {
         // 给更低会被服务端拒掉
         assert_eq!(ThinkingEffort::Low.anthropic_budget(), Some(1024));
         assert!(ThinkingEffort::Medium.anthropic_budget().unwrap() > 1024);
-        assert!(ThinkingEffort::High.anthropic_budget().unwrap()
-            > ThinkingEffort::Medium.anthropic_budget().unwrap());
+        assert!(
+            ThinkingEffort::High.anthropic_budget().unwrap()
+                > ThinkingEffort::Medium.anthropic_budget().unwrap()
+        );
     }
 
     #[test]

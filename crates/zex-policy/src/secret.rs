@@ -28,28 +28,28 @@ const SENSITIVE_NAME_PARTS: &[&str] = &[
 /// 之所以要前缀：只按"长随机串"判定会误伤 UUID、哈希、base64 内容；
 /// 而真实凭据几乎都带可识别前缀。
 const CREDENTIAL_PREFIXES: &[&str] = &[
-    "sk-ant-",      // Anthropic
-    "sk-proj-",     // OpenAI 项目 key
-    "sk-",          // OpenAI 及其兼容实现
-    "AKIA",         // AWS access key
-    "ASIA",         // AWS 临时凭据
-    "ghp_",         // GitHub PAT
+    "sk-ant-",  // Anthropic
+    "sk-proj-", // OpenAI 项目 key
+    "sk-",      // OpenAI 及其兼容实现
+    "AKIA",     // AWS access key
+    "ASIA",     // AWS 临时凭据
+    "ghp_",     // GitHub PAT
     "gho_",
     "ghu_",
     "ghs_",
     "ghr_",
-    "github_pat_",  // GitHub 细粒度 PAT
-    "glpat-",       // GitLab
-    "AIza",         // Google API key
-    "xoxb-",        // Slack bot
-    "xoxp-",        // Slack user
+    "github_pat_", // GitHub 细粒度 PAT
+    "glpat-",      // GitLab
+    "AIza",        // Google API key
+    "xoxb-",       // Slack bot
+    "xoxp-",       // Slack user
     "xoxa-",
     "xoxr-",
     "xoxs-",
-    "sk_live_",     // Stripe
+    "sk_live_", // Stripe
     "sk_test_",
     "rk_live_",
-    "hf_",          // Hugging Face
+    "hf_", // Hugging Face
 ];
 
 /// 前缀之后至少还要有多少个凭据字符，才认定为真凭据。
@@ -246,7 +246,10 @@ mod tests {
         let s = "OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz0123456789";
         let r = redact(s);
         assert!(!r.contains("abcdefghij"), "凭据主体应被抹掉: {r}");
-        assert!(r.contains("OPENAI_API_KEY="), "变量名要留着，否则看不出发生了什么");
+        assert!(
+            r.contains("OPENAI_API_KEY="),
+            "变量名要留着，否则看不出发生了什么"
+        );
         assert!(r.contains(MASK));
     }
 
@@ -270,8 +273,8 @@ mod tests {
             "cargo build --release",
             "这是一个普通的中文句子",
             "fn main() { println!(\"hi\"); }",
-            "sk-learn is a typo",   // 前缀后不够长，不该动
-            "hf_transfer",            // 同上
+            "sk-learn is a typo", // 前缀后不够长，不该动
+            "hf_transfer",        // 同上
         ] {
             assert_eq!(redact(s), s, "不该改动: {s}");
         }

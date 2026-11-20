@@ -32,9 +32,9 @@ impl Recorder {
         use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
         let host = cpal::default_host();
-        let device = host.default_input_device().ok_or_else(|| {
-            Error::Other("找不到可用的麦克风".into())
-        })?;
+        let device = host
+            .default_input_device()
+            .ok_or_else(|| Error::Other("找不到可用的麦克风".into()))?;
         let config = device
             .default_input_config()
             .map_err(|e| Error::Other(format!("读取麦克风配置失败: {e}")))?;
@@ -274,7 +274,7 @@ mod recording_tests {
     #[test]
     fn start_without_device_returns_error_not_panic() {
         match Recording::start() {
-            Ok(_) => {}      // 有麦克风的机器，正常
+            Ok(_) => {} // 有麦克风的机器，正常
             Err(e) => {
                 let msg = e.to_string();
                 assert!(!msg.is_empty(), "错误信息不该是空的");
