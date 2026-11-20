@@ -51,6 +51,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             libxkbcommon-dev \
+            # 测试二进制链接期需要它（gpui 的 X11 输入法那一支）；
+            # 少了这条只有 `cargo test` 会挂在 -lxkbcommon-x11
+            libxkbcommon-x11-dev \
             libwayland-dev \
             libx11-dev \
             libxcb1-dev \

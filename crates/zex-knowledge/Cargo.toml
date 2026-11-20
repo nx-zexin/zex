@@ -11,5 +11,4 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
-zex-core.workspace = true
 

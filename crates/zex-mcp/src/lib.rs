@@ -20,6 +20,7 @@
 //! 它需要的运行环境（node/python/…）也不用和 Zex 一致。
 
 #![forbid(unsafe_code)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 #![warn(missing_docs)]
 
 use std::collections::HashMap;
@@ -472,19 +473,23 @@ impl zex_core::tool::ErasedTool for McpTool {
     }
 }
 
+/// `connect_all` 的产物：挂给 agent 的工具、给设置页看的状态、
+/// 以及后台 hub（没有可用 runtime 时为 `None`）。
+pub type ConnectOutcome = (
+    Vec<Arc<dyn zex_core::tool::ErasedTool>>,
+    Vec<ServerStatus>,
+    Option<Arc<McpHub>>,
+);
+
 /// 连上配置里所有服务端，收集它们的工具。
 ///
 /// 单个服务失败不影响其它：某个 MCP 服务装坏了不该让整个应用起不来。
-pub fn connect_all(
-    configs: &std::collections::BTreeMap<String, ServerConfig>,
-) -> (
-    Vec<Arc<dyn zex_core::tool::ErasedTool>>,
-    Vec<ServerStatus>,
-    Arc<McpHub>,
-) {
+pub fn connect_all(configs: &std::collections::BTreeMap<String, ServerConfig>) -> ConnectOutcome {
     let hub = match McpHub::new() {
         Ok(h) => Arc::new(h),
         Err(e) => {
+            // runtime 建不起来就真的没有 hub 可用（线程池、驱动都起不来）。
+            // 别在这里再造一个必然同样失败的，如实告诉调用方 "没有"。
             return (
                 Vec::new(),
                 vec![ServerStatus {
@@ -493,12 +498,12 @@ pub fn connect_all(
                     detail: e.to_string(),
                     tool_count: 0,
                 }],
-                Arc::new(McpHub::new().expect("MCP runtime 建不起来")),
+                None,
             );
         }
     };
     let (tools, status) = hub.run(connect_inner(configs, hub.clone()));
-    (tools, status, hub)
+    (tools, status, Some(hub))
 }
 
 async fn connect_inner(

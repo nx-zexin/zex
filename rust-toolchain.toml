@@ -1,5 +1,5 @@
 # 锁定 toolchain，保证三平台行为一致（见 docs/PLATFORM.md §4）
 [toolchain]
-channel = "1.97.1"
+channel = "1.100.0"
 components = ["rustfmt", "clippy"]
 targets = []

@@ -7,6 +7,7 @@
 //! 48kHz 只能录 87 秒就超了，16kHz 能撑满 120 秒的上限。
 
 #![forbid(unsafe_code)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 #![warn(missing_docs)]
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -57,7 +58,7 @@ impl Recorder {
                         if stop.load(Ordering::Relaxed) {
                             return;
                         }
-                        let mut buf = sink.lock().expect("录音缓冲中毒");
+                        let mut buf = zex_core::sync::lock_or_panic(&sink, "录音缓冲");
                         buf.extend(data.chunks(channels).map(|c| c[0]));
                     },
                     err_fn,
@@ -72,7 +73,7 @@ impl Recorder {
                         if stop.load(Ordering::Relaxed) {
                             return;
                         }
-                        let mut buf = sink.lock().expect("录音缓冲中毒");
+                        let mut buf = zex_core::sync::lock_or_panic(&sink, "录音缓冲");
                         buf.extend(data.chunks(channels).map(|c| c[0] as f32 / 32768.0));
                     },
                     err_fn,
@@ -104,7 +105,7 @@ impl Recorder {
         self.stop.store(true, Ordering::Relaxed);
         // 给回调最后一点时间收尾，避免尾音被截
         std::thread::sleep(std::time::Duration::from_millis(60));
-        let raw = self.samples.lock().expect("录音缓冲中毒").clone();
+        let raw = zex_core::sync::lock_or_panic(&self.samples, "录音缓冲").clone();
         drop(self._stream);
 
         let pcm = resample_to_16k(&raw, self.source_rate);

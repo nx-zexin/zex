@@ -43,8 +43,7 @@ pub fn connect_mcp_servers(cfg: &FileConfig) -> McpWiring {
     if cfg.mcp_servers.is_empty() {
         return (Vec::new(), Vec::new(), None);
     }
-    let (tools, status, hub) = zex_mcp::connect_all(&cfg.mcp_servers);
-    (tools, status, Some(hub))
+    zex_mcp::connect_all(&cfg.mcp_servers)
 }
 use zex_store::Store;
 
@@ -425,7 +424,7 @@ pub fn build_ephemeral_agent_with_team(
 // ─── 内核线程 ───
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use zex_agent::{Agent, AgentConfig, ApprovalBroker, ApprovalDecision};
 use zex_core::{CoreEvent, SessionId, UiCommand};
@@ -856,19 +855,6 @@ type SessionLocks = Arc<Mutex<HashMap<SessionId, Arc<tokio::sync::Mutex<()>>>>>;
 /// 改模式，而那时 `Agent` 在它自己的任务里，UI 够不着它。
 type ModeCells = Arc<Mutex<HashMap<SessionId, zex_core::ModeCell>>>;
 
-/// 取一张表锁；中毒就 panic。
-///
-/// 中毒意味着有线程在改表的时候挂了 —— 表里可能是半截状态。带着它继续
-/// 干活会看到自相矛盾的数据（比如名册里一半有任务一半没有），所以宁可
-/// 响亮地失败。日志缓冲那种"丢了也无所谓"的表才适合 `into_inner()` 硬撑
-/// （见 `ext_logs`）。
-fn lock_or_panic<'a, T>(m: &'a Mutex<T>, what: &str) -> MutexGuard<'a, T> {
-    match m.lock() {
-        Ok(guard) => guard,
-        Err(_) => panic!("{what}中毒"),
-    }
-}
-
 /// 取（必要时建）某个会话的模式句柄。
 fn mode_cell_for(
     cells: &ModeCells,
@@ -876,7 +862,7 @@ fn mode_cell_for(
     fallback: zex_core::RunMode,
 ) -> zex_core::ModeCell {
     // std 锁：这张表只在"取句柄"时碰一下，不跨 await 持有
-    let mut guard = lock_or_panic(cells, "模式句柄表");
+    let mut guard = zex_core::sync::lock_or_panic(cells, "模式句柄表");
     guard
         .entry(session.clone())
         .or_insert_with(|| zex_core::ModeCell::new(fallback))
@@ -912,7 +898,7 @@ async fn run_task(
     // 而且它们看到的上下文也不一致。tokio 的 Mutex 是公平的，
     // 先来的先拿 —— 所以顺带就有了队列语义。
     let lock = {
-        let mut held = lock_or_panic(&locks, "会话锁表");
+        let mut held = zex_core::sync::lock_or_panic(&locks, "会话锁表");
         held.entry(session.clone())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()

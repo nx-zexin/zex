@@ -25,6 +25,7 @@
 //! frontmatter 缺失时，文件名当名字，首行非空文本当描述。
 
 #![forbid(unsafe_code)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 #![warn(missing_docs)]
 
 use std::path::{Path, PathBuf};

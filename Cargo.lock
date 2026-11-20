@@ -10787,7 +10787,6 @@ dependencies = [
  "zex-llm",
  "zex-policy",
  "zex-store",
- "zex-tools",
 ]
 
 [[package]]
@@ -10823,9 +10822,6 @@ dependencies = [
 [[package]]
 name = "zex-browser"
 version = "0.1.2"
-dependencies = [
- "zex-core",
-]
 
 [[package]]
 name = "zex-core"
@@ -10843,9 +10839,6 @@ dependencies = [
 [[package]]
 name = "zex-evolve"
 version = "0.1.2"
-dependencies = [
- "zex-core",
-]
 
 [[package]]
 name = "zex-extension"
@@ -10868,9 +10861,6 @@ dependencies = [
 [[package]]
 name = "zex-knowledge"
 version = "0.1.2"
-dependencies = [
- "zex-core",
-]
 
 [[package]]
 name = "zex-llm"
@@ -10901,9 +10891,6 @@ dependencies = [
 [[package]]
 name = "zex-platform"
 version = "0.1.2"
-dependencies = [
- "zex-core",
-]
 
 [[package]]
 name = "zex-policy"
@@ -10919,9 +10906,6 @@ dependencies = [
 [[package]]
 name = "zex-schedule"
 version = "0.1.2"
-dependencies = [
- "zex-core",
-]
 
 [[package]]
 name = "zex-skill"

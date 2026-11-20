@@ -18,12 +18,6 @@ zex-store = { path = "crates/zex-store" }
 zex-policy = { path = "crates/zex-policy" }
 zex-agent = { path = "crates/zex-agent" }
 zex-tools = { path = "crates/zex-tools" }
-zex-platform = { path = "crates/zex-platform" }
-zex-browser = { path = "crates/zex-browser" }
-zex-knowledge = { path = "crates/zex-knowledge" }
-zex-evolve = { path = "crates/zex-evolve" }
-zex-schedule = { path = "crates/zex-schedule" }
-zex-app = { path = "crates/zex-app" }
 zex-voice = { path = "crates/zex-voice" }
 zex-skill = { path = "crates/zex-skill" }
 zex-mcp = { path = "crates/zex-mcp" }
@@ -36,7 +30,6 @@ schemars = "1"
 
 # ─── 错误处理 ───
 thiserror = "2"
-anyhow = "1"
 
 # ─── 异步 ───
 async-trait = "0.1"
@@ -75,9 +68,7 @@ tokio = { version = "1", features = [
     "io-std",
     "net",
 ] }
-tokio-util = { version = "0.7", features = ["codec"] }
 futures = "0.3"
-bytes = "1"
 
 # ─── 网络 ───
 # reqwest 0.13 的 feature 名与 0.12 不同：rustls-tls → rustls。
@@ -109,7 +100,6 @@ tracing-core = "0.1"
 
 # ─── 杂项 ───
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
-chrono = { version = "0.4", features = ["serde"] }
 
 # ─── UI ───
 gpui-kit = { version = "0.9", features = ["syntect", "assets"] }

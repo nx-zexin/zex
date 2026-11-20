@@ -8,6 +8,9 @@ repository.workspace = true
 authors.workspace = true
 description = "技能：可复用的做法包"
 
+[lints]
+workspace = true
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }

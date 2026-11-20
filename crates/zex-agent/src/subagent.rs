@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -133,18 +133,6 @@ impl Default for AgentRegistry {
     }
 }
 
-/// 取名册锁；中毒就 panic。
-///
-/// 名册中毒 = 有线程在它上面挂了，表里可能是一个子 agent 会话已经建好、
-/// 状态却还没写进去的半截记录。带着这种名册继续派活会越错越远，
-/// 不如当场失败。
-fn lock_or_panic<'a, T>(m: &'a Mutex<T>, what: &str) -> MutexGuard<'a, T> {
-    match m.lock() {
-        Ok(guard) => guard,
-        Err(_) => panic!("{what}中毒"),
-    }
-}
-
 impl AgentRegistry {
     /// 建一个空注册表。
     pub fn new() -> Self {
@@ -197,7 +185,7 @@ impl AgentRegistry {
         })?;
 
         {
-            let map = lock_or_panic(&self.agents, "子智能体表");
+            let map = zex_core::sync::lock_or_panic(&self.agents, "子智能体表");
             if map.contains_key(&id) {
                 return Err(Error::ToolFailed {
                     tool: "spawn_agent".into(),
@@ -228,7 +216,7 @@ impl AgentRegistry {
             .store
             .rename_session(&session, &format!("子智能体 · {id}"));
 
-        lock_or_panic(&self.agents, "子智能体表").insert(
+        zex_core::sync::lock_or_panic(&self.agents, "子智能体表").insert(
             id.clone(),
             Entry {
                 role: role.clone(),
@@ -249,7 +237,7 @@ impl AgentRegistry {
         // 子 agent 在后台跑：父 agent 立刻拿回控制权，继续派下一个活。
         tokio::spawn(async move {
             let outcome = agent.run_turn(task, Some(&ev_tx)).await;
-            let mut map = lock_or_panic(&this.agents, "子智能体表");
+            let mut map = zex_core::sync::lock_or_panic(&this.agents, "子智能体表");
             if let Some(entry) = map.get_mut(&handle_id) {
                 match outcome {
                     Ok(done) => {
@@ -278,7 +266,7 @@ impl AgentRegistry {
         })?;
 
         let (session, cancel) = {
-            let mut map = lock_or_panic(&self.agents, "子智能体表");
+            let mut map = zex_core::sync::lock_or_panic(&self.agents, "子智能体表");
             let entry = map.get_mut(to).ok_or_else(|| Error::ToolFailed {
                 tool: "send_message".into(),
                 message: format!("没有 `{to}` 这个子智能体"),
@@ -312,7 +300,7 @@ impl AgentRegistry {
         let handle_id = to.to_string();
         tokio::spawn(async move {
             let outcome = agent.run_turn(message, Some(&ev_tx)).await;
-            let mut map = lock_or_panic(&this.agents, "子智能体表");
+            let mut map = zex_core::sync::lock_or_panic(&this.agents, "子智能体表");
             if let Some(entry) = map.get_mut(&handle_id) {
                 // 被叫停的不要用错误覆盖掉「已停止」这个更有信息量的状态
                 if matches!(entry.status, SubAgentStatus::Terminated) {
@@ -336,7 +324,7 @@ impl AgentRegistry {
     ///
     /// 正在跑的那一轮会在下一个检查点退出；已经跑完的就只是标记状态。
     pub fn terminate(&self, id: &str) -> Result<String> {
-        let mut map = lock_or_panic(&self.agents, "子智能体表");
+        let mut map = zex_core::sync::lock_or_panic(&self.agents, "子智能体表");
         let entry = map.get_mut(id).ok_or_else(|| Error::ToolFailed {
             tool: "terminate_agent".into(),
             message: format!("没有 `{id}` 这个子智能体"),
@@ -402,7 +390,7 @@ impl AgentRegistry {
         let _ = deps.store.interrupt_orphan_sub_agents();
         let records = deps.store.list_sub_agents().unwrap_or_default();
         {
-            let mut map = lock_or_panic(&self.agents, "子智能体表");
+            let mut map = zex_core::sync::lock_or_panic(&self.agents, "子智能体表");
             for r in records {
                 let status = match r.status {
                     zex_store::subagents::SubAgentState::Completed => SubAgentStatus::Completed,
@@ -430,7 +418,7 @@ impl AgentRegistry {
 
     /// 当前所有子 agent 的状态。
     pub fn snapshot(&self) -> Vec<SubAgentInfo> {
-        let map = lock_or_panic(&self.agents, "子智能体表");
+        let map = zex_core::sync::lock_or_panic(&self.agents, "子智能体表");
         let mut list: Vec<SubAgentInfo> = map
             .iter()
             .map(|(id, e)| SubAgentInfo {
@@ -471,7 +459,7 @@ impl AgentRegistry {
     /// 那个后台 task 之后如果真的跑完，也不会覆盖这里的状态
     /// （见 `send` 里对 `Terminated` 的保护）。
     fn abandon_running(&self) {
-        let mut map = lock_or_panic(&self.agents, "子智能体表");
+        let mut map = zex_core::sync::lock_or_panic(&self.agents, "子智能体表");
         let mut changed = false;
         for entry in map.values_mut() {
             if matches!(entry.status, SubAgentStatus::Running) {

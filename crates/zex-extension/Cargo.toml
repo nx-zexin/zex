@@ -20,12 +20,6 @@ zex-core.workspace = true
 # 扩展的 SQLite（见 store_db）。跟着 ui 一起编：没有 ui 就没有宿主，
 # 也就没有脚本能调它，但保留依赖让 `cargo test -p zex-extension` 始终能跑。
 rusqlite.workspace = true
-# 剪贴板监视线程：Wayland 下直接在后台读，不依赖 GPUI 的帧循环。
-# 只在 Linux 上链接 —— 其他平台退回"主线程轮询"那条老路（见 clip_watch.rs）。
-# arboard 在这个环境读不到 Wayland 剪贴板（它走了 X11），所以直接用底层这层。
-[target.'cfg(target_os = "linux")'.dependencies]
-wl-clipboard-rs = "0.9"
-
 # 网络三件套：HTTP 复用 reqwest，WebSocket 用 tokio-tungstenite，
 # 裸 socket 用 tokio::net。见 store_db 旁边的 net.rs。
 reqwest.workspace = true
@@ -44,3 +38,13 @@ gpui-shell = { version = "=0.9.1", default-features = false, features = [
 
 # 上游明说：不优化这两个包，debug 版脚本渲染慢 3 倍。
 # 必须写在 workspace 根（库不能给宿主设 profile），见根 Cargo.toml。
+
+# 剪贴板监视线程：Wayland 下直接在后台读，不依赖 GPUI 的帧循环。
+# 只在 Linux 上链接 —— 其他平台退回"主线程轮询"那条老路（见 clip_watch.rs）。
+# arboard 在这个环境读不到 Wayland 剪贴板（它走了 X11），所以直接用底层这层。
+#
+# 这段必须放在 [dependencies] 之后、单独成段：夹在 [dependencies] 中间的话，
+# 它**下面**的所有依赖都会变成 Linux 专属 —— Windows/macOS 上就找不到
+# tokio / futures / gpui-shell 了（CI 已经替我们抓过一次）。
+[target.'cfg(target_os = "linux")'.dependencies]
+wl-clipboard-rs = "0.9"
