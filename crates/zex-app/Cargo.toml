@@ -30,6 +30,9 @@ zex-store.workspace = true
 zex-policy.workspace = true
 zex-voice.workspace = true
 gpui-kit.workspace = true
+# 只有一件事要用它：启动时把脚本 API 的 `.d.ts` 生成到技能目录里
+# （见 src/ext_typings.rs）。版本跟着 zex-extension 钉死，免得两处不一致。
+gpui-shell = { version = "=0.9.1", default-features = false, features = ["quickjs"] }
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -44,3 +47,6 @@ reqwest.workspace = true
 [target.'cfg(windows)'.dependencies]
 windows.workspace = true
 raw-window-handle.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

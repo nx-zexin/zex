@@ -10796,11 +10796,13 @@ version = "0.1.2"
 dependencies = [
  "async-trait",
  "gpui-kit",
+ "gpui-shell",
  "raw-window-handle",
  "reqwest",
  "schemars",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-core",

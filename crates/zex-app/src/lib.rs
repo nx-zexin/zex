@@ -10,6 +10,8 @@
 
 pub mod config;
 pub mod ext_logs;
+/// 把脚本 API 的 `.d.ts` 生成到技能目录，模型写扩展前查的就是它。
+pub mod ext_typings;
 pub mod ext_tools;
 pub mod models_dev;
 /// 自绘标题栏的窗口动作（拖动 / 最大化还原）。Windows 上绕过 gpui 的两个缺陷。
@@ -213,6 +215,12 @@ pub fn load_skills() -> std::sync::Arc<zex_skill::SkillRegistry> {
     // 首次运行时建好目录：用户要放技能文件进去，得先有个地方放
     let _ = std::fs::create_dir_all(&dir);
     install_bundled_skills(&dir);
+    // 脚本 API 的声明也铺在同一层：模型读技能时在同一目录就能拿到
+    // 当前运行时的全部 API，不必先"打开某个扩展"才有一份。
+    // 失败只记警告 —— 技能加载不该因为磁盘问题整体失败。
+    if let Err(e) = ext_typings::write_api_declarations(&dir) {
+        tracing::warn!(dir = %dir.display(), error = %e, "无法生成脚本 API 声明");
+    }
     std::sync::Arc::new(zex_skill::SkillRegistry::load(&dir))
 }
 
