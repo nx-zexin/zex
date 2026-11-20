@@ -234,6 +234,14 @@ impl Agent {
     ) -> Result<Self> {
         let http = zex_llm::build_http_client()?;
         let policy = Policy::new(store.clone());
+        // 工具结果预算跟着模型的输出上限走。放在这个**唯一的**装配点上，
+        // 而不是各个 builder 里：`cfg.max_tokens` 有四个写入点（构造默认值、
+        // 配置里的 params、请求级换模型、每轮从配置文件重读），
+        // 漏掉任何一处就是“改了参数却不生效”。
+        // 回写进 cfg，是为了与 `cfg.budget` 保持单一真相 —— 否则摘要长度等
+        // 地方读到的是另一个数。
+        let mut cfg = cfg;
+        cfg.budget = cfg.budget.clone().with_output_tokens(cfg.max_tokens);
         let compressor = Compressor::new(cfg.budget.clone());
         Ok(Agent {
             mode: zex_core::ModeCell::new(cfg.mode),
@@ -1294,6 +1302,18 @@ mod tests {
             "test-model",
             PathBuf::from("/tmp"),
         )
+    }
+
+    #[test]
+    fn compressor_budget_follows_configured_max_tokens() {
+        // 回归：`max_tokens` 有四个写入点，早先预算只在构造时算一次，
+        // 所以配置里写的上限只管输出、不管工具结果。
+        let store = Store::in_memory().unwrap();
+        let cfg = test_cfg().with_model_params(None, Some(2048));
+        let agent = Agent::new(cfg, vec![], store).unwrap();
+        assert_eq!(agent.compressor.budget().tool_result_max_tokens, 2048);
+        // 回写后两个字段必须一致，否则摘要长度等处读到的是旧值
+        assert_eq!(agent.cfg.budget.tool_result_max_tokens, 2048);
     }
 
     #[test]

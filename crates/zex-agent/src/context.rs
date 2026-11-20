@@ -27,6 +27,9 @@ pub struct ContextBudget {
     /// 两次压缩之间至少隔多少 turn。
     pub cooldown_turns: u32,
     /// 单条工具结果的 token 上限，超出则截断。
+    ///
+    /// 由 [`ContextBudget::with_output_tokens`] 按模型的 `max_tokens` 改写，
+    /// 这里的 1000 只是“没接上模型参数”时的兜底值（也是地板）。
     pub tool_result_max_tokens: usize,
     /// 消息数少于该值不做压缩。
     pub min_messages: usize,
@@ -75,7 +78,33 @@ impl ContextBudget {
     pub fn emergency_limit(&self) -> usize {
         (self.window as f32 * self.emergency_at) as usize
     }
+
+    /// 让工具结果预算跟着模型的单次输出上限走。
+    ///
+    /// # 为什么要关联 `max_tokens`
+    ///
+    /// `max_tokens` 是“模型一次能吃掉多少”的唯一现成读数。一条工具结果
+    /// 比它还大，等于逼模型在一堆自己消化不了的内容里找重点；反过来，
+    /// 用户把上限调到 32k 就是想看长输出，这时还按 1000 token 砍工具结果
+    /// 纯属帮倒忙。所以不另造一个旋钮，直接跟它走。
+    ///
+    /// 上下限只是防护：`max_tokens = 64` 这种极端配置不该把每条结果
+    /// 都砍成残包（下限 1000，也是历史默认值）；而真的填了 512k 也不是
+    /// “能不能读懂”的问题了，是往窗口里灌 —— 封顶在 64k。
+    pub fn with_output_tokens(mut self, max_tokens: u32) -> Self {
+        self.tool_result_max_tokens = (max_tokens as usize).clamp(
+            TOOL_RESULT_FLOOR_TOKENS,
+            TOOL_RESULT_CEILING_TOKENS,
+        );
+        self
+    }
 }
+
+/// 工具结果预算的地板：低于这个值，正常的一条 `read` 输出会被砍成残包。
+pub const TOOL_RESULT_FLOOR_TOKENS: usize = 1_000;
+
+/// 工具结果预算的天花板：再大就不是“读不读得懂”，而是往窗口里灌水。
+pub const TOOL_RESULT_CEILING_TOKENS: usize = 65_536;
 
 /// 估算一段文本的 token 数。
 ///
@@ -163,6 +192,25 @@ mod tests {
 
     use super::*;
     use zex_core::{Role, ToolCallId};
+
+    #[test]
+    fn tool_result_budget_follows_the_output_limit() {
+        // 关联的意义：用户把单次输出从 2048 调到 32768，就是想看长内容，
+        // 工具结果不该还按 1000 token 砍。
+        let b = ContextBudget::default().with_output_tokens(2048);
+        assert_eq!(b.tool_result_max_tokens, 2048);
+        let b = ContextBudget::default().with_output_tokens(32_768);
+        assert_eq!(b.tool_result_max_tokens, 32_768);
+    }
+
+    #[test]
+    fn tool_result_budget_is_clamped() {
+        // 极端的 max_tokens 不该把工具结果砍成残包，也不该往窗口里灌水
+        let tiny = ContextBudget::default().with_output_tokens(64);
+        assert_eq!(tiny.tool_result_max_tokens, TOOL_RESULT_FLOOR_TOKENS);
+        let huge = ContextBudget::default().with_output_tokens(512_000);
+        assert_eq!(huge.tool_result_max_tokens, TOOL_RESULT_CEILING_TOKENS);
+    }
 
     #[test]
     fn default_budget_limits_are_consistent() {
