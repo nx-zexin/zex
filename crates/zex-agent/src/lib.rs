@@ -253,8 +253,8 @@ impl Agent {
         );
         let healed = crate::compress::heal_tool_pairs(&mut history);
         if healed > 0 {
-            tracing::warn!(healed, "历史里的工具调用配对不完整，已补齐");
             if tail_is_orphan {
+                // 缺口在末尾：追加就能真正修好，下次启动不用再修
                 for msg in &history[before_len..] {
                     let tokens = context::estimate_message_tokens(msg);
                     if let Err(e) = store.append_message(&session, msg, tokens) {
@@ -262,6 +262,12 @@ impl Agent {
                         break;
                     }
                 }
+                tracing::info!(healed, "历史末尾缺工具结果，已补齐并写回库");
+            } else {
+                // 缺口在历史中段：库里只有追加，补不到中间去，所以每次启动
+                // 都要重算一遍。功能上没问题（每轮发请求前还会再补一次），
+                // 因此不是 warn —— 它不是异常，是一次幂等的修补。
+                tracing::debug!(healed, "历史中段缺工具结果，已在内存里补齐");
             }
         }
         // 工具结果预算跟着模型的输出上限走。放在这个**唯一的**装配点上，
