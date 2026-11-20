@@ -304,6 +304,118 @@ pub fn truncate_middle(content: &str, target_tokens: usize) -> String {
     )
 }
 
+/// 补全/清理工具调用配对，让历史满足协议要求。
+///
+/// # 为什么需要它
+///
+/// OpenAI 兼容的接口有一条硬性要求：**带 `tool_calls` 的 assistant 消息，
+/// 后面必须跟上每条调用的结果**。少一条就是 400：
+///
+/// ```text
+/// An assistant message with 'tool_calls' must be followed by tool messages
+/// responding to each 'tool_call_id'. (insufficient tool messages following
+/// tool_calls message)
+/// ```
+///
+/// 而"少一条"很容易发生，都不需要谁写错代码：
+///
+/// - 用户点了停止 —— 走到第 2 个工具时中断，剩下 2 条没有结果；
+/// - 进程被杀 / 崩溃 / 重启 —— assistant 已经落库，结果还没写；
+/// - 上一轮报错退出。
+///
+/// 所以每次发请求之前都过一遍这里：**缺的补上、多的丢掉、重复的去掉**。
+/// 补的是"未执行"的合成结果而不是删掉调用 —— 后者会让模型以为自己
+/// 从没提过这个工具，用户看到的也是"它怎么不记得了"。
+///
+/// 返回被改动的位置条数（插入 + 删除），0 表示历史本来就是好的。
+pub fn heal_tool_pairs(messages: &mut Vec<Message>) -> usize {
+    use std::collections::HashSet;
+
+    let mut out: Vec<Message> = Vec::with_capacity(messages.len());
+    let mut healed = 0usize;
+    let mut i = 0;
+
+    while i < messages.len() {
+        match &messages[i] {
+            Message::Assistant { content, tool_calls } if !tool_calls.is_empty() => {
+                let content = content.clone();
+                let calls = tool_calls.clone();
+
+                // 紧随其后的连续 Tool 消息就是这一批的结果
+                let mut j = i + 1;
+                let mut results: Vec<Message> = Vec::new();
+                while j < messages.len() {
+                    if matches!(&messages[j], Message::Tool { .. }) {
+                        results.push(messages[j].clone());
+                        j += 1;
+                    } else {
+                        break;
+                    }
+                }
+
+                // 按调的**顺序**排结果：协议要求跟上，顺带让读历史的人
+                // 能对上"第几个调用得了什么"
+                let mut seen: HashSet<ToolCallId> = HashSet::new();
+                let mut used = vec![false; results.len()];
+                let mut ordered: Vec<Message> = Vec::with_capacity(calls.len());
+                for call in &calls {
+                    if !seen.insert(call.id.clone()) {
+                        // 同一个调用声明了两次：只认第一条
+                        healed += 1;
+                        continue;
+                    }
+                    match results
+                        .iter()
+                        .enumerate()
+                        .find(|(k, r)| {
+                            !used[*k]
+                                && matches!(r, Message::Tool { call_id, .. } if *call_id == call.id)
+                        })
+                        .map(|(k, _)| k)
+                    {
+                        Some(k) => {
+                            used[k] = true;
+                            ordered.push(results[k].clone());
+                        }
+                        None => {
+                            ordered.push(Message::Tool {
+                                call_id: call.id.clone(),
+                                name: Some(call.name.clone()),
+                                content: format!(
+                                    "未执行：本轮在调用 `{}` 之前中断了，这条没有运行。",
+                                    call.name
+                                ),
+                                is_error: true,
+                            });
+                            healed += 1;
+                        }
+                    }
+                }
+                // 不认识任何调用的结果（上一轮被砍掉的残留）直接丢
+                healed += used.iter().filter(|u| !**u).count();
+
+                out.push(Message::Assistant { content, tool_calls: calls });
+                out.extend(ordered);
+                i = j;
+            }
+            // 前面没有 assistant 认领的结果：孤立，丢掉
+            Message::Tool { .. } => {
+                healed += 1;
+                i += 1;
+            }
+            other => {
+                out.push(other.clone());
+                i += 1;
+            }
+        }
+    }
+
+    // 无条件写回：即使条数没变，顺序也可能被整理过（结果乱序 ->
+    // 按调用顺序排），而那正是协议要的"紧跟各自的结果"
+    *messages = out;
+    healed
+}
+
 /// 修复工具调用配对：`tool_call.id` 与 `tool.call_id` 取交集。
 ///
 /// **这是正确性要求，不是优化。** 压缩边界切在调用与结果之间时，
@@ -381,6 +493,14 @@ mod tests {
 
     fn budget() -> ContextBudget {
         ContextBudget { min_messages: 2, ..Default::default() }
+    }
+
+    fn call(id: &str) -> zex_core::ToolCall {
+        zex_core::ToolCall {
+            id: ToolCallId::new(id),
+            name: "fs_read".into(),
+            arguments: "{}".into(),
+        }
     }
 
     fn asst(text: &str) -> Message {
@@ -519,6 +639,124 @@ mod tests {
             }
             _ => {}
         }
+    }
+
+    #[test]
+    fn heal_fills_in_missing_tool_results() {
+        // 用户在第 2 个工具之前点了停止 / 进程被杀 → assistant 有 2 条调用，
+        // 但只有第 1 条的结果。这条历史直接发出去，接口会 400。
+        let mut msgs = vec![
+            Message::user("看看这两个文件"),
+            Message::Assistant {
+                content: vec![Part::text("我读一下")],
+                tool_calls: vec![call("a"), call("b")],
+            },
+            Message::Tool {
+                call_id: ToolCallId::new("a"),
+                name: Some("fs_read".into()),
+                content: "文件 A".into(),
+                is_error: false,
+            },
+        ];
+        let healed = heal_tool_pairs(&mut msgs);
+        assert_eq!(healed, 1, "只该补一条");
+        assert_eq!(msgs.len(), 4);
+        match &msgs[3] {
+            Message::Tool { call_id, is_error, content, .. } => {
+                assert_eq!(*call_id, ToolCallId::new("b"));
+                assert!(is_error, "补的这条必须标成失败，否则模型以为它跑过了");
+                assert!(content.contains("未执行"), "要写明原因：{content}");
+            }
+            other => panic!("第三条应该是补出来的工具结果，得到 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn heal_keeps_results_in_call_order() {
+        // 结果乱序（并发场景下会出现）：按调用顺序重排，
+        // 顺带让顺序满足"紧跟其后"的协议要求
+        let mut msgs = vec![
+            Message::Assistant {
+                content: vec![],
+                tool_calls: vec![call("a"), call("b")],
+            },
+            Message::Tool {
+                call_id: ToolCallId::new("b"),
+                name: Some("x".into()),
+                content: "B".into(),
+                is_error: false,
+            },
+            Message::Tool {
+                call_id: ToolCallId::new("a"),
+                name: Some("x".into()),
+                content: "A".into(),
+                is_error: false,
+            },
+        ];
+        assert_eq!(heal_tool_pairs(&mut msgs), 0, "条数没变，不算修补");
+        let ids: Vec<_> = msgs
+            .iter()
+            .filter_map(|m| match m {
+                Message::Tool { call_id, .. } => Some(call_id.to_string()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids, ["a", "b"]);
+    }
+
+    #[test]
+    fn heal_drops_orphan_and_duplicate_results() {
+        let mut msgs = vec![
+            // 前面没有 assistant 认领
+            Message::Tool {
+                call_id: ToolCallId::new("ghost"),
+                name: None,
+                content: "孤立的".into(),
+                is_error: false,
+            },
+            Message::Assistant {
+                content: vec![Part::text("ok")],
+                tool_calls: vec![call("a")],
+            },
+            Message::Tool {
+                call_id: ToolCallId::new("a"),
+                name: None,
+                content: "第一次".into(),
+                is_error: false,
+            },
+            Message::Tool {
+                call_id: ToolCallId::new("a"),
+                name: None,
+                content: "重复的".into(),
+                is_error: false,
+            },
+        ];
+        let healed = heal_tool_pairs(&mut msgs);
+        assert_eq!(healed, 2, "丢一条孤立 + 一条重复");
+        assert_eq!(msgs.len(), 2);
+        assert!(matches!(&msgs[0], Message::Assistant { .. }));
+        match &msgs[1] {
+            Message::Tool { content, .. } => assert_eq!(content, "第一次"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn heal_is_a_no_op_on_a_healthy_history() {
+        let mut msgs = vec![
+            Message::user("跑一下"),
+            Message::Assistant { content: vec![], tool_calls: vec![call("a")] },
+            Message::Tool {
+                call_id: ToolCallId::new("a"),
+                name: None,
+                content: "结果".into(),
+                is_error: false,
+            },
+            Message::Assistant { content: vec![Part::text("好了")], tool_calls: vec![] },
+        ];
+        let before = msgs.clone();
+        assert_eq!(heal_tool_pairs(&mut msgs), 0);
+        assert_eq!(msgs, before);
     }
 
     #[test]

@@ -174,6 +174,10 @@ loop {
    `apply(plan, summary) -> Vec<Message>` 只做拼装。
 4. **压缩后必须修复工具调用配对**（`tool_call.id` ⇄ `tool_result.call_id` 取交集）。
    边界切在调用与结果之间会让 API 返回 400，这是正确性要求不是优化。
+   **发请求前还要再补一次**（`heal_tool_pairs`）：用户点停止、进程被杀、上一轮报错，
+   都会留下「有调用没结果」的半截历史，直接发就是
+   `an assistant message with 'tool_calls' must be followed by tool messages…`。
+   装载会话时补一次、每轮发请求前补一次，缺的填"未执行"、多的丢掉、重复的去重。
 5. **没到压缩线不动历史。** 历史上任何一处的改写，都会让它后面全部消息的 prefix cache 失效
    （provider 侧按未命中计费），所以工具结果裁剪也只在总量过 70% 后才做；否则 192k/1M 时
    会每步重写一次，钱白烧、界面上全是「已压缩」噪音。

@@ -234,6 +234,16 @@ impl Agent {
     ) -> Result<Self> {
         let http = zex_llm::build_http_client()?;
         let policy = Policy::new(store.clone());
+        // 上一次进程被杀 / 用户点停止，都会在库里留下「有调用没结果」的
+        // 半截历史。带这种历史发第一次请求，接口直接 400：
+        //   an assistant message with 'tool_calls' must be followed by
+        //   tool messages responding to each 'tool_call_id'
+        // 所以装载完先补一遍，再让它参与任何请求。
+        let mut history = history;
+        let healed = crate::compress::heal_tool_pairs(&mut history);
+        if healed > 0 {
+            tracing::warn!(healed, "历史里的工具调用配对不完整，已补齐");
+        }
         // 工具结果预算跟着模型的输出上限走。放在这个**唯一的**装配点上，
         // 而不是各个 builder 里：`cfg.max_tokens` 有四个写入点（构造默认值、
         // 配置里的 params、请求级换模型、每轮从配置文件重读），
@@ -652,6 +662,11 @@ impl Agent {
             // 几百条消息的规模完全可忽略。
             self.compressor.tick_turn();
             self.maybe_compress(&turn, events).await;
+            // 压缩、中断、上一步的工具执行都可能让配对缺口重新出现；
+            // 这里是**发请求前的最后一道闸**，幂等且 O(n)，代价可忽略。
+            if crate::compress::heal_tool_pairs(&mut self.history) > 0 {
+                tracing::debug!("发请求前补齐了工具调用配对");
+            }
 
             let req = self.build_request();
             let streamed = match self.stream_once(req, &turn, events).await {
@@ -718,6 +733,7 @@ impl Agent {
             }
 
             // 串行执行：审批必须逐个过，并行会让审批顺序混乱。
+            let mut executed = 0usize;
             for call in &tool_calls {
                 // 中断后剩下的工具不再执行 —— 用户按停止就是不想让它继续动
                 if self.cancelled.load(Ordering::SeqCst) {
@@ -761,6 +777,26 @@ impl Agent {
                 };
                 self.record(&tool_msg)?;
                 self.history.push(tool_msg);
+                executed += 1;
+            }
+
+            // 中断发生在半路时，剩下的调用一条结果都不会有。用户看到的是
+            // "停下了"，但下一轮请求会因为配对不全被接口拒掉 —— 所以在
+            // 这里就把没跑的那些补成明确的结果，别等下一轮再去猜。
+            if self.cancelled.load(Ordering::SeqCst) {
+                for call in &tool_calls[executed..] {
+                    let msg = Message::Tool {
+                        call_id: call.id.clone(),
+                        name: Some(call.name.clone()),
+                        content: format!(
+                            "未执行：用户在这一步之前中断了本轮，`{}` 没有运行。",
+                            call.name
+                        ),
+                        is_error: true,
+                    };
+                    self.record(&msg)?;
+                    self.history.push(msg);
+                }
             }
         }
 
@@ -1462,6 +1498,44 @@ mod tests {
 
         let resumed = Agent::resume(test_cfg(), vec![], store, sid).unwrap();
         assert_eq!(resumed.history().len(), 2);
+    }
+
+    #[test]
+    fn resume_heals_half_finished_tool_calls() {
+        // 复现用户报的那个 400：进程在工具执行到一半时被杀，
+        // 库里留着「assistant 有 tool_calls，但没有对应结果」的半截历史。
+        // 直接 resume 再发请求会被接口拒掉，所以装载时就得补齐。
+        let store = Store::in_memory().unwrap();
+        let agent = Agent::new(test_cfg(), vec![], store.clone()).unwrap();
+        let sid = agent.session_id().clone();
+        store.append_message(&sid, &Message::user("读一下"), 1).unwrap();
+        store
+            .append_message(
+                &sid,
+                &Message::Assistant {
+                    content: vec![zex_core::Part::text("我看看")],
+                    tool_calls: vec![zex_core::ToolCall {
+                        id: zex_core::ToolCallId::new("call-1"),
+                        name: "fs_read".into(),
+                        arguments: r#"{"path":"a"}"#.into(),
+                    }],
+                },
+                1,
+            )
+            .unwrap();
+        // 结果没来得及写
+
+        let resumed = Agent::resume(test_cfg(), vec![], store, sid).unwrap();
+        let h = resumed.history();
+        assert_eq!(h.len(), 3, "缺的那条结果应该被补上：{h:?}");
+        match &h[2] {
+            Message::Tool { call_id, is_error, content, .. } => {
+                assert_eq!(call_id.to_string(), "call-1");
+                assert!(is_error);
+                assert!(content.contains("未执行"), "{content}");
+            }
+            other => panic!("第三条应该是补出来的工具结果，得到 {other:?}"),
+        }
     }
 
     #[test]
