@@ -166,6 +166,35 @@ strategy:
 ! grep -q "gpui-kit" crates/zex-core/Cargo.toml crates/zex-agent/Cargo.toml
 ```
 
+### 在 Linux 上提前抓非 Linux 的编译错
+
+交叉 `cargo check --target` 走不通：`gpui-pre` 的 build script 要 Windows SDK /
+Xcode 的 C 工具链。但大部分跨平台编译错不是 ABI 问题，而是**条件编译没盖住**——
+
+- 某个只在 Linux 侧被调用的私有函数，在 Windows 上成了 `dead_code`，
+  而 CI 带 `-D warnings`，直接编译失败
+- 某个函数只有 `#[cfg(target_os = "linux")]` 的定义，非 Linux 分支却在调它
+
+这类问题可以**在 Linux 上用十秒钟抓出来**：把文件里的 `target_os = "linux"`
+临时全换成 `target_os = "macos"`，然后编译。原来的 Linux 分支全部关闭，
+等价于站在非 Linux 平台上编译这个文件。
+
+```bash
+f=crates/zex-extension/src/clip_watch.rs
+cp "$f" /tmp/bak && sed -i 's/target_os = "linux"/target_os = "macos"/g' "$f"
+RUSTFLAGS="-D warnings" cargo check -p zex-extension --lib; rc=$?
+cp /tmp/bak "$f"; echo "退出码 $rc"
+```
+
+两点注意：
+
+1. **不能随手编一个新的 OS 名**（如 `"notlinux"`）—— rustc 会报
+   `unexpected cfg condition value`，因为 `target_os` 的取值是白名单。用
+   `macos` 这种真实值才合法。
+2. 它只验证**本文件的条件编译**，验证不了真正的平台 API 差异（窗口系统、
+   文件路径语义）。后者仍然只有 CI 或真机。
+
+
 ---
 
 ## 5. 各平台的坑（持续补充）

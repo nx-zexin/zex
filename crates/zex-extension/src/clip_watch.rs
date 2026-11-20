@@ -32,6 +32,11 @@ use std::sync::{Mutex, OnceLock};
 
 /// 队列上限。复制狂魔也不会一次积压这么多；超了丢最旧的，
 /// 因为最新的才是用户最可能要的。
+///
+/// 只在 Linux（后台线程要它）和测试（`queue_is_bounded` 要它）里用。
+/// 少了这个 cfg，Windows/macOS 会因为 `dead_code` 直接编不过 ——
+/// 那边根本没有 queue 的生产者。
+#[cfg(any(target_os = "linux", test))]
 const MAX_QUEUE: usize = 300;
 
 /// 轮询间隔。实测 120ms 能把间隔 250ms 的三次快速复制全部捕获，
@@ -58,6 +63,7 @@ pub struct Event {
     pub at_ms: u64,
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -72,6 +78,7 @@ fn queue() -> &'static Mutex<VecDeque<Event>> {
     QUEUE.get_or_init(|| Mutex::new(VecDeque::new()))
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn push(event: Event) {
     let Ok(mut q) = queue().lock() else {
         return;
