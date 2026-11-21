@@ -98,9 +98,15 @@ pub fn skills_dir() -> PathBuf {
 /// 它必须和程序版本一致。跟着安装包走，就不会出现"程序升级了、
 /// 说明书还是旧的"那种情况。
 const BUNDLED_SKILLS: &[(&str, &str)] = &[(
-    "write-extension.md",
-    include_str!("../../../skills/write-extension.md"),
+    "write-extension",
+    include_str!("../../../skills/write-extension/skill.md"),
 )];
+
+/// `gpui-kit.d.ts` 落在哪个技能的目录里。
+///
+/// 这份声明是"写扩展"这件事的附件：跟 `skill.md` 放在同一个目录，
+/// 技能整个目录拷走就是完整的一套（说明 + API 清单）。
+const TYPINGS_SKILL: &str = "write-extension";
 
 /// 记录"我们上次铺下去的是什么"，用来分辨用户改没改。
 ///
@@ -118,15 +124,42 @@ const BUNDLE_STATE: &str = ".bundled-hashes.json";
 ///   留着旧版会**主动误导**模型，比没有更糟。
 /// - 存在、但和记录对不上 → 用户改过，一个字都不动。
 /// - 存在、但没有记录（这个机制上线前装的）→ 无法判断，于是先把旧内容
-///   备份成 `.bundled-backup-<名字>`，再写新版。宁可多一个备份文件，
-///   也不能悄悄扔掉别人可能改过的东西。
+///   备份成技能目录里的 `.bundled-backup.md`，再写新版。宁可多一个备份
+///   文件，也不能悄悄扔掉别人可能改过的东西。
+///
+/// 落点是 `<dir>/<名字>/skill.md`（一个技能一个目录，附件放在一起）。
+/// 老版本铺的是 `<dir>/<名字>.md`，那段迁移在上面单独处理。
 fn install_bundled_skills(dir: &std::path::Path) {
     let state_path = dir.join(BUNDLE_STATE);
     let mut state = read_bundle_state(&state_path);
     let mut dirty = false;
 
     for (name, body) in BUNDLED_SKILLS {
-        let path = dir.join(name);
+        let skill_dir = dir.join(name);
+        let path = skill_dir.join(zex_skill::SKILL_FILE);
+
+        // 老布局是直接摊在根目录下的 `<name>.md`。如果那份还是我们上次
+        // 铺下去的（等于记录里的哈希，说明用户没碰过），删掉 —— 它已经被
+        // `<name>/skill.md` 取代，留着只会在加载时撞名。
+        // 改过的一律保留：宁可多一个旧文件，也不能删别人写的东西。
+        let legacy_path = dir.join(format!("{name}.md"));
+        let legacy_key = format!("{name}.md");
+        if let Ok(old) = std::fs::read_to_string(&legacy_path) {
+            if state.get(&legacy_key).copied() == Some(fnv1a(&old)) {
+                if std::fs::remove_file(&legacy_path).is_ok() {
+                    state.remove(&legacy_key);
+                    dirty = true;
+                    tracing::info!(skill = name, "内置技能已从 <name>.md 迁入 <name>/skill.md");
+                }
+            } else {
+                tracing::warn!(
+                    skill = name,
+                    path = %legacy_path.display(),
+                    "旧布局的内置技能被改过，保留原样；它和新的目录版会同时出现，建议手动合并"
+                );
+            }
+        }
+
         let want = fnv1a(body);
         let existing = std::fs::read_to_string(&path).ok();
 
@@ -150,6 +183,10 @@ fn install_bundled_skills(dir: &std::path::Path) {
 
         match decision {
             Decision::Write => {
+                if let Err(e) = std::fs::create_dir_all(&skill_dir) {
+                    tracing::warn!(skill = name, error = %e, "无法创建技能目录");
+                    continue;
+                }
                 if let Err(e) = std::fs::write(&path, body) {
                     tracing::warn!(skill = name, error = %e, "无法写入内置技能");
                     continue;
@@ -161,7 +198,11 @@ fn install_bundled_skills(dir: &std::path::Path) {
                 tracing::debug!(skill = name, "内置技能被用户改过，保留原样");
             }
             Decision::Migrate => {
-                let backup = dir.join(format!(".bundled-backup-{name}"));
+                if let Err(e) = std::fs::create_dir_all(&skill_dir) {
+                    tracing::warn!(skill = name, error = %e, "无法创建技能目录");
+                    continue;
+                }
+                let backup = skill_dir.join(".bundled-backup.md");
                 if let Some(old) = &existing {
                     let _ = std::fs::write(&backup, old);
                 }
@@ -224,10 +265,28 @@ pub fn load_skills() -> std::sync::Arc<zex_skill::SkillRegistry> {
     // 脚本 API 的声明也铺在同一层：模型读技能时在同一目录就能拿到
     // 当前运行时的全部 API，不必先"打开某个扩展"才有一份。
     // 失败只记警告 —— 技能加载不该因为磁盘问题整体失败。
-    if let Err(e) = ext_typings::write_api_declarations(&dir) {
-        tracing::warn!(dir = %dir.display(), error = %e, "无法生成脚本 API 声明");
+    // 声明是这个技能的附件，落在它的目录里，不摊在根目录
+    let typings_dir = dir.join(TYPINGS_SKILL);
+    match ext_typings::write_api_declarations(&typings_dir) {
+        Ok(written) => {
+            // 老版本把声明摊在技能根目录。新的一份已经就位，就把旧的删掉 ——
+            // 那是我们生成的、不是用户数据，留着白占 800 KB，还会让人照着
+            // 过时的路径去找。
+            let legacy = dir.join(ext_typings::FILE_NAME);
+            if legacy != written && legacy.is_file() {
+                let _ = std::fs::remove_file(&legacy);
+                tracing::info!("已把 gpui-kit.d.ts 移进 write-extension/ 目录");
+            }
+        }
+        Err(e) => tracing::warn!(dir = %typings_dir.display(), error = %e, "无法生成脚本 API 声明"),
     }
-    std::sync::Arc::new(zex_skill::SkillRegistry::load(&dir))
+    let registry = zex_skill::SkillRegistry::load(&dir);
+    // 加载时的问题（旧布局、目录里没 skill.md）要能被人看见 ——
+    // 静默忽略等于让用户对着一个"为什么不生效"的目录发呆。
+    for warning in registry.warnings() {
+        tracing::warn!(target: "zex_skill", "{warning}");
+    }
+    std::sync::Arc::new(registry)
 }
 
 /// 打开最近一个会话（若无则新建），并加载技能。
@@ -1167,12 +1226,17 @@ mod skills_tests {
         p
     }
 
+    /// 内置技能现在落在哪：`<dir>/<名字>/skill.md`。
+    fn bundled_path(dir: &std::path::Path) -> std::path::PathBuf {
+        dir.join("write-extension").join(zex_skill::SKILL_FILE)
+    }
+
     #[test]
-    fn bundled_skill_is_installed_when_missing() {
+    fn bundled_skill_is_installed_into_its_own_directory() {
         let dir = temp_dir("install");
         install_bundled_skills(&dir);
-        let path = dir.join("write-extension.md");
-        assert!(path.exists(), "内置技能应被铺到磁盘");
+        let path = bundled_path(&dir);
+        assert!(path.exists(), "内置技能应被铺到 <名字>/skill.md");
         let once = std::fs::read_to_string(&path).unwrap();
         assert!(once.contains("write-extension") || once.contains("给 zex 写"));
         assert!(
@@ -1185,13 +1249,13 @@ mod skills_tests {
     fn unmodified_copy_is_upgraded() {
         let dir = temp_dir("upgrade");
         install_bundled_skills(&dir);
-        let path = dir.join("write-extension.md");
+        let path = bundled_path(&dir);
         // 模拟"旧版铺下去、用户没碰"：内容变了，但记录也跟着变
         let stale = "---\nname: write-extension\ndescription: 旧版\n---\n\n旧内容\n";
         std::fs::write(&path, stale).unwrap();
         std::fs::write(
             dir.join(BUNDLE_STATE),
-            serde_json::json!({"write-extension.md": fnv1a(stale)}).to_string(),
+            serde_json::json!({"write-extension": fnv1a(stale)}).to_string(),
         )
         .unwrap();
         install_bundled_skills(&dir);
@@ -1206,13 +1270,14 @@ mod skills_tests {
     #[test]
     fn user_edited_copy_is_never_overwritten() {
         let dir = temp_dir("keep");
-        let path = dir.join("write-extension.md");
+        let path = bundled_path(&dir);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let mine = "---\nname: write-extension\ndescription: 我改过的\n---\n\n别动我\n";
         std::fs::write(&path, mine).unwrap();
         // 记录里是别的版本 → 说明用户动过
         std::fs::write(
             dir.join(BUNDLE_STATE),
-            serde_json::json!({"write-extension.md": fnv1a("别的版本")}).to_string(),
+            serde_json::json!({"write-extension": fnv1a("别的版本")}).to_string(),
         )
         .unwrap();
         install_bundled_skills(&dir);
@@ -1223,18 +1288,64 @@ mod skills_tests {
     #[test]
     fn copy_without_record_is_migrated_with_backup() {
         let dir = temp_dir("migrate");
-        let path = dir.join("write-extension.md");
+        let path = bundled_path(&dir);
         // 这个机制上线前装的：文件在，但没有记录
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, "---\nname: write-extension\n---\n\n上一代内容\n").unwrap();
         install_bundled_skills(&dir);
         let after = std::fs::read_to_string(&path).unwrap();
         assert!(after.contains("icon.svg"), "没有记录时也要升级到新版");
-        let backup = dir.join(".bundled-backup-write-extension.md");
+        let backup = dir.join("write-extension").join(".bundled-backup.md");
         let kept = std::fs::read_to_string(&backup).unwrap();
         assert!(
             kept.contains("上一代内容"),
             "旧内容必须留个备份，不能凭空消失"
         );
+    }
+
+    #[test]
+    fn legacy_flat_copy_is_removed_after_moving_into_a_directory() {
+        // 老布局：`<dir>/write-extension.md`，是我们自己铺的、用户没动过
+        let dir = temp_dir("legacy-clean");
+        let legacy = dir.join("write-extension.md");
+        let old = "---\nname: write-extension\ndescription: 上一版\n---\n\n旧内容\n";
+        std::fs::write(&legacy, old).unwrap();
+        std::fs::write(
+            dir.join(BUNDLE_STATE),
+            serde_json::json!({"write-extension.md": fnv1a(old)}).to_string(),
+        )
+        .unwrap();
+
+        install_bundled_skills(&dir);
+
+        assert!(
+            !legacy.exists(),
+            "没改过的旧布局文件应被清理，否则会和目录版撞名"
+        );
+        assert!(bundled_path(&dir).exists(), "新布局要就位");
+        let state = read_bundle_state(&dir.join(BUNDLE_STATE));
+        assert!(
+            !state.contains_key("write-extension.md"),
+            "旧键该从记录里去掉"
+        );
+    }
+
+    #[test]
+    fn edited_legacy_flat_copy_is_kept() {
+        // 老布局但用户改过：一个字都不能删
+        let dir = temp_dir("legacy-keep");
+        let legacy = dir.join("write-extension.md");
+        std::fs::write(&legacy, "---\nname: write-extension\n---\n\n我改过的\n").unwrap();
+        std::fs::write(
+            dir.join(BUNDLE_STATE),
+            serde_json::json!({"write-extension.md": fnv1a("完全不同的内容")}).to_string(),
+        )
+        .unwrap();
+
+        install_bundled_skills(&dir);
+
+        assert!(legacy.exists(), "改过的旧文件不能删");
+        assert!(bundled_path(&dir).exists(), "新版目录也照铺");
     }
 
     #[test]

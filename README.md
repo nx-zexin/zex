@@ -138,8 +138,9 @@ cargo run -p zex-app --bin zex-cli -- "看看当前目录是什么项目"
 - `~/.zex/config.json`：提供方、默认模型、MCP 服务、应用授权
 - `~/.zex/.env`：密钥，权限 600
 - `~/.zex/zex.db`：会话、消息、审计、授权、任务，单一数据库
-- `~/.zex/skills/*.md`：技能，带 frontmatter。系统提示中仅包含名称与一句话说明，
-  正文由 `load_skill` 按需读取
+- `~/.zex/skills/<名字>/skill.md`：技能，一个技能一个目录，目录名即技能名。
+  附件（脚本、模板、生成的 `gpui-kit.d.ts`）跟说明放在同一目录里。
+  系统提示中仅包含名称与一句话说明，正文由 `load_skill` 按需读取
 - `~/.zex/extensions/<id>/`：应用
 - `~/.zex/state/`：应用的 localStorage 与各自的数据库文件
 
@@ -185,8 +186,8 @@ cargo run -p zex-app --bin zex-cli -- "看看当前目录是什么项目"
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)：分层、双世界桥接、agent loop、数据层
 - [docs/SECURITY.md](docs/SECURITY.md)：四档风险、审批、审计、提示注入
 - [docs/EXTENSIONS.md](docs/EXTENSIONS.md)：应用系统与网络授权的设计依据
-- [skills/write-extension.md](skills/write-extension.md)：写应用的说明书。编译进二进制，启动时铺到
-  `~/.zex/skills`，模型按需用 `load_skill` 读取
+- [skills/write-extension/skill.md](skills/write-extension/skill.md)：写应用的说明书。编译进二进制，
+  启动时铺到 `~/.zex/skills/write-extension/`，模型按需用 `load_skill` 读取
 - [docs/DECISIONS.md](docs/DECISIONS.md)：架构决策记录，包含被否决的方案
 - [docs/PLATFORM.md](docs/PLATFORM.md)：三平台策略与能力矩阵
 - [docs/M1-REPORT.md](docs/M1-REPORT.md)：权限、持久化、压缩与界面的实现记录与实测结果

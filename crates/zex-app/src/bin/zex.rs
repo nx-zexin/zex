@@ -6453,13 +6453,16 @@ impl ChatView {
                             .text_xs()
                             .line_height(px(20.0))
                             .text_color(rgb(TEXT_MUTED))
-                            .child("在技能目录里放一个 .md 文件就会被加载，格式见下："),
+                            .child(
+                                "一个技能是一个目录：在技能目录里建 <名字>/skill.md 就会被加载，\
+                                 目录名就是技能名，附件放在同一个目录里。格式见下：",
+                            ),
                     )
                     .child(
                         TextView::markdown(
                             ElementId::Name("skill-example".into()),
                             as_code_block(
-                                "---\nname: rust-refactor\ndescription: 重构 Rust 代码时的检查清单\n---\n\n1. 先跑 cargo check 建立基线\n2. 改完再跑一次，确认没有新增错误\n3. cargo fmt",
+                                "# ~/.zex/skills/rust-refactor/skill.md\n---\ndescription: 重构 Rust 代码时的检查清单\n---\n\n1. 先跑 cargo check 建立基线\n2. 改完再跑一次，确认没有新增错误\n3. cargo fmt",
                                 "markdown",
                             ),
                         )

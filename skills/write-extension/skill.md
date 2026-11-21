@@ -39,8 +39,9 @@ description: 给 zex 写一个应用（脚本面板/独立小应用），含模�
 包含 `gpui-kit`、`gpui-base` 两个模块的全部导出、每个方法的参数文档，
 以及 `cx` 上的能力（剪贴板、定时器、主题……）。写代码前先查，别凭印象。
 
-**它在哪：`~/.zex/skills/gpui-kit.d.ts`。** 宿主每次启动都会按当前运行时
-重新生成这份文件（内容变了才重写），所以它永远等于你现在跑的这版运行时 ——
+**它就是跟本文件同目录的那份 `gpui-kit.d.ts`** —— 完整路径
+`~/.zex/skills/write-extension/gpui-kit.d.ts`。宿主每次启动都会按当前运行时
+重新生成（内容变了才重写），所以它永远等于你现在跑的这版运行时 ——
 不需要谁去同步，也不存在"照着旧文档写、运行时对不上"。
 
 扩展目录里也有一个同名文件，但那是**这个应用第一次被打开时**才生成的。
@@ -48,7 +49,7 @@ description: 给 zex 写一个应用（脚本面板/独立小应用），含模�
 
 ```bash
 # 用 grep 工具搜，不要整份读（两万两千行，读进来就吃掉半个上下文）
-grep pattern="v_flex|h_flex" path=~/.zex/skills/gpui-kit.d.ts
+grep pattern="v_flex|h_flex" path=~/.zex/skills/write-extension/gpui-kit.d.ts
 ```
 
 三个用法要点：
