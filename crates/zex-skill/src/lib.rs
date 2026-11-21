@@ -467,9 +467,14 @@ mod tests {
         let reg = SkillRegistry::load(dir.path());
         assert_eq!(reg.all().len(), 1, "老布局也要读进来，不能凭空消失");
         assert_eq!(reg.all()[0].name, "old");
+        // 用 Path 拼期望值，别写死 `/` —— Windows 上是反斜杠
+        let suggested = dir.path().join("old").join(SKILL_FILE);
         assert!(
-            reg.warnings().iter().any(|w| w.contains("old/skill.md")),
-            "该提示搬到目录里：{:?}",
+            reg.warnings()
+                .iter()
+                .any(|w| w.contains(&suggested.to_string_lossy().to_string())),
+            "该提示搬到 {}：{:?}",
+            suggested.display(),
             reg.warnings()
         );
     }
