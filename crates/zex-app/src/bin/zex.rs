@@ -452,6 +452,41 @@ struct ChatView {
     usage: Usage,
 }
 
+/// 常见系统目录的第一段。
+///
+/// `/tmp`、`/home` 这种"只有一个词"的输入也可能是路径，不能因为不像
+/// `/new` 那样带参数就当成命令吃掉。
+const SYSTEM_ROOT_SEGMENTS: &[&str] = &[
+    "home",
+    "users",
+    "tmp",
+    "temp",
+    "var",
+    "etc",
+    "usr",
+    "opt",
+    "root",
+    "dev",
+    "srv",
+    "mnt",
+    "media",
+    "proc",
+    "sys",
+    "boot",
+    "private",
+    "system",
+    "volumes",
+    "bin",
+    "sbin",
+    "lib",
+    "lib64",
+    "run",
+    "snap",
+    "workspace",
+    "project",
+    "projects",
+];
+
 impl ChatView {
     /// 十三个参数是"界面初始化要交进去的全部状态"。
     ///
@@ -528,7 +563,7 @@ impl ChatView {
                     }
                     this.last_input_len = len;
                     let v = v.trim_start();
-                    this.slash_open = v.starts_with('/') && !v.contains(' ');
+                    this.slash_open = Self::looks_like_command(v) && !v.contains(' ');
                     // 候选集变了，游标回到第一项
                     this.menu_cursor = 0;
                     // @ 提到最后一个 @ 之后的词
@@ -1220,6 +1255,29 @@ impl ChatView {
     /// 执行一条斜杠命令。
     ///
     /// 返回 true 表示这次输入被当作命令消费掉了，不该发给模型。
+    /// 这行输入是不是一条斜杠命令。
+    ///
+    /// 只看第一个词：命令名是 `/new`、`/model` 这种单词，而
+    /// `/home/adam/Workspace/x` 是绝对路径。少了这条判断，任何以路径开头
+    /// 描述任务的提示词都会被当成"未知命令"吞掉 —— 用户看到的就是
+    /// "打了字、按了发送、什么都没发生"。
+    fn looks_like_command(text: &str) -> bool {
+        let text = text.trim_start();
+        let Some(rest) = text.strip_prefix('/') else {
+            return false;
+        };
+        let first = rest.split_whitespace().next().unwrap_or("");
+        // 命令名里不该再有分隔符；有就是路径
+        if first.contains('/') {
+            return false;
+        }
+        // 单个词也可能是一条路径：`/tmp 下建个文件`、`/home 看一下`。
+        // 拿常见系统目录的头一段兜一下 —— 这些不可能是命令名。
+        !SYSTEM_ROOT_SEGMENTS
+            .iter()
+            .any(|seg| seg.eq_ignore_ascii_case(first))
+    }
+
     fn run_slash(&mut self, cmd: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let cmd = cmd.trim();
         let (name, rest) = match cmd.split_once(' ') {
@@ -1609,8 +1667,9 @@ impl ChatView {
             return;
         }
 
-        // 斜杠命令不发给模型
-        if text.starts_with('/') {
+        // 斜杠命令不发给模型。判据见 `looks_like_command`：
+        // 以绝对路径开头的提示词（`/home/u/x 在这个目录下…`）是正文，不是命令。
+        if Self::looks_like_command(&text) {
             self.run_slash(&text, window, cx);
             return;
         }
@@ -8719,4 +8778,42 @@ fn main() {
             })
             .detach();
         });
+}
+
+#[cfg(test)]
+mod slash_rules {
+    use super::ChatView;
+
+    #[test]
+    fn a_path_is_not_a_command() {
+        // 回归：用户以绝对路径开头描述任务时，提示词被当成"未知命令"
+        // 吞掉，界面上什么都不会发生。
+        assert!(!ChatView::looks_like_command(
+            "/home/adam/Workspace/BeiTanXian 在这个目录下创建一个电商应用"
+        ));
+        assert!(!ChatView::looks_like_command(
+            "/etc/nginx/nginx.conf 改一下"
+        ));
+        assert!(!ChatView::looks_like_command("/tmp"));
+    }
+
+    #[test]
+    fn real_commands_are_still_commands() {
+        for cmd in ["/new", "/clear", "/model", "/help", "/?", "/model deepseek"] {
+            assert!(ChatView::looks_like_command(cmd), "`{cmd}` 应该当命令");
+        }
+        // 打错命令名的仍然要走到"没有这个命令"的提示
+        assert!(ChatView::looks_like_command("/modle"));
+        // 参数里带斜杠不影响：切模型时模型名常带 `provider/model`
+        assert!(ChatView::looks_like_command(
+            "/model deepseek/deepseek-flash"
+        ));
+    }
+
+    #[test]
+    fn plain_text_is_not_a_command() {
+        assert!(!ChatView::looks_like_command("帮我改个 bug"));
+        assert!(!ChatView::looks_like_command(""));
+        assert!(!ChatView::looks_like_command("   /home/u/x"));
+    }
 }
