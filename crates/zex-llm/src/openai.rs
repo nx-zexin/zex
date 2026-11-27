@@ -347,6 +347,7 @@ mod tests {
             description: "读文件",
             input_schema: json!({"type": "object", "properties": {"path": {"type": "string"}}}),
             risk: Risk::ReadOnly,
+            hint: None,
         }
     }
 

@@ -36,14 +36,17 @@ pub struct WebFetch;
 #[async_trait]
 impl Tool for WebFetch {
     const NAME: &'static str = "web_fetch";
+    const HINT: Option<&'static str> = Some(
+        "抓已知 URL 的正文用它；不要用 shell 的 curl/wget，那回来的是 HTML 源码，还得再洗一遍",
+    );
     const RISK: Risk = Risk::ReadOnly;
     type Args = FetchArgs;
 
     fn description() -> &'static str {
         "抓取一个网页或 HTTP API，返回可读文本。只做静态抓取：\
          不执行 JavaScript、不保持登录态、不点击按钮。\
-         需要登录或交互的页面请告知用户，由 browser 工具（M3）处理。\
-         要搜索信息请用 web_search（M1），本工具需要你给出确切 URL。"
+         需要你给出确切 URL；需要登录或点击才能拿到的内容，\
+         做不到，请让用户把内容复制过来或另想办法。"
     }
 
     async fn call(&self, _cx: &dyn ToolCtx, args: FetchArgs) -> Result<ToolOutput> {

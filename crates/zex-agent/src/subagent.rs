@@ -500,6 +500,13 @@ pub struct SpawnAgent {
 impl Tool for SpawnAgent {
     const NAME: &'static str = "spawn_agent";
     const RISK: Risk = Risk::Reversible;
+    // 克制着写：这里的措辞一旦偏向"多拆任务"，就会滑回先规划再执行那套
+    // （见 docs/DECISIONS.md ADR-006）。子智能体的正当理由是上下文的隔离，
+    // 不是"会协作显得厉害"。
+    const HINT: Option<&'static str> = Some(
+        "只有当子任务能并行、且各自要读一大堆文件时才值得开；\
+         一两个来回能做完的事自己做完更快",
+    );
     type Args = SpawnArgs;
 
     fn description() -> &'static str {

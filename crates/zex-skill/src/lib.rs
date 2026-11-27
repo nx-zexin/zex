@@ -303,6 +303,10 @@ pub struct LoadSkillArgs {
 impl zex_core::tool::Tool for LoadSkill {
     const NAME: &'static str = "load_skill";
     const RISK: zex_core::Risk = zex_core::Risk::ReadOnly;
+    const HINT: Option<&'static str> = Some(
+        "技能列表里出现对口的名字时，先取正文再动手 —— 那是用户为这个项目定下的做法，\
+         比通用经验更准",
+    );
     type Args = LoadSkillArgs;
 
     fn description() -> &'static str {

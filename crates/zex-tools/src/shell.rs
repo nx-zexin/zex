@@ -41,6 +41,12 @@ pub struct Shell;
 impl Tool for Shell {
     const NAME: &'static str = "shell";
     const RISK: Risk = Risk::Impactful;
+    // 「独立进程」这条是从真实故障里长出来的：模型写完 `cd /tmp` 就
+    // 下一条命令 `ls`，以为还在 /tmp，结果一直在工作目录。
+    const HINT: Option<&'static str> = Some(
+        "列目录、跑构建/测试、git 操作；每次调用是独立进程，cd 和 export 不跨调用保留。\
+         必须能自己跑完（vim、等确认的 apt、读 stdin 都会把整轮卡死）",
+    );
     type Args = ShellArgs;
 
     fn description() -> &'static str {

@@ -933,13 +933,16 @@ impl Agent {
 
     /// 组装一次请求。
     fn build_request(&self) -> ChatRequest {
+        let specs: Vec<_> = self.tools.iter().map(|t| t.spec()).collect();
         let mut system = prompt::system_prompt(&self.cfg.cwd);
+        // 工具规则跟着实际工具集走，不写在人格里
+        system.push_str(&prompt::tool_rules(&specs));
         if !self.cfg.extra_prompt.trim().is_empty() {
             system.push_str(&self.cfg.extra_prompt);
         }
         let req = ChatRequest::new(self.history.clone())
             .with_system(system)
-            .with_tools(self.tools.iter().map(|t| t.spec()).collect());
+            .with_tools(specs);
         ChatRequest {
             max_tokens: self.cfg.max_tokens,
             temperature: self.cfg.temperature,
@@ -1061,6 +1064,7 @@ impl Agent {
                 description: "",
                 risk: Risk::Impactful,
                 input_schema: serde_json::json!({}),
+                hint: None,
             });
         spec.risk = self.risk_of(name, args);
         self.judge_for(&spec, args)
@@ -1487,6 +1491,7 @@ mod tests {
             description: "",
             risk: Risk::Destructive,
             input_schema: serde_json::json!({}),
+            hint: None,
         };
         assert!(
             matches!(

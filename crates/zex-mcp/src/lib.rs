@@ -449,6 +449,10 @@ impl zex_core::tool::ErasedTool for McpTool {
             // MCP 工具干什么的我们不知道 —— 可能是读文件，也可能是删库。
             // 按 L2（有外部影响）处理，让它走审批而不是默认放行。
             risk: zex_core::Risk::Impactful,
+            // 不写选择规则：这些工具是运行时接进来的，我们既不知道它和谁
+            // 功能重叠，也说不清"该用它还是用别的"。它的 description 由 MCP
+            // 服务自己给，模型照那个用就行。
+            hint: None,
         }
     }
 

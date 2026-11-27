@@ -277,6 +277,7 @@ mod tests {
             description: "",
             input_schema: serde_json::json!({}),
             risk,
+            hint: None,
         }
     }
 

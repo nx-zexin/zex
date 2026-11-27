@@ -28,6 +28,16 @@ pub struct ToolSpec {
     pub input_schema: serde_json::Value,
     /// 风险等级。
     pub risk: Risk,
+    /// 一句「什么时候该选它」的选择规则，会被动态拼进系统提示词。
+    ///
+    /// 和 `description` 的分工：`description` 随工具一起发给模型（function
+    /// calling），说明这个工具自己怎么用；`hint` 是**跨工具**的比较级 ——
+    /// 「用这个，别用那个」—— 单个工具的 schema 里放不下，只能进系统提示。
+    ///
+    /// 系统提示里只列**实际注册**的工具的 hint，所以 MCP 没接上、技能库为
+    /// 空时，那几行不会出现。写死名录的老做法会指向不存在的工具，模型照着
+    /// 调一次就是一轮浪费。
+    pub hint: Option<&'static str>,
 }
 
 /// 工具执行结果。
@@ -102,6 +112,12 @@ pub trait Tool: Send + Sync + 'static {
     /// 工具名。约定为 `snake_case`，与文件名一致。
     const NAME: &'static str;
 
+    /// 跨工具的选择规则，进系统提示词。默认不写。
+    ///
+    /// 只写「该用它而不是什么」这种比较级；单纯复述功能是噪音，模型在
+    /// function calling 的 `tools` 里已经读到 `description` 了。
+    const HINT: Option<&'static str> = None;
+
     /// 风险等级。**无默认值** —— 漏标必须是编译错误。
     const RISK: Risk;
 
@@ -151,6 +167,7 @@ impl<T: Tool> ErasedTool for T {
             description: T::description(),
             input_schema: schema_of::<T::Args>(),
             risk: T::RISK,
+            hint: T::HINT,
         }
     }
 

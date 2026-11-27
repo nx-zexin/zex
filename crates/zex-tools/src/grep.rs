@@ -75,6 +75,10 @@ pub struct Grep;
 #[async_trait]
 impl Tool for Grep {
     const NAME: &'static str = "grep";
+    const HINT: Option<&'static str> = Some(
+        "找符号定义、找谁引用它、找工作区里的字面量都用它；不要用 shell 的 grep/rg，\
+         也不要 fs_read 一个文件一个文件翻",
+    );
     const RISK: Risk = Risk::ReadOnly;
     type Args = GrepArgs;
 

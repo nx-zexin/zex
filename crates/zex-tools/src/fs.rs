@@ -37,12 +37,14 @@ pub struct FsRead;
 impl Tool for FsRead {
     const NAME: &'static str = "fs_read";
     const RISK: Risk = Risk::ReadOnly;
+    const HINT: Option<&'static str> =
+        Some("读文件用它，返回带行号；不要用 shell 的 cat 代替，行号是后续精确修改的依据");
     type Args = ReadArgs;
 
     fn description() -> &'static str {
         "读取文件内容。返回带行号的文本，便于后续精确修改。\
          大文件请用 offset/limit 分段读取，不要试图一次读完。\
-         目录请改用 tree 或 shell 的 ls。"
+         目录不是文件，请用 shell 的 ls。"
     }
 
     async fn call(&self, cx: &dyn ToolCtx, args: ReadArgs) -> Result<ToolOutput> {
@@ -176,6 +178,10 @@ pub struct FsWrite;
 impl Tool for FsWrite {
     const NAME: &'static str = "fs_write";
     const RISK: Risk = Risk::Reversible;
+    // 没有"替换第 N 行"的工具，只有整体写回。这条必须说出来，
+    // 否则模型会按编辑器的直觉只写改动的那几行，把文件截断。
+    const HINT: Option<&'static str> =
+        Some("整文件写回：改之前先 fs_read 看清原文，再交出完整内容；漏掉的部分就是删掉了");
     type Args = WriteArgs;
 
     fn description() -> &'static str {
