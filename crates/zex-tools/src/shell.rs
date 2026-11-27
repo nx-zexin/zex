@@ -32,16 +32,19 @@ pub struct ShellArgs {
     /// 工作目录。默认使用当前工作目录。
     #[serde(default)]
     pub cwd: Option<String>,
-    /// 这条命令要做什么，一句话说清。
-    ///
-    /// 是**模型的自述**，只用于显示 —— 审批界面把它摆在命令上方，让用户
-    /// 不必自己读一行管道就能判断该不该批。但它可能和 `command` 说的不是
-    /// 一回事（模型会说错，也可能被注入的内容带偏），所以：
-    ///
-    /// **任何安全判定都不许读这个字段。** `risk_for` 只看 `command`，
-    /// 策略层的硬拦截同理（见 `zex_policy::rules`）。
-    #[serde(default)]
-    pub description: Option<String>,
+    /// 这条命令要做什么，一句话说清。会显示给用户看 —— 审批时他只有这一行
+    /// 能快速判断该不该放行，别写"执行命令"这种空话。
+    pub description: String,
+    // 上面这段文档注释会原样进 schema 发给模型，所以只写它需要知道的。
+    // 类型写成 `String`（而不是 `Option`）就是为了让 schema 把它列进
+    // required：给成可选时实测模型一次都没填过。代价是缺这个字段的调用
+    // 会解析失败，`risk_for` 因此退回静态等级 —— 也就是"要审批"。
+    // 对真人使用来说这个兜底是安全的（宁可多问一句），只要模型照填就不会触发。
+    //
+    // 维护者须知：这是**模型的自述**，只用于显示。它可能和 `command` 说的
+    // 不是一回事（模型会说错，也可能被注入的内容带偏），所以任何安全判定
+    // 都不许读它 —— `risk_for` 只看 `command`，策略层的硬拦截同理。
+    //
 }
 
 /// 执行 shell 命令。
@@ -266,7 +269,7 @@ mod tests {
                     command: "echo zex-ok".into(),
                     timeout_secs: None,
                     cwd: None,
-                    description: None,
+                    description: "测试".into(),
                 },
             )
             .await
@@ -284,7 +287,7 @@ mod tests {
                     command: "exit 3".into(),
                     timeout_secs: None,
                     cwd: None,
-                    description: None,
+                    description: "测试".into(),
                 },
             )
             .await
@@ -302,7 +305,7 @@ mod tests {
                     command: "echo oops 1>&2".into(),
                     timeout_secs: None,
                     cwd: None,
-                    description: None,
+                    description: "测试".into(),
                 },
             )
             .await
@@ -320,7 +323,7 @@ mod tests {
                     command: "sleep 5".into(),
                     timeout_secs: Some(1),
                     cwd: None,
-                    description: None,
+                    description: "测试".into(),
                 },
             )
             .await
@@ -368,8 +371,8 @@ mod erased_risk_test {
     #[test]
     fn erased_trait_sees_per_call_risk() {
         let tool: Arc<dyn ErasedTool> = Arc::new(Shell);
-        let read = serde_json::json!({"command": "ls crates"});
-        let write = serde_json::json!({"command": "touch x"});
+        let read = serde_json::json!({"command": "ls crates", "description": "列目录"});
+        let write = serde_json::json!({"command": "touch x", "description": "建空文件"});
         assert_eq!(tool.risk_for(&read), Risk::ReadOnly, "只读命令应静默");
         assert_eq!(tool.risk_for(&write), Risk::Impactful);
         assert_eq!(tool.spec().risk, Risk::Impactful, "静态等级不变");
