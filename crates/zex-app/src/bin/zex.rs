@@ -1113,7 +1113,6 @@ impl ChatView {
                 .flex()
                 .flex_col()
                 .gap_2()
-                .child(role_label("ZEX"))
                 .child(
                     div()
                         .flex()
@@ -1131,7 +1130,6 @@ impl ChatView {
             .flex()
             .flex_col()
             .gap_2()
-            .child(role_label("ZEX"))
             .child(content)
             .into_any_element()
     }
@@ -2825,6 +2823,10 @@ impl ChatView {
 
 // ─── 渲染辅助 ───
 
+/// 一块小标签。
+///
+/// 主信息流已经不用它了（"谁在说话"改由气泡和位置表达），只有子智能体
+/// 面板还在用 —— 那里面同时有主对话和子 agent 的输出，需要一层区分。
 fn role_label(text: &str) -> impl IntoElement {
     div()
         .text_size(px(11.0))
@@ -3246,7 +3248,10 @@ impl ChatView {
     ) -> AnyElement {
         match &m.kind {
             MsgKind::User { images } => {
-                let mut col = div().flex().flex_col().gap_2().child(role_label("USER"));
+                // 气泡 + 右对齐：把"谁在说话"交给位置表达。
+                // 以前靠每行顶上的 USER / ZEX 标签区分，信息流里全是
+                // 重复的抬头，读起来像日志而不像对话。
+                let mut col = div().flex().flex_col().gap_2();
 
                 // 图片排在文字上方：发图时那句话通常只是配文
                 if !images.is_empty() {
@@ -3282,7 +3287,23 @@ impl ChatView {
                         .style(md_style(scale)),
                     );
                 }
-                col.context_menu(copy_context_menu(m.text.clone()))
+                div()
+                    .w_full()
+                    .flex()
+                    .justify_end()
+                    .child(
+                        div()
+                            .max_w(px(620.0))
+                            .rounded(px(14.0))
+                            // 右下角收一点，做出"从用户那边发出来"的方向感
+                            .rounded_br(px(4.0))
+                            .bg(rgb(BRAND_SOFT))
+                            .border_1()
+                            .border_color(rgb(BRAND_BORDER))
+                            .px_4()
+                            .py_3()
+                            .child(col.context_menu(copy_context_menu(m.text.clone()))),
+                    )
                     .into_any_element()
             }
 
@@ -3297,7 +3318,6 @@ impl ChatView {
                     .flex()
                     .flex_col()
                     .gap_2()
-                    .child(role_label("ZEX"))
                     // 模型回复是 markdown：代码块、列表、粗体都要按语义渲染，
                     // 而不是把 ** 和 - 原样吐给用户
                     .child(
