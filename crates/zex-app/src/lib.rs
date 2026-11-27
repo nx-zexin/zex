@@ -16,6 +16,7 @@ pub mod ext_logs;
 pub mod ext_tools;
 /// 把脚本 API 的 `.d.ts` 生成到技能目录，模型写扩展前查的就是它。
 pub mod ext_typings;
+pub mod log_file;
 pub mod models_dev;
 /// 自绘标题栏的窗口动作（拖动 / 最大化还原）。Windows 上绕过 gpui 的两个缺陷。
 pub mod window_ops;

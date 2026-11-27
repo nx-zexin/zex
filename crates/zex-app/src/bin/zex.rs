@@ -6,15 +6,18 @@
 //! 双世界桥接的 UI 侧（ADR-002）：gpui 主线程只做渲染与输入，
 //! 内核在独立 tokio 线程里跑，两者用 channel 通信。
 
-// Windows：release 构建**不要**附带那个黑色控制台窗口。
+// Windows：不要那个黑色控制台窗口。
 //
 // 没有这一行，rustc 默认把二进制编成 console 子系统 —— 双击 exe 会先弹出
 // 一个终端停在后面，用户看到的第一个东西就是个黑框。GUI 程序要的是
 // windows 子系统。
 //
-// debug 下故意保留：`cargo run` 时终端里能看日志和 panic 回溯。代价是
-// release 里 stdout/stderr 没有去处（见 `main` 里的日志初始化）。
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// 这里不分 debug/release：既然日志已经落到 `~/.zex/logs/zex.log`（见
+// `zex_app::log_file`），就不必再靠控制台看输出了。调试要看实时日志：
+//
+//     tail -f ~/.zex/logs/zex.log        # Linux / macOS
+//     Get-Content $HOME\.zex\logs\zex.log -Wait -Tail 50   # PowerShell
+#![cfg_attr(windows, windows_subsystem = "windows")]
 
 use std::sync::Arc;
 
@@ -8464,10 +8467,35 @@ fn main() {
 
         let filter = tracing_subscriber::EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
+
+        // 文件那一层：GUI 经常没有终端可看（Windows 上根本没有控制台），
+        // 出问题时这是唯一能事后回看的地方。初始化失败就只用终端那层 ——
+        // 磁盘满、目录只读都发生过，日志写不了不该让应用起不来。
+        let log_path = zex_app::log_file::init();
+
         tracing_subscriber::registry()
             .with(zex_app::ext_logs::CaptureLayer)
-            .with(tracing_subscriber::fmt::layer().with_filter(filter))
+            .with(tracing_subscriber::fmt::layer().with_filter(filter.clone()))
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(zex_app::log_file::writer())
+                    // 文件里不要颜色转义：那是给终端的，混进去只让人搜不动
+                    .with_ansi(false)
+                    .with_filter(filter),
+            )
             .init();
+
+        // 崩溃也要留下痕迹：Windows 上没有控制台，panic 信息会直接消失。
+        // 保留默认 hook —— 有终端的时候（开发、CLI）照旧看得到。
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            tracing::error!("panic: {info}");
+            default_hook(info);
+        }));
+
+        if let Some(path) = log_path {
+            tracing::debug!(path = %path.display(), "日志同时写入文件");
+        }
     }
 
     let cfg = match zex_app::load() {

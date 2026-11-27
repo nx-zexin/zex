@@ -143,6 +143,8 @@ cargo run -p zex-app --bin zex-cli -- "看看当前目录是什么项目"
   系统提示中仅包含名称与一句话说明，正文由 `load_skill` 按需读取
 - `~/.zex/extensions/<id>/`：应用
 - `~/.zex/state/`：应用的 localStorage 与各自的数据库文件
+- `~/.zex/logs/zex.log`：运行日志（同时打到终端）。超过 8 MiB 轮转成
+  `zex.log.1`，只保留一份旧的。Windows 上没有控制台，出问题时看这里
 
 `ZEX_CONFIG_DIR` 可将整个 `~/.zex` 迁至其他位置，`ZEX_UI_FONT` 用于覆盖界面字体。
 

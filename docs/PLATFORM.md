@@ -216,7 +216,8 @@ cp /tmp/bak "$f"; echo "退出码 $rc"
 | **SmartScreen** | 必须买 EV 证书签名，否则每次下载都红色警告 |
 | 长路径 (>260 字符) | manifest 里声明 `longPathAware`，代码统一用 `\\?\` 前缀 |
 | 控制台窗口闪现 | 所有子进程用 `CREATE_NO_WINDOW` 标志 |
-| **双击 exe 会多一个黑色终端** | rustc 默认把二进制编成 console 子系统。GUI 二进制必须加 `#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]`（见 `crates/zex-app/src/bin/zex.rs` 顶部）。`zex-cli` 故意**不加**——它本来就该待在终端里 |
+| **双击 exe 会多一个黑色终端** | rustc 默认把二进制编成 console 子系统。GUI 二进制加 `#![cfg_attr(windows, windows_subsystem = "windows")]`（见 `crates/zex-app/src/bin/zex.rs` 顶部）。`zex-cli` 故意**不加**——它本来就该待在终端里 |
+| **没有控制台 ⇒ 日志没有去处** | windows 子系统下 stdout/stderr 没人接收。所以日志同时写 `~/.zex/logs/zex.log`（`zex_app::log_file`），配 `Get-Content $HOME\.zex\logs\zex.log -Wait -Tail 50` 看实时输出 |
 | 中文路径 / GBK 输出 | 子进程统一 `chcp 65001` 或强制 UTF-8 |
 
 ### macOS
