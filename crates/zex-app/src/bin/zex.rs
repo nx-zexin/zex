@@ -8294,8 +8294,10 @@ impl ChatView {
             .flex()
             .flex_col()
             .items_end()
+            // 垂直居中：从顶部往下排的话，短横全挤在屏幕上半截，
+            // 而"消息流滚到哪儿了"这件事上下对称才好对位置
+            .justify_center()
             .gap_1()
-            .py_6()
             .pr(px(2.0))
             .overflow_hidden();
 
