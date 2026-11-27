@@ -8360,7 +8360,11 @@ impl ChatView {
                                     // 这个 Div 来自 gpui-base，既没有 `on_hover`
                                     // 也没有 `tooltip`，`group_hover` 改尺寸也不
                                     // 生效（改 visible 却可以）—— 只能借它的回调
-                                    .open_delay(std::time::Duration::from_millis(120))
+                                    //
+                                    // 默认开合延迟是 600ms/300ms，刻度上完全不能用：
+                                    // 指过去像没反应，移开了框还杵在那儿
+                                    .open_delay(std::time::Duration::ZERO)
+                                    .close_delay(std::time::Duration::from_millis(80))
                                     .on_open_change({
                                         let weak = cx.entity().downgrade();
                                         move |open: &bool, _window, cx: &mut gpui_kit::App| {
