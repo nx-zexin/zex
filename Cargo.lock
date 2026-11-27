@@ -10794,6 +10794,7 @@ name = "zex-app"
 version = "0.1.2"
 dependencies = [
  "async-trait",
+ "embed-resource",
  "gpui-kit",
  "gpui-shell",
  "image",

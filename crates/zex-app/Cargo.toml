@@ -51,3 +51,7 @@ raw-window-handle.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+
+# Windows：把 zex.ico 嵌进 exe（资源 ID 1，gpui 窗口类图标读的就是它）
+[build-dependencies]
+embed-resource = "3"
