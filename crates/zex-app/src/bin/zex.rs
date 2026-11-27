@@ -8294,8 +8294,10 @@ impl ChatView {
             .collect();
 
         let mut rail = div()
-            // 条最长会到 26px（悬停时），整列给够宽度，不然会被裁
-            .w(px(26.0))
+            // 左边留出间距：紧贴内容区左缘会显得像正文的一部分。
+            // 宽度按"最长的条 + 这份间距"给，悬停时才不会被裁
+            .w(px(34.0))
+            .pl(px(10.0))
             .h_full()
             .flex_none()
             .flex()
@@ -8387,20 +8389,45 @@ impl ChatView {
                                             .flex()
                                             .items_center()
                                             .justify_start()
-                                            .child(
-                                                // 常态是一道细灰线，指到哪条哪条就
-                                                // 变粗变黑变长 —— 位置靠长度和深浅一起
-                                                // 表达，只改颜色在满屏灰线里不够醒目
+                                            .child({
+                                                // 常态一道细灰线，指到哪条哪条变粗、
+                                                // 变橙、变长。长度走动画而不是一帧跳变：
+                                                // 十几条灰线里突然支棱出一根，太跳
+                                                const SHORT: f32 = 13.0;
+                                                const LONG: f32 = 20.0;
+                                                // id 带上目标状态：状态一变 id 就变，
+                                                // 动画才会从头播一次（否则会卡在末尾）
+                                                let id = ElementId::Name(
+                                                    format!("nav-bar-{idx}-{hovered}").into(),
+                                                );
                                                 div()
-                                                    .w(px(if hovered { 26.0 } else { 18.0 }))
                                                     .h(px(if hovered { 4.0 } else { 2.0 }))
                                                     .rounded_full()
-                                                    .bg(rgb(if hovered {
-                                                        BRAND
-                                                    } else {
-                                                        0xD5D5D1
-                                                    })),
-                                            ),
+                                                    .bg(rgb(if hovered { BRAND } else { 0xD5D5D1 }))
+                                                    .with_animation(
+                                                        id,
+                                                        gpui_kit::Animation::new(
+                                                            std::time::Duration::from_millis(160),
+                                                        )
+                                                        .with_easing(|t: f32| {
+                                                            // ease-in-out：起止都慢，中间快
+                                                            if t < 0.5 {
+                                                                2.0 * t * t
+                                                            } else {
+                                                                let x = -2.0 * t + 2.0;
+                                                                1.0 - x * x / 2.0
+                                                            }
+                                                        }),
+                                                        move |el, t| {
+                                                            let (from, to) = if hovered {
+                                                                (SHORT, LONG)
+                                                            } else {
+                                                                (LONG, SHORT)
+                                                            };
+                                                            el.w(px(from + (to - from) * t))
+                                                        },
+                                                    )
+                                            }),
                                     )
                                     .content({
                                         let preview = preview.clone();
