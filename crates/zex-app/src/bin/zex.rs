@@ -8333,7 +8333,9 @@ impl ChatView {
                             .h(px(10.0))
                             .flex()
                             .items_center()
-                            .justify_end()
+                            // 左对齐：横条从同一条竖线起头，长短只在右边变化，
+                            // 整列看起来才是一把尺子
+                            .justify_start()
                             .cursor_pointer()
                             .on_mouse_down(
                                 MouseButton::Left,
@@ -8384,7 +8386,7 @@ impl ChatView {
                                             .h(px(10.0))
                                             .flex()
                                             .items_center()
-                                            .justify_end()
+                                            .justify_start()
                                             .child(
                                                 // 常态是一道细灰线，指到哪条哪条就
                                                 // 变粗变黑变长 —— 位置靠长度和深浅一起
@@ -8393,7 +8395,11 @@ impl ChatView {
                                                     .w(px(if hovered { 26.0 } else { 18.0 }))
                                                     .h(px(if hovered { 4.0 } else { 2.0 }))
                                                     .rounded_full()
-                                                    .bg(rgb(if hovered { TEXT } else { 0xD5D5D1 })),
+                                                    .bg(rgb(if hovered {
+                                                        BRAND
+                                                    } else {
+                                                        0xD5D5D1
+                                                    })),
                                             ),
                                     )
                                     .content({
