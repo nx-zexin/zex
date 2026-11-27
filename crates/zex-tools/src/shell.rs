@@ -32,6 +32,16 @@ pub struct ShellArgs {
     /// 工作目录。默认使用当前工作目录。
     #[serde(default)]
     pub cwd: Option<String>,
+    /// 这条命令要做什么，一句话说清。
+    ///
+    /// 是**模型的自述**，只用于显示 —— 审批界面把它摆在命令上方，让用户
+    /// 不必自己读一行管道就能判断该不该批。但它可能和 `command` 说的不是
+    /// 一回事（模型会说错，也可能被注入的内容带偏），所以：
+    ///
+    /// **任何安全判定都不许读这个字段。** `risk_for` 只看 `command`，
+    /// 策略层的硬拦截同理（见 `zex_policy::rules`）。
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 /// 执行 shell 命令。
@@ -53,7 +63,9 @@ impl Tool for Shell {
         "执行 shell 命令并返回输出。用于列目录、运行构建、测试、git 操作等。\
          非交互式：不要执行需要人工输入的命令（如 vim、需要确认的 apt）。\
          耗时任务请显式调大 timeout_secs。\
-         需要读文件内容时优先用 fs_read，它能给出更清晰的行号。"
+         需要读文件内容时优先用 fs_read，它能给出更清晰的行号。\
+         每次都要填 description：一句话说明这条命令在做什么、为了什么，\
+         会显示给用户看 —— 审批时他只有这一行字能快速判断该不该放行。"
     }
 
     /// 只读命令不需要授权。
@@ -254,6 +266,7 @@ mod tests {
                     command: "echo zex-ok".into(),
                     timeout_secs: None,
                     cwd: None,
+                    description: None,
                 },
             )
             .await
@@ -271,6 +284,7 @@ mod tests {
                     command: "exit 3".into(),
                     timeout_secs: None,
                     cwd: None,
+                    description: None,
                 },
             )
             .await
@@ -288,6 +302,7 @@ mod tests {
                     command: "echo oops 1>&2".into(),
                     timeout_secs: None,
                     cwd: None,
+                    description: None,
                 },
             )
             .await
@@ -305,6 +320,7 @@ mod tests {
                     command: "sleep 5".into(),
                     timeout_secs: Some(1),
                     cwd: None,
+                    description: None,
                 },
             )
             .await

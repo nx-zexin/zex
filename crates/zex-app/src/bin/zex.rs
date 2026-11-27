@@ -109,7 +109,11 @@ enum ToolPreview {
     /// 覆盖已有文件：看差异比看全文有用得多。
     Diff { lines: Vec<DiffLine> },
     /// 执行命令：命令本身，不需要 JSON 外壳。
-    Command { text: String },
+    Command {
+        text: String,
+        /// 模型自述这条命令要做什么。只用于显示。
+        about: Option<String>,
+    },
 }
 
 /// diff 里的一行。
@@ -2987,19 +2991,38 @@ fn push_tool_step(items: &mut Vec<MsgItem>, step: ToolStep) {
 ///
 /// 返回 `false` 表示这是一条**孤立结果**（调用记录丢了，比如老数据），
 /// 由调用方决定怎么摆。
+/// 取模型自述的那句话（目前只有 `shell` 有这个字段）。
+///
+/// 纯显示用。**不要拿它参与任何安全判定** —— 它和 `command` 可能对不上，
+/// 而用户信任的是后者。
+fn model_says(args: &serde_json::Value) -> Option<String> {
+    args.get("description")
+        .and_then(|v| v.as_str())
+        .map(|d| d.trim().to_string())
+        .filter(|d| !d.is_empty())
+}
+
 /// 把参数的"人话"形态画出来。
 fn render_preview(p: &ToolPreview, idx: usize, i: usize) -> AnyElement {
     match p {
-        ToolPreview::Command { text } => div()
+        ToolPreview::Command { text, about } => div()
             .flex()
             .flex_col()
             .gap_1()
-            .child(
-                div()
+            .child(match about {
+                // 有自述就用它当标题：比"在终端执行"多一层信息，
+                // 而且用户扫一眼就知道这条命令是为了什么
+                Some(d) => div()
                     .text_xs()
                     .text_color(rgb(TEXT_MUTED))
-                    .child("在终端执行"),
-            )
+                    .child(format!("在终端执行 · {d}"))
+                    .into_any_element(),
+                None => div()
+                    .text_xs()
+                    .text_color(rgb(TEXT_MUTED))
+                    .child("在终端执行")
+                    .into_any_element(),
+            })
             .child(
                 TextView::markdown(
                     ElementId::Name(format!("md-cmd-{idx}-{i}").into()),
@@ -5168,9 +5191,9 @@ impl ChatView {
                     // click_count 靠不住，自己记时间。
                     let now = std::time::Instant::now();
                     let double = ev.click_count >= 2
-                        || this.titlebar_click_at.map_or(false, |t| {
-                            now.duration_since(t).as_millis() < 500
-                        });
+                        || this
+                            .titlebar_click_at
+                            .is_some_and(|t| now.duration_since(t).as_millis() < 500);
                     this.titlebar_click_at = if double { None } else { Some(now) };
                     if double {
                         zex_app::window_ops::toggle_maximize(window);
@@ -8302,16 +8325,45 @@ impl ChatView {
                     .text_color(rgb(TEXT_MUTED))
                     .child(req.summary.clone()),
             )
-            .child(
+            // 模型自述这条命令要干什么。
+            //
+            // 标签必须写清楚是"模型说的"：它可能和下面的命令对不上，
+            // 让用户以为这是系统的判断就危险了。判断依据永远是命令本身。
+            .children(model_says(&req.arguments).map(|d| {
                 div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(TEXT_DIM))
+                            .child("模型说它要做什么"),
+                    )
+                    .child(div().text_sm().text_color(rgb(TEXT)).child(d))
+            }))
+            .child(match preview_for(&req.tool, &req.arguments) {
+                // shell 的命令直接给命令本身：审批时用户要看的是它，
+                // 不是 `{"command":"…","description":"…"}` 这一坨
+                Some(ToolPreview::Command { text, .. }) => div()
                     .p_3()
                     .rounded(px(8.0))
                     .bg(rgb(0xEFEFEC))
                     .text_sm()
                     .font_family(MONO)
                     .text_color(rgb(TEXT))
-                    .child(compact_args(&req.arguments)),
-            )
+                    .child(text)
+                    .into_any_element(),
+                _ => div()
+                    .p_3()
+                    .rounded(px(8.0))
+                    .bg(rgb(0xEFEFEC))
+                    .text_sm()
+                    .font_family(MONO)
+                    .text_color(rgb(TEXT))
+                    .child(compact_args(&req.arguments))
+                    .into_any_element(),
+            })
             .into_any_element()
     }
 }
@@ -8606,8 +8658,16 @@ fn preview_impl(name: &str, args: &serde_json::Value, allow_diff: bool) -> Optio
             if cmd.is_empty() {
                 return None;
             }
+            // 自述是模型写的，可能和命令说的不是一回事 —— 只拿来显示。
+            // 安全判定在 `risk_for` 和策略层，那边只看 `command`
+            let about = args
+                .get("description")
+                .and_then(|v| v.as_str())
+                .map(|d| d.trim().to_string())
+                .filter(|d| !d.is_empty());
             Some(ToolPreview::Command {
                 text: cmd.to_string(),
+                about,
             })
         }
         "fs_write" => {
@@ -9566,17 +9626,46 @@ mod slash_rules {
 mod tool_preview {
     // 精确导入而不是 `super::*`：bin crate 顶上有一堆通配导入，
     // 全引进来会让 `#[test]` 的宏展开递归到爆栈
-    use super::{DIFF_CONTEXT, DiffKind, MAX_WRITE_PREVIEW, ToolPreview, line_diff, preview_for};
+    use super::{
+        DIFF_CONTEXT, DiffKind, MAX_WRITE_PREVIEW, ToolPreview, line_diff, model_says, preview_for,
+    };
 
     #[test]
     fn shell_shows_the_command_not_the_json() {
         // 回归：以前把 `{"command":"ls -la"}` 原样摊在卡片上，
         // 还被 compact_args 压成一行
         let args = serde_json::json!({"command": "ls -la"});
-        let Some(ToolPreview::Command { text }) = preview_for("shell", &args) else {
+        let Some(ToolPreview::Command { text, .. }) = preview_for("shell", &args) else {
             panic!("shell 该给出命令预览");
         };
         assert_eq!(text, "ls -la");
+    }
+
+    #[test]
+    fn shell_description_rides_along_but_is_optional() {
+        let with = serde_json::json!({
+            "command": "go build ./...",
+            "description": "编译后端，检查有没有类型错误"
+        });
+        let Some(ToolPreview::Command { text, about }) = preview_for("shell", &with) else {
+            panic!("shell 该给出命令预览");
+        };
+        assert_eq!(text, "go build ./...");
+        assert_eq!(about.as_deref(), Some("编译后端，检查有没有类型错误"));
+
+        // 老模型不填这个字段，界面要照常工作
+        let without = serde_json::json!({"command": "ls"});
+        let Some(ToolPreview::Command { about, .. }) = preview_for("shell", &without) else {
+            panic!("没自述也该有预览");
+        };
+        assert!(about.is_none());
+    }
+
+    #[test]
+    fn blank_description_is_treated_as_absent() {
+        // 模型偶尔给个空串或纯空格，别在界面上留一行空标题
+        let args = serde_json::json!({"command": "ls", "description": "   "});
+        assert!(model_says(&args).is_none());
     }
 
     #[test]
