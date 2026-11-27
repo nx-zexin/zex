@@ -539,6 +539,11 @@ struct ChatView {
     /// 更长，默认摊开会把正文顶出屏幕；工具调用则相反 —— 默认收着等于
     /// 让用户逐条点开才能看见执行了什么。
     expanded_tools: std::collections::HashSet<String>,
+    /// 鼠标正停在哪条刻度上（按消息下标记）。
+    ///
+    /// 用状态字段而不是 `group_hover`：那个是组件库的样式机制，实测改宽度
+    /// 不生效（改 `visible` 却可以），只能自己记状态重绘。
+    hovered_mark: Option<usize>,
     /// 哪些卡片被**收起**了（默认展开的那些：工具组本身）。
     ///
     /// 只到组这一层：组内的每一步仍然默认折叠，点开才看命令与输出。
@@ -958,6 +963,7 @@ impl ChatView {
             history_draft: String::new(),
             expanded_tools: std::collections::HashSet::new(),
             collapsed_tools: std::collections::HashSet::new(),
+            hovered_mark: None,
             models_expanded: std::collections::HashSet::new(),
             extensions: zex_extension::scan_default(),
             ext_mtimes: std::collections::HashMap::new(),
@@ -8320,7 +8326,7 @@ impl ChatView {
                         // group 挂在 HoverCard **外面**：挂在 trigger 上的话，
                         // 鼠标进入的是 HoverCard 那层包装，祖先链上摸不到它，
                         // 短横就不会跟着变长
-                        let group = format!("nav-mark-{idx}");
+                        let hovered = self.hovered_mark == Some(idx);
                         div()
                             .w_full()
                             .h(px(10.0))
@@ -8328,7 +8334,6 @@ impl ChatView {
                             .items_center()
                             .justify_end()
                             .cursor_pointer()
-                            .group(group.clone())
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, _: &MouseDownEvent, _w, cx| {
@@ -8341,7 +8346,26 @@ impl ChatView {
                                 // HoverCard 而不是 tooltip：这个 Div 来自
                                 // gpui-base，没有 `InteractiveElement::tooltip`
                                 HoverCard::new(("nav-mark", idx))
-                                    .open_delay(std::time::Duration::from_millis(150))
+                                    // 浮层开合就是"指针停在这一条上"的信号：
+                                    // 这个 Div 来自 gpui-base，既没有 `on_hover`
+                                    // 也没有 `tooltip`，`group_hover` 改尺寸也不
+                                    // 生效（改 visible 却可以）—— 只能借它的回调
+                                    .open_delay(std::time::Duration::from_millis(120))
+                                    .on_open_change({
+                                        let weak = cx.entity().downgrade();
+                                        move |open: &bool, _window, cx: &mut gpui_kit::App| {
+                                            let open = *open;
+                                            weak.update(cx, |this, cx| {
+                                                if open {
+                                                    this.hovered_mark = Some(idx);
+                                                } else if this.hovered_mark == Some(idx) {
+                                                    this.hovered_mark = None;
+                                                }
+                                                cx.notify();
+                                            })
+                                            .ok();
+                                        }
+                                    })
                                     .anchor(gpui_kit::Anchor::LeftCenter)
                                     .trigger(
                                         // 感应区是**整行**，短横只是画在里面：
@@ -8357,22 +8381,19 @@ impl ChatView {
                                             .justify_end()
                                             .child(
                                                 div()
-                                                    .w(px(10.0))
+                                                    .w(px(if hovered { 18.0 } else { 10.0 }))
                                                     .h(px(2.0))
                                                     .rounded_full()
-                                                    .bg(rgb(BORDER))
-                                                    .group_hover(group, |st| {
-                                                        st.w(px(18.0)).bg(rgb(BRAND))
-                                                    }),
+                                                    .bg(rgb(if hovered { BRAND } else { BORDER })),
                                             ),
                                     )
                                     .content({
                                         let preview = preview.clone();
                                         move |_, _, _| {
-                                            // 左边留 10px：紧贴着刻度弹出来，
-                                            // 和那条短横粘在一起像是一个东西
+                                            // 和刻度拉开 25px：贴着弹出来
+                                            // 会跟那条短横粘成一体
                                             div()
-                                                .ml(px(10.0))
+                                                .ml(px(25.0))
                                                 .max_w(px(260.0))
                                                 .rounded(px(8.0))
                                                 .bg(rgb(BG_MAIN))
