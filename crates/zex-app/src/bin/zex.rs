@@ -1108,9 +1108,10 @@ impl ChatView {
         } else {
             self.render_streaming(cx)
         };
-        // 内容和面板边缘之间要留出呼吸：不加这层，正文会直接贴到
-        // 侧栏和窗口右边框上，读起来像没排版的纯文本
-        div().px_8().py_2().child(inner).into_any_element()
+        // 左右留出呼吸：不加这层，正文会直接贴到侧栏和窗口右边框上。
+        // 上下只留 2px —— 行间距已经由 `with_row_style` 统一管着，
+        // 这里再加一份就是双份空隙
+        div().px_8().py(px(2.0)).child(inner).into_any_element()
     }
 
     /// 正在流式输出的那条回复。
@@ -3496,7 +3497,9 @@ impl ChatView {
                 if expanded {
                     // 组内每一步仍是独立小卡片，各自折叠 ——
                     // 一个组里常有七八次调用，全铺开等于没分组
-                    let mut body = div().flex().flex_col().gap_2().px_3().pb_3();
+                    // 组内每一步之间也收紧：展开一组七八条时，
+                    // 每条各留一份大空隙，一屏就装不下三步
+                    let mut body = div().flex().flex_col().gap_1().px_2().pb_2();
                     for (i, step) in steps.iter().enumerate() {
                         let step_key = format!("{step_prefix}-step-{i}");
                         // 组是展开的，但每一步仍收着：一组常有七八条调用，
@@ -3647,7 +3650,7 @@ impl ChatView {
                             .child(head);
 
                         if step_open {
-                            let mut sb = div().flex().flex_col().gap_2().px_3().pb_2();
+                            let mut sb = div().flex().flex_col().gap_1().px_2().pb_2();
                             if let Some(preview) = &step.preview {
                                 sb = sb.child(render_preview(preview, idx, i));
                             } else if !step.args.trim().is_empty() {
@@ -8642,6 +8645,10 @@ impl Render for ChatView {
             weak.update(cx, |view, cx| view.render_row(ix, window, cx))
                 .unwrap_or_else(|_| div().into_any_element())
         })
+        // 组件内部每行自带 `pb_8`（32px），加上外层的上下 padding，
+        // 两条消息之间能空出近 50px —— 一屏没几轮就滑完了。
+        // 这里覆盖掉，压到 6px；真正的视觉分组靠气泡和卡片自身的外形
+        .with_row_style(gpui_kit::StyleRefinement::default().pb(px(6.0)))
         .flex_1()
         .min_h(px(0.0))
         .bg(rgb(BG_MAIN));
