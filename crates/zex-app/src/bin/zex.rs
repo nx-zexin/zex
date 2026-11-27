@@ -8364,7 +8364,9 @@ impl ChatView {
                                     // 默认开合延迟是 600ms/300ms，刻度上完全不能用：
                                     // 指过去像没反应，移开了框还杵在那儿
                                     .open_delay(std::time::Duration::ZERO)
-                                    .close_delay(std::time::Duration::from_millis(80))
+                                    // 关也归零：留过 80ms，实际用起来是"鼠标走了
+                                    // 框还赖着"，比边缘擦过时的闪烁更烦人
+                                    .close_delay(std::time::Duration::ZERO)
                                     .on_open_change({
                                         let weak = cx.entity().downgrade();
                                         move |open: &bool, _window, cx: &mut gpui_kit::App| {
