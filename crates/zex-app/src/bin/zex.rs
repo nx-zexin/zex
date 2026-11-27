@@ -2991,6 +2991,14 @@ fn push_tool_step(items: &mut Vec<MsgItem>, step: ToolStep) {
 ///
 /// 返回 `false` 表示这是一条**孤立结果**（调用记录丢了，比如老数据），
 /// 由调用方决定怎么摆。
+/// 从步骤里取模型的自述（目前只有 `shell` 会填）。
+fn step_about(step: &ToolStep) -> Option<&str> {
+    match &step.preview {
+        Some(ToolPreview::Command { about: Some(d), .. }) => Some(d.as_str()),
+        _ => None,
+    }
+}
+
 /// 取模型自述的那句话（目前只有 `shell` 有这个字段）。
 ///
 /// 纯显示用。**不要拿它参与任何安全判定** —— 它和 `command` 可能对不上，
@@ -3541,33 +3549,54 @@ impl ChatView {
                             );
                         }
 
-                        head = head
-                            .child(
+                        // 模型自述这一条调用要做什么。
+                        //
+                        // 摊在标题行上而不是只藏在展开区：一张卡片摊开之前
+                        // 就该能看懂"这一步在干什么"，否则用户还得逐个点开。
+                        // 占满剩余宽度、单行截断，挤不下就省略。
+                        if let Some(about) = step_about(step) {
+                            head = head.child(
                                 div()
-                                    .size(px(16.0))
-                                    .flex_none()
-                                    .rounded_full()
-                                    .bg(rgb(s_dot_bg))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .child(match &step.result {
-                                        None => div()
-                                            .size(px(6.0))
-                                            .rounded_full()
-                                            .bg(rgb(s_dot_fg))
-                                            .into_any_element(),
-                                        Some(r) => Icon::new(if r.ok {
-                                            IconName::Check
-                                        } else {
-                                            IconName::Close
-                                        })
-                                        .text_size(px(10.0))
-                                        .text_color(rgb(s_dot_fg))
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .truncate()
+                                    .text_xs()
+                                    .text_color(rgb(TEXT_MUTED))
+                                    .child(about.to_string()),
+                            );
+                        }
+
+                        head = head.child(
+                            div()
+                                .size(px(16.0))
+                                .flex_none()
+                                .rounded_full()
+                                .bg(rgb(s_dot_bg))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(match &step.result {
+                                    None => div()
+                                        .size(px(6.0))
+                                        .rounded_full()
+                                        .bg(rgb(s_dot_fg))
                                         .into_any_element(),
-                                    }),
-                            )
-                            .child(div().flex_1());
+                                    Some(r) => Icon::new(if r.ok {
+                                        IconName::Check
+                                    } else {
+                                        IconName::Close
+                                    })
+                                    .text_size(px(10.0))
+                                    .text_color(rgb(s_dot_fg))
+                                    .into_any_element(),
+                                }),
+                        );
+
+                        // 有自述时它已经吃掉了剩余宽度，把状态点推到最右；
+                        // 没有自述才需要空占位撑一下
+                        if step_about(step).is_none() {
+                            head = head.child(div().flex_1());
+                        }
 
                         let mut step_card = div()
                             .flex()
