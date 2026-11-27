@@ -19,6 +19,7 @@
 //     Get-Content $HOME\.zex\logs\zex.log -Wait -Tail 50   # PowerShell
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use gpui_kit::assets::IconName;
@@ -268,6 +269,18 @@ struct MsgItem {
     text: String,
 }
 
+/// 上一轮没跑完时用户又发的一条输入。
+///
+/// 存下来而不是丢掉：用户看着模型跑，想起一句要补充的，发出去就该算数。
+/// 等这一轮 `TurnEnded` 再按顺序发，不打断正在做的事。
+struct QueuedPrompt {
+    text: String,
+    /// 发给内核的图片引用。
+    images: Vec<zex_core::message::ImageRef>,
+    /// 界面上画缩略图用。提交时就解码好了，省得轮到自己时再算一遍。
+    shown: Vec<std::sync::Arc<gpui::Image>>,
+}
+
 /// 主区域显示什么。
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ViewMode {
@@ -309,6 +322,11 @@ struct ChatView {
     input: Entity<TextareaState>,
     messages: Vec<MsgItem>,
     streaming: Option<String>,
+    /// 上一轮还在跑时用户又发的话，排队等这一轮结束。
+    ///
+    /// 以前是直接拒收（`submit` 里 `streaming.is_some()` 就 return），
+    /// 用户发出去的话凭空消失，输入框还清空了 —— 最容易让人以为程序坏了。
+    queued: VecDeque<QueuedPrompt>,
     /// 任务快照（工作台展示用）。
     tasks: Vec<zex_store::tasks::TaskRecord>,
     /// 当前显示的是工作台还是对话。
@@ -776,6 +794,7 @@ impl ChatView {
             mode,
             messages: history,
             streaming: None,
+            queued: VecDeque::new(),
             scroller,
             rename_input,
             renaming: None,
@@ -1676,7 +1695,8 @@ impl ChatView {
         }
 
         let mut text = self.input.read(cx).value().trim().to_string();
-        if (text.is_empty() && self.attachments.is_empty()) || self.streaming.is_some() {
+        // 只有"真的没内容"才拦。上一轮还在跑不是拒收的理由 —— 见 `queued`。
+        if text.is_empty() && self.attachments.is_empty() {
             return;
         }
 
@@ -1731,6 +1751,23 @@ impl ChatView {
             .update(cx, |state, cx| state.set_value("", window, cx));
         // 派了活就要看到它跑：从工作台自动进入对话视图
         self.mode = ViewMode::Chat;
+
+        if self.streaming.is_some() {
+            // 这一轮还没跑完：话收下，等它说完再说。
+            // 不打断 —— 用户补充一句"顺便看看 X"不该让正在编的代码半途而废。
+            //
+            // **不在这里 push 气泡**：那条回答还在流式输出、还没落到 messages
+            // 里，现在插进去就排在自己要回应的回答前面了。轮到它时再画。
+            self.queued.push_back(QueuedPrompt {
+                text,
+                images,
+                shown: shown_images,
+            });
+            self.status = format!("排队中 · {} 条，本轮结束后发送", self.queued.len());
+            cx.notify();
+            return;
+        }
+
         self.messages.push(MsgItem {
             kind: MsgKind::User {
                 images: shown_images,
@@ -1739,7 +1776,21 @@ impl ChatView {
         });
         self.streaming = Some(String::new());
         self.status = "思考中…".into();
+        self.dispatch_prompt(text, images, cx);
+        self.sync_scroller(cx);
+        cx.notify();
+    }
 
+    /// 把一条输入交给内核。
+    ///
+    /// 只负责发送，不碰界面状态。`submit` 和「排队消息自动接着发」都走这里 ——
+    /// 气泡由各自调用方画，因为排队的那些要等到轮到自己才出现在信息流里。
+    fn dispatch_prompt(
+        &mut self,
+        text: String,
+        images: Vec<zex_core::message::ImageRef>,
+        cx: &mut Context<Self>,
+    ) {
         let tx = self.cmd_tx.clone();
         let session = self.active_session.clone();
         let selected_model = self.selected_model.clone();
@@ -1758,12 +1809,20 @@ impl ChatView {
                 .await;
         })
         .detach();
-
-        self.sync_scroller(cx);
-        cx.notify();
     }
 
     fn cancel(&mut self, cx: &mut Context<Self>) {
+        // 用户按停止就是"到此为止"。排队里的话不再替他发出去 ——
+        // 按了停止之后程序又自己跑起来，比不让发更让人意外
+        let dropped = self.queued.len();
+        self.queued.clear();
+        if dropped > 0 {
+            // 说在信息流里而不是 `status`：后者目前没有任何地方渲染
+            self.messages.push(MsgItem {
+                kind: MsgKind::System,
+                text: format!("已停止；{dropped} 条排队消息未发送"),
+            });
+        }
         let tx = self.cmd_tx.clone();
         self.status = "正在停止…".into();
         cx.spawn(async move |_this, _cx| {
@@ -2339,6 +2398,20 @@ impl ChatView {
                     kind: MsgKind::System,
                     text: end_reason_text(&reason, steps, elapsed_ms),
                 });
+                // 跑的时候用户又发的话，现在接着说。
+                //
+                // 必须排在结束语**之后**：信息流读下来是
+                // 「回答 → 这轮完了 → 你的下一句」，把用户的话挤到结束语前面，
+                // 看起来就像上一轮还没结束就收到了新的。
+                if let Some(next) = self.queued.pop_front() {
+                    self.messages.push(MsgItem {
+                        kind: MsgKind::User { images: next.shown },
+                        text: next.text.clone(),
+                    });
+                    self.streaming = Some(String::new());
+                    self.status = "思考中…".into();
+                    self.dispatch_prompt(next.text, next.images, cx);
+                }
                 // 必须同步条目数：对话流是 `MessageScroller`，它的条目数在
                 // 初始化时就定了，`messages.push` 不会让它知道多了一条。
                 // 少了这一行，结束提示会**永远渲染不出来** —— 这正是
@@ -2392,6 +2465,16 @@ impl ChatView {
                 self.mode = ViewMode::Chat;
                 self.streaming = None;
                 self.running_tool = None;
+                // 排队里的话是发给上一个会话的，不能带到这儿来发 ——
+                // 但也不能装没发生过，说一声
+                let dropped = self.queued.len();
+                self.queued.clear();
+                if dropped > 0 {
+                    self.messages.push(MsgItem {
+                        kind: MsgKind::System,
+                        text: format!("上一个会话还有 {dropped} 条排队消息未发送"),
+                    });
+                }
                 self.status = "Ready".into();
                 self.sync_scroller(cx);
             }
@@ -2401,6 +2484,8 @@ impl ChatView {
                 // 不清就会永久锁死输入框，出错后一句话都发不出去
                 self.streaming = None;
                 self.running_tool = None;
+                // 出错之后自动发下一条只会再撞一次同样的墙
+                self.queued.clear();
                 self.status = "出错".into();
                 self.messages.push(MsgItem {
                     kind: MsgKind::System,
@@ -7218,19 +7303,29 @@ impl ChatView {
                 btn.into_any_element()
             }
         };
-        let send_btn = match self.streaming.is_some() {
-            // 正在跑就换成停止键：否则用户只能干等长任务跑完
-            true => Button::new("stop")
+        // 发送键始终是发送键。以前执行中会把它换成停止键 —— 想补充一句话
+        // 就没地方按了，而"停下来"和"继续说话"本来就是两件事。
+        let send_btn = Button::new("send")
+            .primary()
+            .icon(Icon::new(IconName::ArrowUp))
+            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.submit(window, cx)))
+            .into_any_element();
+        // 停止是独立的入口，只在真的在跑时出现
+        let stop_btn = self.streaming.is_some().then(|| {
+            Button::new("stop")
                 .danger()
                 .label("■")
                 .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| this.cancel(cx)))
-                .into_any_element(),
-            false => Button::new("send")
-                .primary()
-                .icon(Icon::new(IconName::ArrowUp))
-                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.submit(window, cx)))
-                .into_any_element(),
-        };
+                .into_any_element()
+        });
+        // 排队条数写在按钮旁边：用户得知道刚才那句话去哪了
+        let queued_badge = (!self.queued.is_empty()).then(|| {
+            div()
+                .text_xs()
+                .text_color(rgb(TEXT_DIM))
+                .child(format!("排队 {}", self.queued.len()))
+                .into_any_element()
+        });
         // 模型切换放在输入框内部左下角：它和"这条消息"一起生效，
         // 摆到框外会被当成全局设置。
         let model_picker = if self.editing_model {
@@ -7616,8 +7711,10 @@ impl ChatView {
                             .items_center()
                             .gap_2()
                             .children(team_entry)
+                            .children(queued_badge)
                             .child(model_picker)
                             .child(voice_btn)
+                            .children(stop_btn)
                             .child(send_btn),
                     )
                     // 左下角：模型切换。和右下角的发送键同处框内，
