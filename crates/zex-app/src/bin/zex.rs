@@ -8320,6 +8320,10 @@ impl ChatView {
                         // 组件库自己实现的一套，能直接包任意元素
                         HoverCard::new(("nav-mark", idx))
                             .open_delay(std::time::Duration::from_millis(150))
+                            // 浮在刻度**右侧**。默认是 TopCenter，会往左溢出到
+                            // 侧栏上，把会话列表整块盖住 —— 预览是给正文看的，
+                            // 不该遮住用户用来切换会话的地方
+                            .anchor(gpui_kit::Anchor::RightCenter)
                             .trigger(
                                 div()
                                     .w(px(10.0))
