@@ -8320,18 +8320,20 @@ impl ChatView {
                         // 组件库自己实现的一套，能直接包任意元素
                         HoverCard::new(("nav-mark", idx))
                             .open_delay(std::time::Duration::from_millis(150))
-                            // 浮在刻度**右侧**。默认是 TopCenter，会往左溢出到
-                            // 侧栏上，把会话列表整块盖住 —— 预览是给正文看的，
-                            // 不该遮住用户用来切换会话的地方
-                            .anchor(gpui_kit::Anchor::RightCenter)
-                            .trigger(
+                            .anchor(gpui_kit::Anchor::LeftCenter)
+                            .trigger({
+                                // 感应区是**整行**（20×10），短横只是画在里面。
+                                // 原来只有 10×2 的短横本身可点，鼠标稍微偏一点
+                                // 就点空了 —— 2px 高的目标本来就是刁难人
+                                let group = format!("nav-mark-{idx}");
                                 div()
-                                    .w(px(10.0))
-                                    .h(px(2.0))
-                                    .rounded_full()
-                                    .bg(rgb(BORDER))
+                                    .w_full()
+                                    .h(px(10.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_end()
                                     .cursor_pointer()
-                                    .hover(|s| s.w(px(18.0)).bg(rgb(BRAND)))
+                                    .group(group.clone())
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(move |this, _: &MouseDownEvent, _w, cx| {
@@ -8339,8 +8341,16 @@ impl ChatView {
                                                 state.scroll_to_item(idx, cx);
                                             });
                                         }),
-                                    ),
-                            )
+                                    )
+                                    .child(
+                                        div()
+                                            .w(px(10.0))
+                                            .h(px(2.0))
+                                            .rounded_full()
+                                            .bg(rgb(BORDER))
+                                            .group_hover(group, |s| s.w(px(18.0)).bg(rgb(BRAND))),
+                                    )
+                            })
                             .content({
                                 let preview = preview.clone();
                                 move |_, _, _| {
@@ -8547,14 +8557,21 @@ impl Render for ChatView {
         .min_h(px(0.0))
         .bg(rgb(BG_MAIN));
 
-        // 左侧定位刻度 + 消息流：刻度是独立一列而不是浮在流上，
-        // 免得压住正文左边那一条
-        let feed_row = div()
-            .flex_1()
-            .min_h(px(0.0))
-            .flex()
-            .child(self.render_nav_rail(cx))
-            .child(feed);
+        // 左侧定位刻度 + 消息流。
+        //
+        // 整块**居中**而不是贴着侧栏：贴边时刻度看起来像侧栏的一部分，
+        // 而且悬停预览往外一溢出就盖住会话列表。居中之后左边有留白，
+        // 预览往哪边展开都不挡东西。
+        //
+        // 1100 是正文的阅读上限：再宽，长段落一眼扫不完，视线要来回跑。
+        let feed_row = div().flex_1().min_h(px(0.0)).flex().justify_center().child(
+            div()
+                .w_full()
+                .max_w(px(1100.0))
+                .flex()
+                .child(self.render_nav_rail(cx))
+                .child(feed),
+        );
 
         // ─── 底部区域 ───
         let mut bottom = div().flex().flex_col().gap_3().px_8().pb_5();
