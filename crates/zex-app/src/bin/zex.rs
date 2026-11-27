@@ -25,6 +25,7 @@ use std::sync::Arc;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::Icon;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::hover_card::HoverCard;
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
@@ -8258,6 +8259,106 @@ impl ChatView {
             .into_any_element()
     }
 
+    /// 信息流左侧的定位刻度：每一条用户输入对应一道短横。
+    ///
+    /// 长对话里想翻回"我说过的那句"只能一路滚，虚拟列表又让人看不出还有
+    /// 多远。这条刻度把用户输入抽出来当索引，点一下直接跳过去。
+    ///
+    /// 只在有两条以上用户输入时出现：一条的时候它没有任何导航价值，
+    /// 出现在那儿只是白占一列宽度。
+    fn render_nav_rail(&self, cx: &mut Context<Self>) -> AnyElement {
+        let marks: Vec<(usize, String)> = self
+            .messages
+            .iter()
+            .enumerate()
+            .filter_map(|(i, m)| match &m.kind {
+                MsgKind::User { .. } => {
+                    let t = m.text.trim();
+                    Some((
+                        i,
+                        if t.is_empty() {
+                            "（图片）".to_string()
+                        } else {
+                            t.to_string()
+                        },
+                    ))
+                }
+                _ => None,
+            })
+            .collect();
+
+        let mut rail = div()
+            .w(px(20.0))
+            .h_full()
+            .flex_none()
+            .flex()
+            .flex_col()
+            .items_end()
+            .gap_1()
+            .py_6()
+            .pr(px(2.0))
+            .overflow_hidden();
+
+        if marks.len() < 2 {
+            // 占住宽度，免得只有一条输入时正文左右跳一下
+            return rail.into_any_element();
+        }
+
+        for (idx, text) in marks {
+            // 气泡里只放开头一段：完整内容看正文去，这里只是"哪一句"的提示
+            let preview: String = text.chars().take(160).collect();
+            rail = rail.child(
+                div()
+                    .w_full()
+                    .h(px(6.0))
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .child(
+                        // HoverCard 而不是 tooltip：这个 Div 来自 gpui-base，
+                        // 没有 `InteractiveElement::tooltip`；HoverCard 是
+                        // 组件库自己实现的一套，能直接包任意元素
+                        HoverCard::new(("nav-mark", idx))
+                            .open_delay(std::time::Duration::from_millis(150))
+                            .trigger(
+                                div()
+                                    .w(px(10.0))
+                                    .h(px(2.0))
+                                    .rounded_full()
+                                    .bg(rgb(BORDER))
+                                    .cursor_pointer()
+                                    .hover(|s| s.w(px(18.0)).bg(rgb(BRAND)))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _: &MouseDownEvent, _w, cx| {
+                                            this.scroller.update(cx, |state, cx| {
+                                                state.scroll_to_item(idx, cx);
+                                            });
+                                        }),
+                                    ),
+                            )
+                            .content({
+                                let preview = preview.clone();
+                                move |_, _, _| {
+                                    div()
+                                        .max_w(px(260.0))
+                                        .rounded(px(8.0))
+                                        .bg(rgb(BG_MAIN))
+                                        .border_1()
+                                        .border_color(rgb(BORDER))
+                                        .px_3()
+                                        .py_2()
+                                        .text_sm()
+                                        .text_color(rgb(TEXT))
+                                        .child(preview.clone())
+                                }
+                            }),
+                    ),
+            );
+        }
+        rail.into_any_element()
+    }
+
     /// 浮在右下角的完成提示。
     fn render_toasts(&self, cx: &mut Context<Self>) -> AnyElement {
         if self.toasts.is_empty() {
@@ -8442,6 +8543,15 @@ impl Render for ChatView {
         .min_h(px(0.0))
         .bg(rgb(BG_MAIN));
 
+        // 左侧定位刻度 + 消息流：刻度是独立一列而不是浮在流上，
+        // 免得压住正文左边那一条
+        let feed_row = div()
+            .flex_1()
+            .min_h(px(0.0))
+            .flex()
+            .child(self.render_nav_rail(cx))
+            .child(feed);
+
         // ─── 底部区域 ───
         let mut bottom = div().flex().flex_col().gap_3().px_8().pb_5();
 
@@ -8533,7 +8643,7 @@ impl Render for ChatView {
                         ViewMode::Chat => {
                             // 团队入口已经收进编辑器，底部不再挂卡片：
                             // 它挡在消息流和输入框之间，长对话时很碍事
-                            feed.into_any_element()
+                            feed_row.into_any_element()
                         }
                     });
                     // 工作台模式下不需要输入框：还没决定要干什么
