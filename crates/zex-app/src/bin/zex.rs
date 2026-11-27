@@ -89,6 +89,42 @@ struct ToolStep {
     risk: String,
     /// `None` 表示还没出结果（正在跑，或这一轮被中断了）。
     result: Option<ToolOutcome>,
+    /// 给人看的参数视图。
+    ///
+    /// `args` 是给复制和排查用的原始 JSON，但直接摊在卡片上没人读得下去 ——
+    /// 写文件的 content 被压成一行空格串，shell 的命令裹在两层引号里。
+    /// 这里按工具类型预先算好一份人读的形态。
+    preview: Option<ToolPreview>,
+}
+
+/// 工具参数的"人话"形态。
+#[derive(Clone)]
+enum ToolPreview {
+    /// 写入新文件：直接看内容。
+    Write {
+        /// 按扩展名取的高亮语言。
+        lang: String,
+        body: String,
+    },
+    /// 覆盖已有文件：看差异比看全文有用得多。
+    Diff { lines: Vec<DiffLine> },
+    /// 执行命令：命令本身，不需要 JSON 外壳。
+    Command { text: String },
+}
+
+/// diff 里的一行。
+#[derive(Clone)]
+struct DiffLine {
+    kind: DiffKind,
+    text: String,
+}
+
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum DiffKind {
+    /// 未改动，作为上下文保留。
+    Same,
+    Removed,
+    Added,
 }
 
 /// 工具执行结果。
@@ -2319,6 +2355,7 @@ impl ChatView {
                         args: compact_args(arguments),
                         risk: risk.label().to_string(),
                         result: None,
+                        preview: None,
                     },
                 );
             }
@@ -2335,6 +2372,7 @@ impl ChatView {
                                 ok: *ok,
                                 output: brief.clone(),
                             }),
+                            preview: None,
                         },
                     );
                 }
@@ -2531,6 +2569,7 @@ impl ChatView {
                             args: compact_args(&arguments),
                             risk: risk.label().to_string(),
                             result: None,
+                            preview: preview_for(&name, &arguments),
                         },
                     );
                     self.sync_scroller(cx);
@@ -2553,6 +2592,7 @@ impl ChatView {
                             args: String::new(),
                             risk: String::new(),
                             result: Some(ToolOutcome { ok, output: brief }),
+                            preview: None,
                         },
                     );
                 }
@@ -2947,6 +2987,82 @@ fn push_tool_step(items: &mut Vec<MsgItem>, step: ToolStep) {
 ///
 /// 返回 `false` 表示这是一条**孤立结果**（调用记录丢了，比如老数据），
 /// 由调用方决定怎么摆。
+/// 把参数的"人话"形态画出来。
+fn render_preview(p: &ToolPreview, idx: usize, i: usize) -> AnyElement {
+    match p {
+        ToolPreview::Command { text } => div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(TEXT_MUTED))
+                    .child("在终端执行"),
+            )
+            .child(
+                TextView::markdown(
+                    ElementId::Name(format!("md-cmd-{idx}-{i}").into()),
+                    as_code_block(text, "bash"),
+                )
+                .text_size(px(12.5))
+                .line_height(px(19.0))
+                .text_color(rgb(TEXT))
+                .style(md_style_flat(1.0)),
+            )
+            .into_any_element(),
+
+        ToolPreview::Write { lang, body, .. } => TextView::markdown(
+            ElementId::Name(format!("md-write-{idx}-{i}").into()),
+            as_code_block(body, lang),
+        )
+        .text_size(px(12.5))
+        .line_height(px(19.0))
+        .text_color(rgb(TEXT))
+        .style(md_style_flat(1.0))
+        .into_any_element(),
+
+        ToolPreview::Diff { lines } => {
+            let mut col = div()
+                .flex()
+                .flex_col()
+                .rounded(px(6.0))
+                .border_1()
+                .border_color(rgb(BORDER_SOFT))
+                .bg(rgb(BG_TOOL))
+                .px_2()
+                .py_1()
+                .font_family(MONO)
+                .text_size(px(12.0));
+            for line in lines {
+                let (sign, fg, bg) = match line.kind {
+                    DiffKind::Same => ("  ", TEXT_MUTED, None),
+                    DiffKind::Removed => ("- ", DANGER, Some(DANGER_SOFT)),
+                    DiffKind::Added => ("+ ", OK, Some(OK_SOFT)),
+                };
+                let mut row = div().flex().gap_1().child(
+                    div()
+                        .flex_none()
+                        .text_color(rgb(fg))
+                        .child(sign.to_string()),
+                );
+                // 空行也得占一行高，否则 diff 里少一行会看不出来
+                let body = if line.text.is_empty() {
+                    " ".to_string()
+                } else {
+                    line.text.clone()
+                };
+                row = row.child(div().text_color(rgb(fg)).child(body));
+                if let Some(b) = bg {
+                    row = row.bg(rgb(b));
+                }
+                col = col.child(row);
+            }
+            col.into_any_element()
+        }
+    }
+}
+
 fn merge_tool_result(items: &mut [MsgItem], ok: bool, output: String) -> bool {
     for item in items.iter_mut().rev() {
         if let MsgKind::ToolGroup { steps } = &mut item.kind {
@@ -3442,7 +3558,11 @@ impl ChatView {
 
                         if step_open {
                             let mut sb = div().flex().flex_col().gap_2().px_3().pb_2();
-                            if !step.args.trim().is_empty() {
+                            if let Some(preview) = &step.preview {
+                                sb = sb.child(render_preview(preview, idx, i));
+                            } else if !step.args.trim().is_empty() {
+                                // 参数本来就短的（读文件、搜内容）保持原样：
+                                // 它们真正的信息在结果里，参数只是个坐标
                                 sb = sb.child(
                                     TextView::markdown(
                                         ElementId::Name(format!("md-call-{idx}-{i}").into()),
@@ -8451,6 +8571,154 @@ fn compact_args(v: &serde_json::Value) -> String {
     }
 }
 
+/// 写文件预览最多显示多少字符。
+///
+/// 卡片是"扫一眼"的地方，不是编辑器。真要读全文点文件名，
+/// 右侧面板里就是完整内容。
+const MAX_WRITE_PREVIEW: usize = 4000;
+
+/// 差异最多显示多少行。再多就不如直接看全文了。
+const MAX_DIFF_LINES: usize = 160;
+
+/// diff 里保留多少行未改动的上下文。
+const DIFF_CONTEXT: usize = 3;
+
+/// 把工具参数翻译成人能读的形态。
+///
+/// 只处理"原始 JSON 特别难读"的两个工具：写文件（content 是整段文本）
+/// 和 shell（命令行裹在 JSON 里）。其余工具参数本来就短，保持原样。
+fn preview_for(name: &str, args: &serde_json::Value) -> Option<ToolPreview> {
+    preview_impl(name, args, true)
+}
+
+/// 从历史记录里还原的调用。
+///
+/// 不读文件算 diff：历史是**当时**发生的事，而现在磁盘上的内容可能已经
+/// 被后续几步改过了 —— 拿现在的内容去对比，diff 出来的是假的。
+fn preview_for_history(name: &str, args: &serde_json::Value) -> Option<ToolPreview> {
+    preview_impl(name, args, false)
+}
+
+fn preview_impl(name: &str, args: &serde_json::Value, allow_diff: bool) -> Option<ToolPreview> {
+    match name {
+        "shell" => {
+            let cmd = args.get("command").and_then(|v| v.as_str())?.trim();
+            if cmd.is_empty() {
+                return None;
+            }
+            Some(ToolPreview::Command {
+                text: cmd.to_string(),
+            })
+        }
+        "fs_write" => {
+            let path = args.get("path")?.as_str()?;
+            let content = args.get("content")?.as_str()?;
+            let append = args
+                .get("append")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let lang = lang_from_path(path);
+
+            // 追加没有"旧内容被删掉"这回事，看新增部分就够了
+            if allow_diff && !append {
+                if let Some(old) = read_for_diff(path) {
+                    if old != content {
+                        let lines = line_diff(&old, content);
+                        let changed = lines.iter().filter(|l| l.kind != DiffKind::Same).count();
+                        // 改了大半文件时 diff 反而更难读，退回全文
+                        if changed > 0 && changed <= MAX_DIFF_LINES {
+                            return Some(ToolPreview::Diff { lines });
+                        }
+                    }
+                }
+            }
+
+            let mut body: String = content.chars().take(MAX_WRITE_PREVIEW).collect();
+            let truncated = content.chars().count() > MAX_WRITE_PREVIEW;
+            if truncated {
+                body.push_str("\n…（已截断，点文件名看全文）");
+            }
+            Some(ToolPreview::Write { lang, body })
+        }
+        _ => None,
+    }
+}
+
+/// 读旧文件用来算 diff。
+///
+/// 超过 512 KiB 直接放弃：模型一次整体重写这么大的文件本来就少见，
+/// 而在 UI 线程上读一个几十兆的文件会卡住一帧。
+fn read_for_diff(path: &str) -> Option<String> {
+    const MAX: u64 = 512 * 1024;
+    let p = std::path::Path::new(path);
+    let p = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::env::current_dir().ok()?.join(p)
+    };
+    let meta = std::fs::metadata(&p).ok()?;
+    if !meta.is_file() || meta.len() > MAX {
+        return None;
+    }
+    let s = std::fs::read_to_string(&p).ok()?;
+    if s.len() as u64 > MAX {
+        return None;
+    }
+    Some(s)
+}
+
+/// 逐行对比，只保留差异附近的上下文。
+///
+/// 用公共前缀/后缀裁剪而不是完整 LCS：模型改文件基本是"大面积相同、
+/// 中间动几行"，裁剪之后剩下的就是真改动。完整 LCS 在这个场景下
+/// 算得慢、收益也不大。
+fn line_diff(old: &str, new: &str) -> Vec<DiffLine> {
+    let o: Vec<&str> = old.lines().collect();
+    let n: Vec<&str> = new.lines().collect();
+
+    let mut pre = 0;
+    while pre < o.len() && pre < n.len() && o[pre] == n[pre] {
+        pre += 1;
+    }
+    let mut suf = 0;
+    while suf < o.len().saturating_sub(pre)
+        && suf < n.len().saturating_sub(pre)
+        && o[o.len() - 1 - suf] == n[n.len() - 1 - suf]
+    {
+        suf += 1;
+    }
+
+    let mut out = Vec::new();
+    let ctx = pre.saturating_sub(DIFF_CONTEXT);
+    for l in &o[ctx..pre] {
+        out.push(DiffLine {
+            kind: DiffKind::Same,
+            text: (*l).to_string(),
+        });
+    }
+    for l in &o[pre..o.len() - suf] {
+        out.push(DiffLine {
+            kind: DiffKind::Removed,
+            text: (*l).to_string(),
+        });
+    }
+    for l in &n[pre..n.len() - suf] {
+        out.push(DiffLine {
+            kind: DiffKind::Added,
+            text: (*l).to_string(),
+        });
+    }
+    // 结尾也留几行上下文，否则看不出这段改动落在哪儿
+    let suf_ctx = suf.min(DIFF_CONTEXT);
+    for l in &n[n.len() - suf_ctx..] {
+        out.push(DiffLine {
+            kind: DiffKind::Same,
+            text: (*l).to_string(),
+        });
+    }
+    out
+}
+
 /// 截断过长的工具输出。
 ///
 /// 保留开头和结尾 —— 结尾通常有错误信息，全砍掉反而最有用的一段没了。
@@ -8665,6 +8933,7 @@ fn history_to_items(msgs: &[zex_core::Message]) -> Vec<MsgItem> {
                             // 历史里没存风险等级，留空即不画胶囊
                             risk: String::new(),
                             result: None,
+                            preview: preview_for_history(&call.name, &call.arguments),
                         },
                     );
                 }
@@ -8685,6 +8954,7 @@ fn history_to_items(msgs: &[zex_core::Message]) -> Vec<MsgItem> {
                                 ok: !*is_error,
                                 output: content.clone(),
                             }),
+                            preview: None,
                         },
                     );
                 }
@@ -9289,5 +9559,97 @@ mod slash_rules {
         assert!(!ChatView::looks_like_command("帮我改个 bug"));
         assert!(!ChatView::looks_like_command(""));
         assert!(!ChatView::looks_like_command("   /home/u/x"));
+    }
+}
+
+#[cfg(test)]
+mod tool_preview {
+    // 精确导入而不是 `super::*`：bin crate 顶上有一堆通配导入，
+    // 全引进来会让 `#[test]` 的宏展开递归到爆栈
+    use super::{DIFF_CONTEXT, DiffKind, MAX_WRITE_PREVIEW, ToolPreview, line_diff, preview_for};
+
+    #[test]
+    fn shell_shows_the_command_not_the_json() {
+        // 回归：以前把 `{"command":"ls -la"}` 原样摊在卡片上，
+        // 还被 compact_args 压成一行
+        let args = serde_json::json!({"command": "ls -la"});
+        let Some(ToolPreview::Command { text }) = preview_for("shell", &args) else {
+            panic!("shell 该给出命令预览");
+        };
+        assert_eq!(text, "ls -la");
+    }
+
+    #[test]
+    fn write_to_new_file_shows_content() {
+        let args = serde_json::json!({
+            "path": "/tmp/zex-preview-does-not-exist.rs",
+            "content": "fn main() {}\n"
+        });
+        let Some(ToolPreview::Write { lang, body }) = preview_for("fs_write", &args) else {
+            panic!("新文件该按全文展示");
+        };
+        assert_eq!(lang, "rust");
+        assert!(body.contains("fn main"), "实际: {body}");
+    }
+
+    #[test]
+    fn long_content_is_truncated() {
+        let big = "x".repeat(MAX_WRITE_PREVIEW + 500);
+        let args = serde_json::json!({"path": "/tmp/zex-big.txt", "content": big});
+        let Some(ToolPreview::Write { body, .. }) = preview_for("fs_write", &args) else {
+            panic!("该按全文展示");
+        };
+        assert!(body.chars().count() <= MAX_WRITE_PREVIEW + 40);
+        assert!(body.contains("已截断"), "截断要有提示");
+    }
+
+    #[test]
+    fn other_tools_have_no_preview() {
+        // 读文件、搜内容的参数本来就短，原样显示 JSON 更省事
+        assert!(preview_for("fs_read", &serde_json::json!({"path": "a"})).is_none());
+        assert!(preview_for("grep", &serde_json::json!({"pattern": "x"})).is_none());
+    }
+
+    #[test]
+    fn diff_keeps_only_changed_lines_plus_context() {
+        let lines = line_diff("a\nb\nc\nd\ne\nf\ng", "a\nb\nc\nD\ne\nf\ng");
+
+        let removed: Vec<_> = lines
+            .iter()
+            .filter(|l| l.kind == DiffKind::Removed)
+            .map(|l| l.text.as_str())
+            .collect();
+        let added: Vec<_> = lines
+            .iter()
+            .filter(|l| l.kind == DiffKind::Added)
+            .map(|l| l.text.as_str())
+            .collect();
+        assert_eq!(removed, vec!["d"], "只该标出真正改掉的那行");
+        assert_eq!(added, vec!["D"]);
+
+        // 上下文不要整篇搬过来
+        let same = lines.iter().filter(|l| l.kind == DiffKind::Same).count();
+        assert!(same <= DIFF_CONTEXT * 2, "上下文行太多：{same}");
+    }
+
+    #[test]
+    fn identical_content_has_no_diff() {
+        let lines = line_diff("a\nb", "a\nb");
+        assert!(
+            lines.iter().all(|l| l.kind == DiffKind::Same),
+            "内容没变就不该有 - / + 行"
+        );
+    }
+
+    #[test]
+    fn empty_lines_keep_their_place() {
+        // 空行也要占位，否则 diff 里少一行会看不出来
+        let lines = line_diff("a\n\nb", "a\nX\nb");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.kind == DiffKind::Removed && l.text.is_empty()),
+            "被删掉的空行要出现"
+        );
     }
 }
