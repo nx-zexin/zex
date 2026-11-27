@@ -10798,6 +10798,7 @@ dependencies = [
  "gpui-kit",
  "gpui-shell",
  "image",
+ "notify-rust",
  "raw-window-handle",
  "reqwest",
  "schemars",

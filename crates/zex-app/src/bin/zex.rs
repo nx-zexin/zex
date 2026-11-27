@@ -287,6 +287,28 @@ struct QueuedPrompt {
     steered: bool,
 }
 
+/// 一条短暂浮出来的提示。
+///
+/// 只在**后台会话**跑完时用：用户正盯着看的那个会话，结果就在眼前，
+/// 再弹一张卡片只是噪音。
+struct Toast {
+    /// 用于定时移除和做渲染 key。
+    id: u64,
+    text: String,
+    /// 点它跳过去的会话。
+    session: Option<String>,
+    kind: ToastKind,
+}
+
+/// 提示的语义色彩。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ToastKind {
+    /// 任务完成。
+    Done,
+    /// 出错。
+    Error,
+}
+
 /// 主区域显示什么。
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ViewMode {
@@ -328,6 +350,15 @@ struct ChatView {
     input: Entity<TextareaState>,
     messages: Vec<MsgItem>,
     streaming: Option<String>,
+    /// 哪些会话正在跑任务。
+    ///
+    /// 侧栏据此打点：内核支持并行执行，用户得能一眼看出别的会话还在干活，
+    /// 否则切走之后就跟忘了它们一样。
+    running_sessions: std::collections::HashSet<String>,
+    /// 后台会话跑完的提示。自动消失，不需要用户处理。
+    toasts: Vec<Toast>,
+    /// 递增的提示 id。
+    next_toast_id: u64,
     /// 这一轮是否还在跑（从提交到 `TurnEnded`）。
     ///
     /// 不能用 `streaming.is_some()` 代替：每次工具调用前 `flush_streaming`
@@ -813,6 +844,9 @@ impl ChatView {
             messages: history,
             streaming: None,
             running: false,
+            running_sessions: std::collections::HashSet::new(),
+            toasts: Vec::new(),
+            next_toast_id: 0,
             cancelling: false,
             queued: VecDeque::new(),
             scroller,
@@ -2138,6 +2172,86 @@ impl ChatView {
         session.as_str() == self.active_session
     }
 
+    /// 后台会话跑完：浮一条提示 + 弹系统通知。
+    ///
+    /// 只在用户**没看着**那个会话时叫：正盯着的那个，结果就在眼前。
+    /// 取消不提示 —— 那是用户自己按的，不需要再被告知一遍。
+    fn announce_finished(
+        &mut self,
+        session: &zex_core::SessionId,
+        reason: &zex_core::EndReason,
+        cx: &mut Context<Self>,
+    ) {
+        let (what, kind) = match reason {
+            zex_core::EndReason::Completed => ("任务完成", ToastKind::Done),
+            zex_core::EndReason::MaxSteps { .. } => ("步数已达上限，先停下了", ToastKind::Done),
+            zex_core::EndReason::BudgetExhausted => ("上下文预算用尽，先停下了", ToastKind::Done),
+            zex_core::EndReason::Failed { .. } => ("执行出错", ToastKind::Error),
+            // 用户自己按的停止，不用再通知一遍
+            zex_core::EndReason::Cancelled => return,
+        };
+
+        let title = self
+            .sessions
+            .iter()
+            .find(|s| s.id == session.as_str())
+            .map(|s| s.title.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| "会话".into());
+
+        let text = format!("{title} · {what}");
+        self.push_toast(text.clone(), Some(session.to_string()), kind, cx);
+
+        // 系统通知放在独立线程：`show()` 是阻塞的（Linux 走 DBus 往返），
+        // 在 UI 线程上调会把窗口卡一下
+        std::thread::spawn(move || {
+            let _ = notify_rust::Notification::new()
+                .appname("Zex")
+                .summary("Zex")
+                .body(&text)
+                .timeout(notify_rust::Timeout::Milliseconds(6000))
+                .show();
+        });
+    }
+
+    /// 浮一条提示，几秒后自己消失。
+    fn push_toast(
+        &mut self,
+        text: String,
+        session: Option<String>,
+        kind: ToastKind,
+        cx: &mut Context<Self>,
+    ) {
+        let id = self.next_toast_id;
+        self.next_toast_id += 1;
+        self.toasts.push(Toast {
+            id,
+            text,
+            session,
+            kind,
+        });
+        cx.notify();
+
+        // 同时浮超过三张就是刷屏了，老的先走
+        while self.toasts.len() > 3 {
+            self.toasts.remove(0);
+        }
+
+        cx.spawn(async move |this, cx| {
+            // gpui 的执行器不是 tokio runtime，`tokio::time::sleep` 在这里
+            // 会因为没有 reactor 直接 panic —— 用它自己的定时器
+            cx.background_executor()
+                .timer(std::time::Duration::from_secs(5))
+                .await;
+            this.update(cx, |this, cx| {
+                this.toasts.retain(|t| t.id != id);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// 把事件镜像到右侧面板。
     ///
     /// 返回 true 表示这个事件属于面板正在看的那个子智能体，已经消费掉，
@@ -2337,6 +2451,8 @@ impl ChatView {
                 cx.notify();
             }
             CoreEvent::TurnStarted { session, turn: _ } => {
+                // 先记下来，跟是不是当前会话无关 —— 侧栏要显示所有在跑的
+                self.running_sessions.insert(session.to_string());
                 if !self.is_active(&session) {
                     self.status = "其它会话在后台执行".into();
                     return;
@@ -2478,9 +2594,12 @@ impl ChatView {
                 elapsed_ms,
                 turn: _,
             } => {
+                self.running_sessions.remove(session.as_str());
                 if !self.is_active(&session) {
-                    // 后台会话跑完只是刷新待办，不动当前视图
+                    // 后台会话跑完只是刷新待办，不动当前视图 ——
+                    // 但用户可能已经切走了，得让他知道那边好了
                     self.tasks = load_tasks(&self.store);
+                    self.announce_finished(&session, &reason, cx);
                     return;
                 }
                 self.flush_streaming(cx);
@@ -2585,9 +2704,9 @@ impl ChatView {
                 // 切了会话就是要聊，从工作台进对话
                 self.mode = ViewMode::Chat;
                 self.streaming = None;
-                // 新会话跑没跑，得等它自己的 TurnStarted 才知道；
-                // 先按"没在跑"显示，好过显示一个点不动的停止键
-                self.running = false;
+                // 切到的是一个正在后台跑的会话？那就得让停止键出现 ——
+                // 否则用户看着它在跑，却停不下来
+                self.running = self.running_sessions.contains(&session);
                 self.cancelling = false;
                 self.running_tool = None;
                 // 排队里的话是发给上一个会话的，不能带到这儿来发 ——
@@ -7176,6 +7295,20 @@ impl ChatView {
                     ));
             } else {
                 let color = if active { TEXT } else { TEXT_MUTED };
+
+                // 正在跑任务的会话打个点。内核支持并行，切走之后用户
+                // 就看不见那边了 —— 没有这个标记，等于把并行任务忘了
+                if self.running_sessions.contains(&s.id) {
+                    row = row.child(
+                        div()
+                            .w(px(6.0))
+                            .h(px(6.0))
+                            .rounded_full()
+                            .flex_shrink_0()
+                            .bg(rgb(BRAND)),
+                    );
+                }
+
                 let mut title = div()
                     .flex_1()
                     .min_w(px(0.0))
@@ -7905,6 +8038,60 @@ impl ChatView {
             .into_any_element()
     }
 
+    /// 浮在右下角的完成提示。
+    fn render_toasts(&self, cx: &mut Context<Self>) -> AnyElement {
+        if self.toasts.is_empty() {
+            return div().into_any_element();
+        }
+        // 贴右上角：右下角是输入框和发送键的地盘，浮在那儿会挡住要点的东西
+        let mut col = div()
+            .absolute()
+            .right(px(20.0))
+            .top(px(56.0))
+            .flex()
+            .flex_col()
+            .items_end()
+            .gap_2()
+            .max_w(px(320.0));
+        for t in &self.toasts {
+            let accent = match t.kind {
+                ToastKind::Done => OK,
+                ToastKind::Error => DANGER,
+            };
+            let mut card = div()
+                .px_3()
+                .py_2()
+                .rounded(px(8.0))
+                .border_1()
+                .border_color(rgb(accent))
+                .bg(rgb(BG_MAIN))
+                .shadow_lg()
+                .text_sm()
+                .text_color(rgb(TEXT))
+                .child(t.text.clone());
+            if let Some(sid) = &t.session {
+                let sid = sid.clone();
+                let id = t.id;
+                card = card.cursor_pointer().on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _ev, _w, cx| {
+                        let tx = this.cmd_tx.clone();
+                        let _ = tx.try_send(UiCommand::SwitchSession {
+                            session: zex_core::SessionId::from(sid.clone()),
+                        });
+                        this.settings = None;
+                        this.mode = ViewMode::Chat;
+                        // 点过就走，别让它继续挡着
+                        this.toasts.retain(|t| t.id != id);
+                        cx.notify();
+                    }),
+                );
+            }
+            col = col.child(card);
+        }
+        col.into_any_element()
+    }
+
     fn render_approval(&self, cx: &mut Context<Self>) -> AnyElement {
         let Some(req) = &self.approval else {
             return div().into_any_element();
@@ -8123,6 +8310,8 @@ impl Render for ChatView {
         if self.confirm_close {
             root = root.child(self.render_close_confirm(cx));
         }
+        // 提示浮在最上层，但不挡交互（只占右下角一小块）
+        root = root.child(self.render_toasts(cx));
         root
     }
 }

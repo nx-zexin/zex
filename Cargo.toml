@@ -57,6 +57,10 @@ raw-window-handle = "0.6"
 arboard = { version = "3", default-features = false, features = [
     "wayland-data-control",
 ] }
+# 任务跑完弹系统通知。三个平台各有一套原生实现（Linux 走 DBus、
+# macOS 走 UserNotification、Windows 走 WinRT），都是纯 Rust 绑定，
+# 不需要额外的系统库。
+notify-rust = "4"
 tokio = { version = "1", features = [
     "rt-multi-thread",
     "macros",
