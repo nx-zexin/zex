@@ -19,8 +19,8 @@ pub mod subagent;
 pub mod toolctx;
 
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::sync::mpsc;
@@ -213,6 +213,15 @@ pub struct Agent {
     /// 用 AtomicBool 而不是 channel：`run_turn` 的检查点是同步的，
     /// 而且取消要在 `await` 之间也能看到 —— channel 得额外轮询。
     cancelled: Arc<AtomicBool>,
+    /// 执行中途插进来的用户消息。
+    ///
+    /// 每个 step 开头 drain 一次并入 history —— 这是 steering 和
+    /// follow-up 的唯一区别：follow-up 在外面排队等这一轮结束，
+    /// steering 在这里等**下一个 step**。
+    ///
+    /// 用 Mutex<Vec> 而不是 mpsc：drain 是"一次全取走"，不需要背压，
+    /// 而且 agent 实例每轮重建，队列必须挂在外面（和取消开关同理）。
+    inbox: Arc<Mutex<Vec<Message>>>,
 }
 
 impl Agent {
@@ -288,6 +297,7 @@ impl Agent {
             compressor,
             usage: Usage::default(),
             cancelled: Arc::new(AtomicBool::new(false)),
+            inbox: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
@@ -348,6 +358,15 @@ impl Agent {
     /// 取一个取消句柄，可跨线程触发当前轮的中断。
     pub fn cancel_flag(&self) -> Arc<AtomicBool> {
         self.cancelled.clone()
+    }
+
+    /// 接上执行中插话的收件箱。
+    ///
+    /// 和取消开关一样，句柄挂在会话上而不是实例上：`run_task` 每轮都新建
+    /// agent，界面那边投递的消息得有个固定的地方落。
+    pub fn with_inbox(mut self, inbox: Arc<Mutex<Vec<Message>>>) -> Self {
+        self.inbox = inbox;
+        self
     }
 
     /// 首轮对话后自动给会话起标题。
@@ -639,6 +658,11 @@ impl Agent {
                 end_reason = EndReason::Cancelled;
                 break;
             }
+
+            // 执行中插的话：**下一步**就并入，不等这一轮结束。
+            // 放在 step 开头而不是流式中间，是因为 history 必须是完整的
+            // 请求-响应配对，中途插一条会让正在进行的请求对不上号。
+            self.drain_inbox(events)?;
             // 步数上限是**防跑飞**的闸，不是任务边界：这一轮还没给出
             // 最终回复，就说明没做完，续一段接着跑（上限见 max_continue_rounds）。
             // 以前这里直接 break，用户看到的是"干到一半不说话"。
@@ -733,6 +757,7 @@ impl Agent {
                             message: other.to_string(),
                         },
                     };
+                    let _ = self.drain_inbox(events);
                     self.emit(
                         CoreEvent::TurnEnded {
                             session: self.session.clone(),
@@ -840,6 +865,11 @@ impl Agent {
             }
         }
 
+        // 最后再收一次：插话可能在本轮最后一次请求之后才到。现在并进历史，
+        // 下一轮请求就能看到；同时回执让界面把它从待办里划掉 —— 否则界面
+        // 会在 `TurnEnded` 之后把它当 follow-up 再发一遍，同一句话做两次。
+        let _ = self.drain_inbox(events);
+
         self.emit(
             CoreEvent::TurnEnded {
                 session: self.session.clone(),
@@ -936,6 +966,49 @@ impl Agent {
                 self.compressor.fallback_summary(dropped)
             }
         }
+    }
+
+    /// 把执行中攒下的插话并入历史。
+    ///
+    /// 没东西就返回，不产生任何开销 —— 绝大多数轮次都是这样。
+    fn drain_inbox(&mut self, events: Option<&mpsc::Sender<CoreEvent>>) -> Result<()> {
+        let pending: Vec<Message> = {
+            let mut q = zex_core::sync::lock_or_panic(&self.inbox, "插话队列");
+            if q.is_empty() {
+                return Ok(());
+            }
+            q.drain(..).collect()
+        };
+
+        let mut texts = Vec::with_capacity(pending.len());
+        for msg in pending {
+            if let Message::User { content } = &msg {
+                // 只记文本用于回执；图片已经在 content 里，照常进历史
+                let t: String = content
+                    .iter()
+                    .filter_map(|p| match p {
+                        zex_core::Part::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                texts.push(t);
+            }
+            self.record(&msg)?;
+            self.history.push(msg);
+        }
+
+        // 回执：界面据此把"已发出"的插话标记成"已生效"。
+        // 万一插话赶在轮末到达、这一轮已经不会再发请求，界面靠这条
+        // 把消息从待办里划掉，而不是让它悬在那儿
+        self.emit(
+            CoreEvent::SteerApplied {
+                session: self.session.clone(),
+                texts,
+            },
+            events,
+        );
+        Ok(())
     }
 
     /// 组装一次请求。
@@ -1487,6 +1560,37 @@ mod tests {
         assert!(
             matches!(agent.judge("shell", &args), Verdict::Allow { .. }),
             "切到完全访问后，同一轮里的下一句命令必须直接放行"
+        );
+    }
+
+    /// 插话必须真的进历史 —— 它是 steering 的全部意义。
+    #[tokio::test]
+    async fn drain_inbox_moves_messages_into_history() {
+        let store = Store::in_memory().unwrap();
+        let inbox = Arc::new(Mutex::new(Vec::new()));
+        let mut agent = Agent::new(test_cfg(), vec![], store)
+            .unwrap()
+            .with_inbox(inbox.clone());
+
+        let before = agent.history.len();
+        agent.drain_inbox(None).unwrap();
+        assert_eq!(agent.history.len(), before, "空收件箱不该动历史");
+
+        zex_core::sync::lock_or_panic(&inbox, "插话队列").push(Message::User {
+            content: vec![zex_core::Part::text("别动 config.toml")],
+        });
+        agent.drain_inbox(None).unwrap();
+
+        assert_eq!(agent.history.len(), before + 1, "插话没有并入历史");
+        let last = agent.history.last().unwrap();
+        assert!(
+            matches!(last, Message::User { content }
+                if content.iter().any(|p| matches!(p, zex_core::Part::Text { text } if text.contains("config.toml")))),
+            "历史尾部不是那条插话：{last:?}"
+        );
+        assert!(
+            zex_core::sync::lock_or_panic(&inbox, "插话队列").is_empty(),
+            "取过之后收件箱该空了，否则下次会重复并入"
         );
     }
 

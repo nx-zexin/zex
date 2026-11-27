@@ -279,6 +279,12 @@ struct QueuedPrompt {
     images: Vec<zex_core::message::ImageRef>,
     /// 界面上画缩略图用。提交时就解码好了，省得轮到自己时再算一遍。
     shown: Vec<std::sync::Arc<gpui::Image>>,
+    /// 是不是已经作为 steering 投给正在跑的那一轮了。
+    ///
+    /// `true` 的条目在收到 `SteerApplied` 后从队列里划掉；万一没等到回执
+    /// （插话赶在轮末到达），它会在 `TurnEnded` 时作为 follow-up 补发一次。
+    /// 两种路径只有一个会成功，不会重复。
+    steered: bool,
 }
 
 /// 主区域显示什么。
@@ -1363,7 +1369,8 @@ impl ChatView {
             "/help" | "/?" => {
                 self.messages.push(MsgItem {
                     kind: MsgKind::System,
-                    text: "/new 新会话　/clear 清空当前会话　/model [名称] 切换模型　/help 帮助"
+                    text: "/new 新会话　/clear 清空当前会话　/model [名称] 切换模型　\
+                           /task <内容> 排队到当前任务之后　/help 帮助"
                         .into(),
                 });
             }
@@ -1714,9 +1721,30 @@ impl ChatView {
             return;
         }
 
+        // `/task` 是个修饰符而不是独立命令：它把后面的话标成"排队等这一轮
+        // 结束"，而不是插话。所以要在命令分发之前摘掉前缀，剩下的当正文发。
+        let mut queued_only = false;
+        if let Some(rest) = text.strip_prefix("/task") {
+            if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+                let rest = rest.trim().to_string();
+                if rest.is_empty() {
+                    self.messages.push(MsgItem {
+                        kind: MsgKind::System,
+                        text: "用法：/task <要做的事>　—— 任务执行中用它排队，等这一轮结束再开始"
+                            .into(),
+                    });
+                    self.input.update(cx, |st, cx| st.set_value("", window, cx));
+                    cx.notify();
+                    return;
+                }
+                text = rest;
+                queued_only = true;
+            }
+        }
+
         // 斜杠命令不发给模型。判据见 `looks_like_command`：
         // 以绝对路径开头的提示词（`/home/u/x 在这个目录下…`）是正文，不是命令。
-        if Self::looks_like_command(&text) {
+        if !queued_only && Self::looks_like_command(&text) {
             self.run_slash(&text, window, cx);
             return;
         }
@@ -1766,18 +1794,46 @@ impl ChatView {
         // 派了活就要看到它跑：从工作台自动进入对话视图
         self.mode = ViewMode::Chat;
 
-        if self.streaming.is_some() {
-            // 这一轮还没跑完：话收下，等它说完再说。
-            // 不打断 —— 用户补充一句"顺便看看 X"不该让正在编的代码半途而废。
+        if self.running {
+            if queued_only {
+                // follow-up：等这一轮跑完再开始。不打断正在做的事。
+                //
+                // **不在这里 push 气泡**：那条回答还在流式输出、还没落到
+                // messages 里，现在插进去就排在自己要回应的回答前面了。
+                // 轮到它时再画。
+                self.queued.push_back(QueuedPrompt {
+                    text,
+                    images,
+                    shown: shown_images,
+                    steered: false,
+                });
+                self.status = format!("排队中 · {} 条，本轮结束后发送", self.queued.len());
+                cx.notify();
+                return;
+            }
+
+            // steering：直接投给正在跑的那一轮，下一个 step 开头生效。
             //
-            // **不在这里 push 气泡**：那条回答还在流式输出、还没落到 messages
-            // 里，现在插进去就排在自己要回应的回答前面了。轮到它时再画。
-            self.queued.push_back(QueuedPrompt {
-                text,
-                images,
-                shown: shown_images,
+            // 气泡**立即**画出来 —— 插话和排队不一样，它是"现在就说"，
+            // 用户该马上看到自己说了什么。位置在信息流末尾（当前回答
+            // 还在流式中），读下来正是"我说了一句，然后它继续"。
+            self.messages.push(MsgItem {
+                kind: MsgKind::User {
+                    images: shown_images,
+                },
+                text: text.clone(),
             });
-            self.status = format!("排队中 · {} 条，本轮结束后发送", self.queued.len());
+            // 同时也进队列：万一这一轮已经走到最后一步，插话等不到下一个
+            // step 了，`TurnEnded` 会把它当 follow-up 补发。收到
+            // `SteerApplied` 就从队列里划掉，两条路径不会同时生效。
+            self.queued.push_back(QueuedPrompt {
+                text: text.clone(),
+                images: images.clone(),
+                shown: Vec::new(),
+                steered: true,
+            });
+            self.dispatch_steer(text, images, cx);
+            self.sync_scroller(cx);
             cx.notify();
             return;
         }
@@ -1794,6 +1850,29 @@ impl ChatView {
         self.dispatch_prompt(text, images, cx);
         self.sync_scroller(cx);
         cx.notify();
+    }
+
+    /// 把一句话投给正在跑的那一轮（steering）。
+    ///
+    /// 走的是收件箱，不开新轮：agent 下一个 step 开头就会并进上下文。
+    fn dispatch_steer(
+        &mut self,
+        text: String,
+        images: Vec<zex_core::message::ImageRef>,
+        cx: &mut Context<Self>,
+    ) {
+        let tx = self.cmd_tx.clone();
+        let session = self.active_session.clone();
+        cx.spawn(async move |_this, _cx| {
+            let _ = tx
+                .send(UiCommand::Steer {
+                    session: zex_core::SessionId::from(session),
+                    text,
+                    attachments: images,
+                })
+                .await;
+        })
+        .detach();
     }
 
     /// 把一条输入交给内核。
@@ -2428,10 +2507,14 @@ impl ChatView {
                 // 「回答 → 这轮完了 → 你的下一句」，把用户的话挤到结束语前面，
                 // 看起来就像上一轮还没结束就收到了新的。
                 if let Some(next) = self.queued.pop_front() {
-                    self.messages.push(MsgItem {
-                        kind: MsgKind::User { images: next.shown },
-                        text: next.text.clone(),
-                    });
+                    // steering 的条目早就画过气泡了（插话当场就该看见），
+                    // 补发时只发请求，不再画一遍
+                    if !next.steered {
+                        self.messages.push(MsgItem {
+                            kind: MsgKind::User { images: next.shown },
+                            text: next.text.clone(),
+                        });
+                    }
                     self.streaming = Some(String::new());
                     self.running = true;
                     self.status = "思考中…".into();
@@ -2442,6 +2525,19 @@ impl ChatView {
                 // 少了这一行，结束提示会**永远渲染不出来** —— 这正是
                 // "从来没告诉我任务完成了"的根因。
                 self.sync_scroller(cx);
+            }
+            CoreEvent::SteerApplied { session, texts } => {
+                if !self.is_active(&session) {
+                    return;
+                }
+                // 已经并进上下文了 —— 从待办里划掉，别让 `TurnEnded`
+                // 再把它当 follow-up 发一遍
+                for t in texts {
+                    if let Some(pos) = self.queued.iter().position(|q| q.steered && q.text == t) {
+                        self.queued.remove(pos);
+                    }
+                }
+                cx.notify();
             }
             CoreEvent::Warning { message } => {
                 self.messages.push(MsgItem {
@@ -7350,12 +7446,16 @@ impl ChatView {
                 .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| this.cancel(cx)))
                 .into_any_element()
         });
-        // 排队条数写在按钮旁边：用户得知道刚才那句话去哪了
-        let queued_badge = (!self.queued.is_empty()).then(|| {
+        // 排队条数写在按钮旁边：用户得知道刚才那句话去哪了。
+        //
+        // steering 的条目不算：它已经投给正在跑的那一轮，气泡也当场画了，
+        // 显示成"排队"会让人以为还没发出去（它只是在等回执划掉）
+        let waiting = self.queued.iter().filter(|q| !q.steered).count();
+        let queued_badge = (waiting > 0).then(|| {
             div()
                 .text_xs()
                 .text_color(rgb(TEXT_DIM))
-                .child(format!("排队 {}", self.queued.len()))
+                .child(format!("排队 {waiting}"))
                 .into_any_element()
         });
         // 模型切换放在输入框内部左下角：它和"这条消息"一起生效，
@@ -8032,6 +8132,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/new", "新会话"),
     ("/clear", "清空当前会话"),
     ("/model", "切换模型，可跟模型名"),
+    ("/task", "排队：等当前任务结束后再做，后跟内容"),
     ("/help", "命令说明"),
 ];
 

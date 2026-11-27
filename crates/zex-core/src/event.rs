@@ -98,6 +98,16 @@ pub enum CoreEvent {
         /// 审批请求。
         req: ApprovalRequest,
     },
+    /// 中途插的话已经并入当前轮。
+    ///
+    /// 界面靠它把「已发出但还没确认」的插话从待办里划掉 —— 没有这个确认，
+    /// 万一插话赶在轮次结束的那一刻到达，消息就会两边都不落地。
+    SteerApplied {
+        /// 哪个会话。
+        session: SessionId,
+        /// 并入的那几条原文。
+        texts: Vec<String>,
+    },
     /// 发生了上下文压缩。
     ContextCompacted {
         /// 所属会话。并行执行时据它判断该往哪个视图投递。
@@ -452,6 +462,21 @@ pub enum UiCommand {
         /// 和 `model` / `mode` 一样是请求级的：用户调它只是想
         /// "这一问多想一会儿"，不代表改了长期设置。
         thinking: Option<ThinkingEffort>,
+        /// 文本。
+        text: String,
+        /// 附件（图片等）。
+        attachments: Vec<crate::message::ImageRef>,
+    },
+    /// 在一轮执行**中途**插一句话。
+    ///
+    /// 和 `UserPrompt` 的区别是时机：`UserPrompt` 排进会话队列，等这一轮
+    /// 跑完才开始；`Steer` 直接进 agent 的收件箱，**下一个 step 开头**就被
+    /// 并入上下文 —— 用户说"别动那个文件了"，方向当场就能拐。
+    ///
+    /// 界面上的约定：任务在跑时提交走这里，`/task` 前缀走 `UserPrompt`。
+    Steer {
+        /// 目标会话。
+        session: SessionId,
         /// 文本。
         text: String,
         /// 附件（图片等）。

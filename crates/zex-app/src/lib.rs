@@ -595,6 +595,7 @@ pub fn spawn_core(
     // 启动时那个 agent 只用来接管界面初值，不承担碰执行；
     // 真正的开关在执行时按会话从表里取（见 run_task）
     let cancel_flags: CancelFlags = Arc::new(Mutex::new(HashMap::new()));
+    let inboxes: Inboxes = Arc::new(Mutex::new(HashMap::new()));
 
     // 任务执行器的原料。都是克隆成本很低的类型（Arc / 配置结构），
     // 每个任务拿一份，互不干扰。
@@ -669,7 +670,18 @@ pub fn spawn_core(
                             // 否则一个慢任务会把「切会话」「审批」全堵在队列里。
                             // 同一会话内部仍串行（run_task 里的会话锁），
                             // 避免两个任务同时往同一条 history 追加。
-                            let (cfg, tools, store, ev, locks, broker, providers, cells, flags) = (
+                            let (
+                                cfg,
+                                tools,
+                                store,
+                                ev,
+                                locks,
+                                broker,
+                                providers,
+                                cells,
+                                flags,
+                                inboxes,
+                            ) = (
                                 cfg.clone(),
                                 tools.clone(),
                                 store.clone(),
@@ -679,6 +691,7 @@ pub fn spawn_core(
                                 providers.clone(),
                                 mode_cells.clone(),
                                 cancel_flags.clone(),
+                                inboxes.clone(),
                             );
                             let default_provider = default_provider.clone();
                             tokio::spawn(async move {
@@ -728,6 +741,7 @@ pub fn spawn_core(
                                     broker,
                                     cell,
                                     flags,
+                                    inboxes,
                                 )
                                 .await;
                             });
@@ -892,6 +906,27 @@ pub fn spawn_core(
                                 }
                             }
                         }
+                        UiCommand::Steer {
+                            session,
+                            text,
+                            attachments,
+                        } => {
+                            // 进收件箱，不新开一轮。正在跑的那一轮下一个 step
+                            // 开头就会把它并进上下文
+                            let inbox = {
+                                let mut held =
+                                    zex_core::sync::lock_or_panic(&inboxes, "插话收件箱表");
+                                held.entry(session)
+                                    .or_insert_with(|| Arc::new(Mutex::new(Vec::new())))
+                                    .clone()
+                            };
+                            let mut content = vec![zex_core::Part::text(text)];
+                            for img in attachments {
+                                content.push(zex_core::Part::Image(img));
+                            }
+                            zex_core::sync::lock_or_panic(&inbox, "插话收件箱")
+                                .push(zex_core::Message::User { content });
+                        }
                         UiCommand::Cancel { session } => {
                             // 表里没有就现建一个：任务可能还没跑到这一步，
                             // `run_task` 拿到的会是同一个（entry 语义），
@@ -934,6 +969,12 @@ type SessionLocks = Arc<Mutex<HashMap<SessionId, Arc<tokio::sync::Mutex<()>>>>>;
 /// 那一个毫无关系，点了自然没反应。所以开关按会话存，谁跑都用同一个。
 type CancelFlags = Arc<Mutex<HashMap<SessionId, Arc<std::sync::atomic::AtomicBool>>>>;
 
+/// 每个会话一个插话收件箱。
+///
+/// 和取消开关同理：agent 实例每轮重建，执行中插的话得有个不随实例消失的
+/// 落点。`Steer` 往这里投，`run_turn` 每个 step 开头取一次。
+type Inboxes = Arc<Mutex<HashMap<SessionId, Arc<Mutex<Vec<zex_core::Message>>>>>>;
+
 /// 每个会话一个模式句柄，UI 与正在跑的那一轮共享。
 ///
 /// 单独一张表而不是塞进 `AgentConfig`：UI 必须能在任务跑着的时候
@@ -972,6 +1013,7 @@ async fn run_task(
     broker: Arc<ApprovalBroker>,
     mode_cell: zex_core::ModeCell,
     cancel_flags: CancelFlags,
+    inboxes: Inboxes,
 ) {
     // 先落一条 queued 记录，再去等锁。
     //
@@ -1037,12 +1079,22 @@ async fn run_task(
     // 拿到锁才算真的开始跑
     let _ = store.start_task(&task_id);
 
+    // 这个会话的插话收件箱：`Steer` 往这里投，agent 每个 step 取一次
+    let inbox = {
+        let mut held = zex_core::sync::lock_or_panic(&inboxes, "插话收件箱表");
+        held.entry(session.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(Vec::new())))
+            .clone()
+    };
+
     let mut agent = match Agent::resume(cfg, tools, store.clone(), session.clone()) {
         Ok(agent) => agent
             .with_shared_approvals(broker)
             .with_mode_cell(mode_cell)
             // 关了键：界面上的「停止」按的就是它
-            .with_cancel_flag(cancel_flag),
+            .with_cancel_flag(cancel_flag)
+            // 执行中插的话从这里取
+            .with_inbox(inbox),
         Err(e) => {
             let _ = store.finish_task(
                 &task_id,
