@@ -8294,7 +8294,8 @@ impl ChatView {
             .collect();
 
         let mut rail = div()
-            .w(px(20.0))
+            // 条最长会到 26px（悬停时），整列给够宽度，不然会被裁
+            .w(px(26.0))
             .h_full()
             .flex_none()
             .flex()
@@ -8385,11 +8386,14 @@ impl ChatView {
                                             .items_center()
                                             .justify_end()
                                             .child(
+                                                // 常态是一道细灰线，指到哪条哪条就
+                                                // 变粗变黑变长 —— 位置靠长度和深浅一起
+                                                // 表达，只改颜色在满屏灰线里不够醒目
                                                 div()
-                                                    .w(px(if hovered { 18.0 } else { 10.0 }))
-                                                    .h(px(2.0))
+                                                    .w(px(if hovered { 26.0 } else { 18.0 }))
+                                                    .h(px(if hovered { 4.0 } else { 2.0 }))
                                                     .rounded_full()
-                                                    .bg(rgb(if hovered { BRAND } else { BORDER })),
+                                                    .bg(rgb(if hovered { TEXT } else { 0xD5D5D1 })),
                                             ),
                                     )
                                     .content({
