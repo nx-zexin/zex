@@ -58,7 +58,7 @@ mod win {
     use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
     use windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
     use windows::Win32::UI::WindowsAndMessaging::{
-        HTCAPTION, IsZoomed, SW_MAXIMIZE, SW_RESTORE, SendMessageW, ShowWindowAsync,
+        HTCAPTION, IsZoomed, PostMessageW, SW_MAXIMIZE, SW_RESTORE, ShowWindowAsync,
         WM_NCLBUTTONDOWN,
     };
 
@@ -79,14 +79,25 @@ mod win {
         };
         unsafe {
             // 顺序不能反：先把自己对鼠标的捕获还回去，再"假装标题栏被按下"。
-            // DefWindowProc 收到 `HTCAPTION` 的 `WM_NCLBUTTONDOWN` 会自己进入
-            // 拖动循环，直到用户松手才返回 —— 所以这一句是阻塞整个拖拽过程的。
+            //
+            // 必须用 `PostMessageW` 而不是 `SendMessageW`：`WM_NCLBUTTONDOWN`
+            // 配 `HTCAPTION` 由 DefWindowProc 进入的是**模态拖动循环**——
+            // 阻塞到用户松手才返回，期间嵌套派发一切消息。而调用链在这里时
+            // 正身处 gpui 的鼠标事件派发（App 已被可变借用）；同步 Send 会让
+            // 嵌套消息也去取 App 借用 → "RefCell already borrowed" 重入
+            // panic（0xc0000409），实测拖一下窗口就崩，即此因。改为投递：
+            // 消息排队，先让当前事件派发走完、借用释放，下一个消息泵迭代
+            // 才进系统拖动循环，重入即不复存在。
             let _ = ReleaseCapture();
-            SendMessageW(
-                hwnd,
+            // `lParam` 传 0：DefWindowProc 的拖动以 GetMessagePos（真实光标）
+            // 为基准，位移像素级跟手（实测 dx/dy 与光标完全一致）。曾试过把
+            // GetCursorPos 塞进 lParam 想修“原地按一下窗口小幅跳动”的瑕疵，
+            // 实测反而让拖动落点错位，故弃用，保持 0。
+            let _ = PostMessageW(
+                Some(hwnd),
                 WM_NCLBUTTONDOWN,
-                Some(WPARAM(HTCAPTION as usize)),
-                Some(LPARAM(0)),
+                WPARAM(HTCAPTION as usize),
+                LPARAM(0),
             );
         }
         true
