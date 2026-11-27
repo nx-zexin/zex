@@ -1844,11 +1844,12 @@ impl ChatView {
             });
         }
         let tx = self.cmd_tx.clone();
+        let session = self.active_session.clone();
         self.status = "正在停止…".into();
         cx.spawn(async move |_this, _cx| {
             let _ = tx
                 .send(UiCommand::Cancel {
-                    turn: zex_core::TurnId::generate(),
+                    session: zex_core::SessionId::from(session),
                 })
                 .await;
         })

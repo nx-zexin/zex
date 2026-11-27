@@ -592,7 +592,9 @@ pub fn spawn_core(
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<UiCommand>(64);
     let (ev_tx, ev_rx) = mpsc::channel::<CoreEvent>(256);
     let broker = agent.approvals();
-    let cancel_flag = agent.cancel_flag();
+    // 启动时那个 agent 只用来接管界面初值，不承担碰执行；
+    // 真正的开关在执行时按会话从表里取（见 run_task）
+    let cancel_flags: CancelFlags = Arc::new(Mutex::new(HashMap::new()));
 
     // 任务执行器的原料。都是克隆成本很低的类型（Arc / 配置结构），
     // 每个任务拿一份，互不干扰。
@@ -667,7 +669,7 @@ pub fn spawn_core(
                             // 否则一个慢任务会把「切会话」「审批」全堵在队列里。
                             // 同一会话内部仍串行（run_task 里的会话锁），
                             // 避免两个任务同时往同一条 history 追加。
-                            let (cfg, tools, store, ev, locks, broker, providers, cells) = (
+                            let (cfg, tools, store, ev, locks, broker, providers, cells, flags) = (
                                 cfg.clone(),
                                 tools.clone(),
                                 store.clone(),
@@ -676,6 +678,7 @@ pub fn spawn_core(
                                 broker.clone(),
                                 providers.clone(),
                                 mode_cells.clone(),
+                                cancel_flags.clone(),
                             );
                             let default_provider = default_provider.clone();
                             tokio::spawn(async move {
@@ -724,6 +727,7 @@ pub fn spawn_core(
                                     locks,
                                     broker,
                                     cell,
+                                    flags,
                                 )
                                 .await;
                             });
@@ -888,9 +892,20 @@ pub fn spawn_core(
                                 }
                             }
                         }
-                        UiCommand::Cancel { .. } => {
-                            // 内核一次只跑一轮，不必核对 turn id
-                            cancel_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                        UiCommand::Cancel { session } => {
+                            // 表里没有就现建一个：任务可能还没跑到这一步，
+                            // `run_task` 拿到的会是同一个（entry 语义），
+                            // 它开跑前会先看一眼 —— 排队期间按的停止不算白按
+                            let flag = {
+                                let mut held =
+                                    zex_core::sync::lock_or_panic(&cancel_flags, "取消开关表");
+                                held.entry(session)
+                                    .or_insert_with(|| {
+                                        Arc::new(std::sync::atomic::AtomicBool::new(false))
+                                    })
+                                    .clone()
+                            };
+                            flag.store(true, std::sync::atomic::Ordering::SeqCst);
                         }
                         UiCommand::Shutdown => break,
                     }
@@ -911,6 +926,13 @@ pub fn spawn_core(
 
 /// 每个会话一把锁：同一会话的任务排队，不同会话并行。
 type SessionLocks = Arc<Mutex<HashMap<SessionId, Arc<tokio::sync::Mutex<()>>>>>;
+
+/// 每个会话一个取消开关。
+///
+/// `run_task` 每轮都会新建 `Agent`，如果让每个实例自己 new 一个开关，
+/// 界面上那个「停止」按的永远是**启动时那个 agent** 的开关 —— 和真正在跑的
+/// 那一个毫无关系，点了自然没反应。所以开关按会话存，谁跑都用同一个。
+type CancelFlags = Arc<Mutex<HashMap<SessionId, Arc<std::sync::atomic::AtomicBool>>>>;
 
 /// 每个会话一个模式句柄，UI 与正在跑的那一轮共享。
 ///
@@ -949,6 +971,7 @@ async fn run_task(
     locks: SessionLocks,
     broker: Arc<ApprovalBroker>,
     mode_cell: zex_core::ModeCell,
+    cancel_flags: CancelFlags,
 ) {
     // 先落一条 queued 记录，再去等锁。
     //
@@ -968,13 +991,58 @@ async fn run_task(
     };
     let _guard = lock.lock().await;
 
+    // 这个会话的取消开关。排队等锁期间用户就按了停止的话，这里已经是 true ——
+    // 不能装看不见，否则他会看到一个点了没反应、然后照样跑起来的按钮
+    let cancel_flag = {
+        let mut held = zex_core::sync::lock_or_panic(&cancel_flags, "取消开关表");
+        held.entry(session.clone())
+            .or_insert_with(|| Arc::new(std::sync::atomic::AtomicBool::new(false)))
+            .clone()
+    };
+    // 消费掉这个请求：排队期间按的停止只该取消这一轮，不能顺着开关
+    // 一路把后面几个任务也带走
+    if cancel_flag.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        let _ = store.finish_task(
+            &task_id,
+            zex_store::tasks::TaskStatus::Cancelled,
+            None,
+            Some("排队期间被取消"),
+        );
+        let _ = ev_tx
+            .send(CoreEvent::TurnEnded {
+                session: session.clone(),
+                turn: zex_core::TurnId::generate(),
+                reason: zex_core::EndReason::Cancelled,
+                usage: Default::default(),
+                steps: 0,
+                elapsed_ms: 0,
+            })
+            .await;
+        return;
+    }
+
+    // 任务结束时把开关关回去。没有这一步的话，跑到一半按了停止，
+    // 那个 `true` 会一直挂到下一次任务——用户下次发消息，agent 第一步
+    // 就看见"已被取消"，任务刚开始就结束。
+    //
+    // 用 Drop 而不是在末尾手写：取消、失败、panic 三条路径都要清。
+    struct ResetOnDrop(Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for ResetOnDrop {
+        fn drop(&mut self) {
+            self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    let _reset = ResetOnDrop(cancel_flag.clone());
+
     // 拿到锁才算真的开始跑
     let _ = store.start_task(&task_id);
 
     let mut agent = match Agent::resume(cfg, tools, store.clone(), session.clone()) {
         Ok(agent) => agent
             .with_shared_approvals(broker)
-            .with_mode_cell(mode_cell),
+            .with_mode_cell(mode_cell)
+            // 关了键：界面上的「停止」按的就是它
+            .with_cancel_flag(cancel_flag),
         Err(e) => {
             let _ = store.finish_task(
                 &task_id,
@@ -1017,21 +1085,27 @@ async fn run_task(
             );
         }
         Err(e) => {
-            let _ = store.finish_task(
-                &task_id,
-                zex_store::tasks::TaskStatus::Failed,
-                None,
-                Some(&e.to_string()),
-            );
+            // 用户按停止也是一条 Err —— 但它不是故障，记成 Cancelled
+            // 才不会在工作台上挂一条红色的失败
+            let (status, note) = if matches!(e, zex_core::Error::Cancelled) {
+                (zex_store::tasks::TaskStatus::Cancelled, "用户中断")
+            } else {
+                (zex_store::tasks::TaskStatus::Failed, "见错误详情")
+            };
+            let _ = store.finish_task(&task_id, status, None, Some(note));
         }
     }
 
     if let Err(e) = outcome {
-        let _ = ev_tx
-            .send(CoreEvent::Fatal {
-                message: e.to_string(),
-            })
-            .await;
+        // 中断已经由 TurnEnded(Cancelled) 交代过了，再弹一个 Fatal
+        // 会在界面上盖一条红色错误 —— 用户明明是自己按的停止
+        if !matches!(e, zex_core::Error::Cancelled) {
+            let _ = ev_tx
+                .send(CoreEvent::Fatal {
+                    message: e.to_string(),
+                })
+                .await;
+        }
     }
 
     if let Ok(Some(title)) = agent.maybe_autotitle().await {

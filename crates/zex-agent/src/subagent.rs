@@ -606,9 +606,29 @@ impl Tool for WaitForAgents {
          默认最多等 300 秒；超时的话会把还没跑完的也一并返回，你可以再等一次。"
     }
 
-    async fn call(&self, _cx: &dyn ToolCtx, args: WaitArgs) -> Result<ToolOutput> {
+    async fn call(&self, cx: &dyn ToolCtx, args: WaitArgs) -> Result<ToolOutput> {
         let secs = args.timeout_seconds.unwrap_or(300).min(1800);
-        let list = self.registry.wait_all(Duration::from_secs(secs)).await;
+        // 自己轮询而不是交给 `wait_all`：那个函数只有超时才返回，而超时会
+        // 把还在跑的 agent 标成失败。用户按停止不该有这个副作用 —— 子智能体
+        // 该继续在后台跑，只是不再有人等它的结果。
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+        let list = loop {
+            if cx.is_cancelled() {
+                return Ok(ToolOutput::ok(
+                    "用户中断了这一轮，不再等子智能体。它们仍在后台运行，\
+                     结果不会回到当前对话。",
+                ));
+            }
+            let list = self.registry.snapshot();
+            if list.iter().all(|a| a.status.is_done()) {
+                break list;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                self.registry.abandon_running();
+                break self.registry.snapshot();
+            }
+            tokio::time::sleep(Duration::from_millis(80)).await;
+        };
         if list.is_empty() {
             return Ok(ToolOutput::ok("没有子智能体需要等待。"));
         }
@@ -770,6 +790,70 @@ mod fixes {
             list[0].status
         );
         assert!(matches!(list[0].status, SubAgentStatus::Failed(_)));
+    }
+
+    /// 用户按停止时，等待必须立刻返回。
+    ///
+    /// 回归测试：早先 `WaitForAgents` 直接调 `wait_all(300s)`，取消开关
+    /// 在它外面根本传不进去 —— 界面点了停止，最坏要干等五分钟。
+    #[tokio::test]
+    async fn wait_returns_at_once_when_cancelled() {
+        let reg = Arc::new(AgentRegistry::new());
+        reg.agents.lock().unwrap().insert(
+            "stuck-1".into(),
+            Entry {
+                role: "coder".into(),
+                description: "卡住的".into(),
+                session: SessionId::generate(),
+                parent: SessionId::generate(),
+                status: SubAgentStatus::Running,
+                result: None,
+                cancel: Arc::new(AtomicBool::new(false)),
+            },
+        );
+
+        struct CancelledCtx;
+        impl zex_core::tool::ToolCtx for CancelledCtx {
+            fn cwd(&self) -> &std::path::Path {
+                std::path::Path::new("/tmp")
+            }
+            fn session_id(&self) -> &SessionId {
+                static S: std::sync::OnceLock<SessionId> = std::sync::OnceLock::new();
+                S.get_or_init(SessionId::generate)
+            }
+            fn resolve_path(&self, raw: &str) -> zex_core::Result<std::path::PathBuf> {
+                Ok(std::path::PathBuf::from(raw))
+            }
+            fn is_cancelled(&self) -> bool {
+                true
+            }
+        }
+
+        let tool = WaitForAgents {
+            registry: reg.clone(),
+        };
+        let started = std::time::Instant::now();
+        let out = tool
+            .call(
+                &CancelledCtx,
+                WaitArgs {
+                    timeout_seconds: Some(300),
+                },
+            )
+            .await
+            .expect("不该报错");
+        assert!(out.content.contains("中断"), "实际: {}", out.content);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "取消后还在等：{:?}",
+            started.elapsed()
+        );
+        // 中断不是放弃 —— 子智能体该继续在后台跑
+        assert_eq!(
+            reg.snapshot()[0].status,
+            SubAgentStatus::Running,
+            "取消等待不该把子智能体标成失败"
+        );
     }
 
     /// 已经完成的不该被超时清理波及。

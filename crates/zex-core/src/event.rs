@@ -481,10 +481,14 @@ pub enum UiCommand {
         /// 拒绝原因，会作为工具结果回给模型。
         reason: String,
     },
-    /// 中断当前轮。
+    /// 中断某一轮。
+    ///
+    /// 必须带 session：取消开关是**按会话**的。早先这里是 `turn`，而界面上
+    /// 传的是一个随手 `TurnId::generate()` 出来的值 —— 对不上任何东西，
+    /// 接收端也只看 session，等于没传。
     Cancel {
-        /// 轮次。
-        turn: TurnId,
+        /// 哪个会话。并行时只中断这一个。
+        session: SessionId,
     },
     /// 转写一段录音（语音输入）。
     Transcribe {

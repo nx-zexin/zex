@@ -14,12 +14,24 @@ use zex_core::{Result, SessionId};
 pub struct AgentCtx {
     cwd: PathBuf,
     session: SessionId,
+    /// 本轮的中断开关。`None` 表示这个上下文不受取消控制（测试里常见）。
+    cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl AgentCtx {
     /// 新建。
     pub fn new(cwd: PathBuf, session: SessionId) -> Self {
-        AgentCtx { cwd, session }
+        AgentCtx {
+            cwd,
+            session,
+            cancel: None,
+        }
+    }
+
+    /// 接上本轮的中断开关，供工具在长跑中间查看。
+    pub fn with_cancel(mut self, flag: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Self {
+        self.cancel = Some(flag);
+        self
     }
 }
 
@@ -34,6 +46,12 @@ impl ToolCtx for AgentCtx {
 
     fn resolve_path(&self, raw: &str) -> Result<PathBuf> {
         Ok(resolve_path(&self.cwd, raw))
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancel
+            .as_ref()
+            .is_some_and(|f| f.load(std::sync::atomic::Ordering::SeqCst))
     }
 
     fn is_secret_path(&self, path: &Path) -> bool {

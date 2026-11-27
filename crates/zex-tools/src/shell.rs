@@ -86,7 +86,11 @@ impl Tool for Shell {
         }
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            // 中断/超时时 `wait_with_output` 的 future 会被丢掉，Child 跟着 drop。
+            // 不设这个，被丢下的是一整个还在跑的编译进程 —— 用户按了停止，
+            // 后台照样在吃 CPU
+            .kill_on_drop(true);
 
         // Windows 上避免控制台窗口闪现（见 docs/PLATFORM.md §5）
         #[cfg(windows)]
@@ -101,23 +105,43 @@ impl Tool for Shell {
             message: format!("无法启动命令: {e}"),
         })?;
 
-        let output = match tokio::time::timeout(
-            Duration::from_secs(timeout_secs),
-            child.wait_with_output(),
-        )
-        .await
-        {
-            Ok(Ok(o)) => o,
-            Ok(Err(e)) => {
-                return Err(Error::ToolFailed {
-                    tool: Self::NAME.into(),
-                    message: format!("命令执行失败: {e}"),
-                });
+        // 超时和用户中断共用一条轮询：对命令来说两者都是"别再等它了"
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+        enum Stop {
+            Cancelled,
+            Timeout,
+        }
+        let stop = async {
+            loop {
+                if cx.is_cancelled() {
+                    return Stop::Cancelled;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return Stop::Timeout;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
             }
-            Err(_) => {
-                return Ok(ToolOutput::err(format!(
-                    "命令在 {timeout_secs} 秒后超时被终止。若确实需要更久，请调大 timeout_secs（上限 {MAX_TIMEOUT_SECS}）。"
-                )));
+        };
+
+        let output = tokio::select! {
+            r = child.wait_with_output() => match r {
+                Ok(o) => o,
+                Err(e) => {
+                    return Err(Error::ToolFailed {
+                        tool: Self::NAME.into(),
+                        message: format!("命令执行失败: {e}"),
+                    });
+                }
+            },
+            // 这个分支返回时上面那个 future 被丢弃，Child 随之 drop，
+            // `kill_on_drop` 把子进程收掉
+            why = stop => {
+                return Ok(ToolOutput::err(match why {
+                    Stop::Cancelled => "命令被用户中断，已终止。".to_string(),
+                    Stop::Timeout => format!(
+                        "命令在 {timeout_secs} 秒后超时被终止。若确实需要更久，请调大 timeout_secs（上限 {MAX_TIMEOUT_SECS}）。"
+                    ),
+                }));
             }
         };
 

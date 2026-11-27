@@ -725,13 +725,19 @@ impl Agent {
             let (text, thinking, tool_calls, usage) = match streamed {
                 Ok(v) => v,
                 Err(e) => {
+                    // 中断不是失败：界面上不该出现一条红色的"出错"，
+                    // 任务状态也不该记成 Failed（见 run_task）
+                    let reason = match e {
+                        zex_core::Error::Cancelled => EndReason::Cancelled,
+                        ref other => EndReason::Failed {
+                            message: other.to_string(),
+                        },
+                    };
                     self.emit(
                         CoreEvent::TurnEnded {
                             session: self.session.clone(),
                             turn: turn.clone(),
-                            reason: EndReason::Failed {
-                                message: e.to_string(),
-                            },
+                            reason,
                             usage: self.usage,
                             steps: total_steps,
                             elapsed_ms: started.elapsed().as_millis() as u64,
@@ -787,7 +793,8 @@ impl Agent {
                     events,
                 );
 
-                let ctx = AgentCtx::new(self.cfg.cwd.clone(), self.session.clone());
+                let ctx = AgentCtx::new(self.cfg.cwd.clone(), self.session.clone())
+                    .with_cancel(self.cancelled.clone());
                 let (content, is_error) =
                     self.dispatch_gated(&ctx, call, risk, &turn, events).await;
 
@@ -978,6 +985,11 @@ impl Agent {
 
         let mut acc = zex_llm::Accumulator::default();
         while let Some(item) = stream.next().await {
+            // 每个 token 都看一眼：否则用户按了停止，要等这一整段回复
+            // 生成完（长输出能到一两分钟）才有反应
+            if self.cancelled.load(Ordering::SeqCst) {
+                return Err(zex_core::Error::Cancelled);
+            }
             let ev = item?;
             // 先推事件再聚合：用户应该看到 token 落在屏幕上，
             // 而不是等整段结束才看到（流式的全部意义在这里）。

@@ -94,6 +94,15 @@ pub trait ToolCtx: Send + Sync {
     /// 否则授权匹配可被 `../` 绕过（见 `docs/SECURITY.md` §3.2）。
     fn resolve_path(&self, raw: &str) -> Result<PathBuf>;
 
+    /// 本轮是否已被请求中断。
+    ///
+    /// 长跑的工具（等子智能体、等子进程）该据此提前收手 —— 否则用户按了
+    /// 停止要等到工具自己跑完才看见反应，最长的能等十分钟。
+    /// 默认 `false`：没有取消通道的上下文（测试、CLI 单跑）按不会取消处理。
+    fn is_cancelled(&self) -> bool {
+        false
+    }
+
     /// 该路径是否命中密钥黑名单（`~/.zex/.env` 等）。
     ///
     /// 默认实现供测试使用；生产实现应读取真实配置。
