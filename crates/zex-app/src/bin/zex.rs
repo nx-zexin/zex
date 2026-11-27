@@ -8316,60 +8316,77 @@ impl ChatView {
                     .flex()
                     .items_center()
                     .justify_end()
-                    .child(
-                        // HoverCard 而不是 tooltip：这个 Div 来自 gpui-base，
-                        // 没有 `InteractiveElement::tooltip`；HoverCard 是
-                        // 组件库自己实现的一套，能直接包任意元素
-                        HoverCard::new(("nav-mark", idx))
-                            .open_delay(std::time::Duration::from_millis(150))
-                            .anchor(gpui_kit::Anchor::LeftCenter)
-                            .trigger({
-                                // 感应区是**整行**（20×10），短横只是画在里面。
-                                // 原来只有 10×2 的短横本身可点，鼠标稍微偏一点
-                                // 就点空了 —— 2px 高的目标本来就是刁难人
-                                let group = format!("nav-mark-{idx}");
-                                div()
-                                    .w_full()
-                                    .h(px(10.0))
-                                    .flex()
-                                    .items_center()
-                                    .justify_end()
-                                    .cursor_pointer()
-                                    .group(group.clone())
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, _: &MouseDownEvent, _w, cx| {
-                                            this.scroller.update(cx, |state, cx| {
-                                                state.scroll_to_item(idx, cx);
-                                            });
-                                        }),
-                                    )
-                                    .child(
+                    .child({
+                        // group 挂在 HoverCard **外面**：挂在 trigger 上的话，
+                        // 鼠标进入的是 HoverCard 那层包装，祖先链上摸不到它，
+                        // 短横就不会跟着变长
+                        let group = format!("nav-mark-{idx}");
+                        div()
+                            .w_full()
+                            .h(px(10.0))
+                            .flex()
+                            .items_center()
+                            .justify_end()
+                            .cursor_pointer()
+                            .group(group.clone())
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _: &MouseDownEvent, _w, cx| {
+                                    this.scroller.update(cx, |state, cx| {
+                                        state.scroll_to_item(idx, cx);
+                                    });
+                                }),
+                            )
+                            .child(
+                                // HoverCard 而不是 tooltip：这个 Div 来自
+                                // gpui-base，没有 `InteractiveElement::tooltip`
+                                HoverCard::new(("nav-mark", idx))
+                                    .open_delay(std::time::Duration::from_millis(150))
+                                    .anchor(gpui_kit::Anchor::LeftCenter)
+                                    .trigger(
+                                        // 感应区是**整行**，短横只是画在里面：
+                                        // 10×2 的短横自己可点的话，鼠标偏一点
+                                        // 就点空了
                                         div()
-                                            .w(px(10.0))
-                                            .h(px(2.0))
-                                            .rounded_full()
-                                            .bg(rgb(BORDER))
-                                            .group_hover(group, |s| s.w(px(18.0)).bg(rgb(BRAND))),
+                                            // 跟着行宽走：rail 有右内边距，
+                                            // 写死 20 会比行还宽
+                                            .w_full()
+                                            .h(px(10.0))
+                                            .flex()
+                                            .items_center()
+                                            .justify_end()
+                                            .child(
+                                                div()
+                                                    .w(px(10.0))
+                                                    .h(px(2.0))
+                                                    .rounded_full()
+                                                    .bg(rgb(BORDER))
+                                                    .group_hover(group, |st| {
+                                                        st.w(px(18.0)).bg(rgb(BRAND))
+                                                    }),
+                                            ),
                                     )
-                            })
-                            .content({
-                                let preview = preview.clone();
-                                move |_, _, _| {
-                                    div()
-                                        .max_w(px(260.0))
-                                        .rounded(px(8.0))
-                                        .bg(rgb(BG_MAIN))
-                                        .border_1()
-                                        .border_color(rgb(BORDER))
-                                        .px_3()
-                                        .py_2()
-                                        .text_sm()
-                                        .text_color(rgb(TEXT))
-                                        .child(preview.clone())
-                                }
-                            }),
-                    ),
+                                    .content({
+                                        let preview = preview.clone();
+                                        move |_, _, _| {
+                                            // 左边留 10px：紧贴着刻度弹出来，
+                                            // 和那条短横粘在一起像是一个东西
+                                            div()
+                                                .ml(px(10.0))
+                                                .max_w(px(260.0))
+                                                .rounded(px(8.0))
+                                                .bg(rgb(BG_MAIN))
+                                                .border_1()
+                                                .border_color(rgb(BORDER))
+                                                .px_3()
+                                                .py_2()
+                                                .text_sm()
+                                                .text_color(rgb(TEXT))
+                                                .child(preview.clone())
+                                        }
+                                    }),
+                            )
+                    }),
             );
         }
         rail.into_any_element()
