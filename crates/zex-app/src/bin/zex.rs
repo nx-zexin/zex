@@ -532,11 +532,16 @@ struct ChatView {
     history_cursor: Option<usize>,
     /// 开始回溯前的草稿，回溯回来要还原。
     history_draft: String,
-    /// 哪些工具卡被展开了（按消息序号记）。
+    /// 哪些卡片被**展开**了（默认折叠的那几种：思考过程、技能正文）。
     ///
-    /// 默认全折叠：一轮对话里工具调用经常有七八条，
-    /// 全摊开会把真正要读的回复挤出屏幕。
+    /// 和 `collapsed_tools` 是反过来的两套：思考动辄几百上千字、技能正文
+    /// 更长，默认摊开会把正文顶出屏幕；工具调用则相反 —— 默认收着等于
+    /// 让用户逐条点开才能看见执行了什么。
     expanded_tools: std::collections::HashSet<String>,
+    /// 哪些卡片被**收起**了（默认展开的那些：工具组本身）。
+    ///
+    /// 只到组这一层：组内的每一步仍然默认折叠，点开才看命令与输出。
+    collapsed_tools: std::collections::HashSet<String>,
     /// 哪些 provider 的模型列表被展开了（按 provider 名记）。
     ///
     /// 从目录里选一家就带进十几个模型，anthropic 十八个、openrouter 四百多，
@@ -951,6 +956,7 @@ impl ChatView {
             history_cursor: None,
             history_draft: String::new(),
             expanded_tools: std::collections::HashSet::new(),
+            collapsed_tools: std::collections::HashSet::new(),
             models_expanded: std::collections::HashSet::new(),
             extensions: zex_extension::scan_default(),
             ext_mtimes: std::collections::HashMap::new(),
@@ -3366,7 +3372,9 @@ impl ChatView {
                 // key 带会话前缀：否则切到另一个会话时，
                 // 同一行号上的工具组会继承这边的展开状态
                 let key = format!("{}/{}", self.active_session, m.key(idx));
-                let expanded = self.expanded_tools.contains(&key);
+                // 默认展开：工具调用是"它到底做了什么"的证据，
+                // 收着等于让用户逐条点开
+                let expanded = !self.collapsed_tools.contains(&key);
                 let step_prefix = key.clone();
 
                 let total = steps.len();
@@ -3396,8 +3404,8 @@ impl ChatView {
                         MouseButton::Left,
                         cx.listener(move |this, _: &MouseDownEvent, _w, cx| {
                             let key = key.clone();
-                            if !this.expanded_tools.remove(&key) {
-                                this.expanded_tools.insert(key);
+                            if !this.collapsed_tools.remove(&key) {
+                                this.collapsed_tools.insert(key);
                             }
                             cx.notify();
                         }),
@@ -3484,6 +3492,9 @@ impl ChatView {
                     let mut body = div().flex().flex_col().gap_2().px_3().pb_3();
                     for (i, step) in steps.iter().enumerate() {
                         let step_key = format!("{step_prefix}-step-{i}");
+                        // 组是展开的，但每一步仍收着：一组常有七八条调用，
+                        // 每条都摊开（命令 + 输出）会立刻把对话顶出屏幕。
+                        // 组展开解决"看不见有哪几步"，这一步解决"看不见细节"
                         let step_open = self.expanded_tools.contains(&step_key);
 
                         let (s_dot_bg, s_dot_fg) = match &step.result {
