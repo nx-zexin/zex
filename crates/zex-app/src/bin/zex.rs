@@ -8346,6 +8346,11 @@ impl ChatView {
                                 // HoverCard 而不是 tooltip：这个 Div 来自
                                 // gpui-base，没有 `InteractiveElement::tooltip`
                                 HoverCard::new(("nav-mark", idx))
+                                    // 关掉组件自带的外壳：它自带一层背景 + 边框，
+                                    // 和下面内容自己的框叠在一起就是双层框。
+                                    // 关掉之后这个 div 是唯一的视觉，间距也才落在
+                                    // "浮层和刻度之间"而不是内容内缩
+                                    .appearance(false)
                                     // 浮层开合就是"指针停在这一条上"的信号：
                                     // 这个 Div 来自 gpui-base，既没有 `on_hover`
                                     // 也没有 `tooltip`，`group_hover` 改尺寸也不
@@ -8390,8 +8395,8 @@ impl ChatView {
                                     .content({
                                         let preview = preview.clone();
                                         move |_, _, _| {
-                                            // 和刻度拉开 25px：贴着弹出来
-                                            // 会跟那条短横粘成一体
+                                            // 外边距加在这一层：浮层本身离刻度
+                                            // 25px，而不是内容在自己框里内缩
                                             div()
                                                 .ml(px(25.0))
                                                 .max_w(px(260.0))
@@ -8399,6 +8404,7 @@ impl ChatView {
                                                 .bg(rgb(BG_MAIN))
                                                 .border_1()
                                                 .border_color(rgb(BORDER))
+                                                .shadow_lg()
                                                 .px_3()
                                                 .py_2()
                                                 .text_sm()
