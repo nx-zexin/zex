@@ -6,6 +6,16 @@
 //! 双世界桥接的 UI 侧（ADR-002）：gpui 主线程只做渲染与输入，
 //! 内核在独立 tokio 线程里跑，两者用 channel 通信。
 
+// Windows：release 构建**不要**附带那个黑色控制台窗口。
+//
+// 没有这一行，rustc 默认把二进制编成 console 子系统 —— 双击 exe 会先弹出
+// 一个终端停在后面，用户看到的第一个东西就是个黑框。GUI 程序要的是
+// windows 子系统。
+//
+// debug 下故意保留：`cargo run` 时终端里能看日志和 panic 回溯。代价是
+// release 里 stdout/stderr 没有去处（见 `main` 里的日志初始化）。
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use std::sync::Arc;
 
 use gpui_kit::assets::IconName;
