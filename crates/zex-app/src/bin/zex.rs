@@ -530,6 +530,13 @@ struct ChatView {
     cwd: String,
     model: String,
     usage: Usage,
+    /// 上一次标题栏按下的时刻。
+    ///
+    /// 双击最大化要自己记时间：Windows 上第一击投递的 HTCAPTION
+    /// 模态拖动循环会吞掉抬键消息，gpui 的连击计数到不了 2
+    /// （实测确认），`ev.click_count == 2` 在那边基本等不到。
+    /// 自己隔 500ms（系统双击时限）内再按下即视为双击，跨平台成立。
+    titlebar_click_at: Option<std::time::Instant>,
 }
 
 /// 常见系统目录的第一段。
@@ -916,6 +923,7 @@ impl ChatView {
             cwd,
             model,
             usage: Usage::default(),
+            titlebar_click_at: None,
         };
 
         // 启动后连 MCP 服务：连接要 spawn 子进程并等握手，异步做，
@@ -5032,10 +5040,19 @@ impl ChatView {
             // 整条都是拖动区：双击最大化，单击跟手拖走
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|_this, ev: &MouseDownEvent, window, cx| {
+                cx.listener(|this, ev: &MouseDownEvent, window, cx| {
                     // Windows 上必须走 window_ops：gpui 的
                     // start_window_move 在那边是空函数，zoom 不会还原。
-                    if ev.click_count == 2 {
+                    //
+                    // 双击判定见 ChatView::titlebar_click_at 的注释：
+                    // click_count 靠不住，自己记时间。
+                    let now = std::time::Instant::now();
+                    let double = ev.click_count >= 2
+                        || this.titlebar_click_at.map_or(false, |t| {
+                            now.duration_since(t).as_millis() < 500
+                        });
+                    this.titlebar_click_at = if double { None } else { Some(now) };
+                    if double {
                         zex_app::window_ops::toggle_maximize(window);
                     } else {
                         zex_app::window_ops::start_drag(window);
