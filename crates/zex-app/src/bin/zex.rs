@@ -322,6 +322,18 @@ struct ChatView {
     input: Entity<TextareaState>,
     messages: Vec<MsgItem>,
     streaming: Option<String>,
+    /// 这一轮是否还在跑（从提交到 `TurnEnded`）。
+    ///
+    /// 不能用 `streaming.is_some()` 代替：每次工具调用前 `flush_streaming`
+    /// 会把累积的文本落盘并从 `streaming` 里取走，于是**工具执行期间**
+    /// 它一直是 `None`。用那个当判据，停止键就在每个工具调用的空档里
+    /// 闪一下不见、下一步又冒出来 —— 看起来像任务已经结束了。
+    running: bool,
+    /// 已经发过取消，等后端把这一轮收尾。
+    ///
+    /// 单独一个字段是为了让按钮给出反馈：点了停止却什么变化都没有，
+    /// 用户只会再点三次（`cancel` 本身是幂等的，但看起来像坏了）。
+    cancelling: bool,
     /// 上一轮还在跑时用户又发的话，排队等这一轮结束。
     ///
     /// 以前是直接拒收（`submit` 里 `streaming.is_some()` 就 return），
@@ -794,6 +806,8 @@ impl ChatView {
             mode,
             messages: history,
             streaming: None,
+            running: false,
+            cancelling: false,
             queued: VecDeque::new(),
             scroller,
             rename_input,
@@ -1775,6 +1789,7 @@ impl ChatView {
             text: text.clone(),
         });
         self.streaming = Some(String::new());
+        self.running = true;
         self.status = "思考中…".into();
         self.dispatch_prompt(text, images, cx);
         self.sync_scroller(cx);
@@ -1812,6 +1827,11 @@ impl ChatView {
     }
 
     fn cancel(&mut self, cx: &mut Context<Self>) {
+        if self.cancelling {
+            // 已经点过了，后端正在收尾。再发一遍没有意义
+            return;
+        }
+        self.cancelling = true;
         // 用户按停止就是"到此为止"。排队里的话不再替他发出去 ——
         // 按了停止之后程序又自己跑起来，比不让发更让人意外
         let dropped = self.queued.len();
@@ -2242,6 +2262,7 @@ impl ChatView {
                     return;
                 }
                 self.streaming.get_or_insert_with(String::new);
+                self.running = true;
                 self.status = "思考中…".into();
             }
             CoreEvent::Token {
@@ -2385,6 +2406,8 @@ impl ChatView {
                 self.flush_streaming(cx);
                 // 取消/失败路径不会有 flush 收尾，这里兜住，避免输入框锁死
                 self.streaming = None;
+                self.running = false;
+                self.cancelling = false;
                 self.running_tool = None;
                 self.usage.add(usage);
                 self.status = "Ready".into();
@@ -2409,6 +2432,7 @@ impl ChatView {
                         text: next.text.clone(),
                     });
                     self.streaming = Some(String::new());
+                    self.running = true;
                     self.status = "思考中…".into();
                     self.dispatch_prompt(next.text, next.images, cx);
                 }
@@ -2464,6 +2488,10 @@ impl ChatView {
                 // 切了会话就是要聊，从工作台进对话
                 self.mode = ViewMode::Chat;
                 self.streaming = None;
+                // 新会话跑没跑，得等它自己的 TurnStarted 才知道；
+                // 先按"没在跑"显示，好过显示一个点不动的停止键
+                self.running = false;
+                self.cancelling = false;
                 self.running_tool = None;
                 // 排队里的话是发给上一个会话的，不能带到这儿来发 ——
                 // 但也不能装没发生过，说一声
@@ -2483,6 +2511,8 @@ impl ChatView {
                 // 必须清掉流式标记：submit() 用它判断"是否正在跑"，
                 // 不清就会永久锁死输入框，出错后一句话都发不出去
                 self.streaming = None;
+                self.running = false;
+                self.cancelling = false;
                 self.running_tool = None;
                 // 出错之后自动发下一条只会再撞一次同样的墙
                 self.queued.clear();
@@ -7310,11 +7340,12 @@ impl ChatView {
             .icon(Icon::new(IconName::ArrowUp))
             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.submit(window, cx)))
             .into_any_element();
-        // 停止是独立的入口，只在真的在跑时出现
-        let stop_btn = self.streaming.is_some().then(|| {
+        // 停止是独立的入口，整个任务生命周期内都在 —— 用 `running` 而不是
+        // `streaming`：后者在工具调用期间是空的（见字段注释），按钮会闪
+        let stop_btn = self.running.then(|| {
             Button::new("stop")
                 .danger()
-                .label("■")
+                .label(if self.cancelling { "…" } else { "■" })
                 .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| this.cancel(cx)))
                 .into_any_element()
         });
